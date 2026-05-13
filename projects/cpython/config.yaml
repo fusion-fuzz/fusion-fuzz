@@ -1,0 +1,30 @@
+project_name: "cpython"
+
+execution:
+  # The driver handles the binary path dynamically, but this acts as a fallback/template
+  command: "projects/cpython/cpython/build/python {seed_path}"
+  timeout: 10
+  concurrency: 1
+  memory_limit_mb: 512  # Per-execution virtual-memory cap (RLIMIT_AS); 0 = no limit
+
+analysis:
+  crash_patterns:
+    - "SUMMARY:"
+    - ": Assertion `"
+
+
+paths:
+  # We point to the Lib/test directory inside the cloned repo (path relative to project root)
+  seed_source: "projects/cpython/cpython-fuzzing-corpus"
+  seed_corpus: "projects/cpython/corpus.db"
+  seed_blacklist:
+    - "ctypes"
+    - "__code__"
+
+llm:
+  provider: "openai" # Options: gemini, openai, vllm, ollama
+  model: "gpt-4o"
+  # api_key: "" # Defaults to LLM_API_KEY env var
+  # api_base: "" # Optional, for vllm/ollama
+  timeout: 30
+  # rate: 0.05 # Probability to use LLM generation in fuzz loop

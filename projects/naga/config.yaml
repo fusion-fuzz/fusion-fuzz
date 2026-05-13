@@ -1,0 +1,19 @@
+project_name: naga
+
+paths:
+  seed_source: "projects/naga/seeds"
+
+execution:
+  timeout: 10
+  command: "echo 'Use NagaDriver'"
+
+analysis:
+  crash_patterns:
+    - "AddressSanitizer"
+    - "panicked at"
+
+llm:
+  provider: "openai"
+  model: "gpt-4o-mini"
+  api_key: ""
+  timeout: 30

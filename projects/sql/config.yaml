@@ -1,0 +1,16 @@
+docker:
+  image: "mysql:8.0"
+  container_name: "mysql_fuzz"
+  workdir: "/"
+
+execution:
+  command: "mysql -u root -p password < {seed_path}"
+  timeout: 2
+
+analysis:
+  crash_patterns:
+    - "ERROR 2013" # Lost connection
+    - "Signal 11"
+
+paths:
+  seed_source: "./projects/sql/seeds"

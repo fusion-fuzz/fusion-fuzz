@@ -1,0 +1,26 @@
+setup:
+  command: "bash /home/phpfuzz/WorkSpace/flowfusion/prepare.sh"
+
+execution:
+  # The command run inside docker. {seed_path} is replaced by the driver.
+  command: "php will use its driver. see projects/php/driver.py"
+  timeout: 10
+  concurrency: 44
+
+analysis:
+  crash_patterns:
+    - "SUMMARY: AddressSanitizer"
+    - "SUMMARY: UndefinedBehaviorSanitizer"
+    - "Assertion: "
+    - "(core dumped)"
+
+paths:
+  seed_source: "./projects/php/phpt_seeds/" # Where parser looks for initial seeds
+  corpus: "./projects/php/corpus.db"
+
+llm:
+  provider: "openai" # Options: gemini, openai, vllm, ollama
+  model: "gpt-4o-mini"
+  api_key: ""
+  # api_base: "" # Optional, for vllm/ollama
+  timeout: 30

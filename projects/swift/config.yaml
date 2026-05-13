@@ -1,0 +1,25 @@
+project_name: "swift"
+
+execution:
+  # This is informational for the driver, SwiftDriver handles the actual docker exec
+  command: "docker exec ffl-swift swift {seed_path}"
+  timeout: 10
+  concurrency: 64
+
+analysis:
+  crash_patterns:
+    - "Please submit a bug report"
+    - "Assertion failed:"
+
+paths:
+  # Update this if you have a local seed directory
+  seed_source: "projects/swift/seeds"
+
+llm:
+  provider: "openai" # Options: gemini, openai, vllm, ollama
+  model: "gpt-4o-mini"
+  api_key: ""
+  # api_key: "" # Defaults to LLM_API_KEY env var
+  # api_base: "" # Optional, for vllm/ollama
+  timeout: 30
+  # rate: 0.05 # Probability to use LLM generation in fuzz loop
