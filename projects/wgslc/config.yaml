@@ -1,0 +1,24 @@
+project_name: wgslc
+
+paths:
+  seed_source: "projects/wgslc/seeds"
+
+execution:
+  timeout: 10
+  command: "echo 'Use WGSLC_Driver'"
+
+analysis:
+  crash_patterns:
+    - "AddressSanitizer"
+    - "Segmentation fault"
+    - "ASSERTION FAILED"
+  syntax_patterns:
+    - "trying to parse"
+    - "expected a "
+    - "expected '"
+
+llm:
+  provider: "openai"
+  model: "gpt-4o-mini"
+  api_key: ""
+  timeout: 30

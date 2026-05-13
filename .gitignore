@@ -1,0 +1,89 @@
+# Python internals
+**/__pycache__/
+**/*.pyc
+**/*.pyo
+**/*.pyd
+venv/
+env/
+openai-env/
+*-env/
+.env
+
+# FFL Outputs (Logs, Bugs, Crash Reports)
+output/
+*.log
+
+# ---------------------------------
+# Project-Specific Downloads & Artifacts
+# ---------------------------------
+
+# Generated SQLite Databases (Corpus, Knowledge Bases)
+*.db
+*.db.bak
+*.bak
+projects/*/corpus.db
+
+# PHP Project
+projects/php/php-src/
+projects/php/phpt_seeds/
+projects/php/phpt_deps/
+projects/php/modules/
+projects/php/apis.json
+projects/php/class.json
+
+# CPython Project
+projects/cpython/cpython/
+projects/cpython/cpython-fuzzing-corpus/
+
+# Clang Project
+projects/clang/
+
+# GCC Project
+projects/gcc/seeds/
+
+# Go Project
+projects/go/go/
+projects/go/go-bootstrap/
+projects/go/seeds/
+
+# Lean Project
+projects/lean/lean4/
+projects/lean/seeds/
+
+# MLIR Project
+projects/mlir/llvm-project/
+projects/mlir/llvm-mlir-build/
+projects/mlir/llvm-mlir-install/
+projects/mlir/seeds
+
+# Naga Project
+projects/naga/wgpu/
+projects/naga/seeds
+projects/naga/.cache
+# WGSLC Project
+projects/wgslc/WebKit/
+projects/wgslc/seeds
+
+# Rust Project
+projects/rust/rust/
+projects/rust/seeds
+
+# Temporary execution artifacts (if run outside of temp workspace)
+*.test
+*.out
+*.diff
+/tmp_ffl_parser.php
+
+# Claude Code local state
+.claude/
+
+# OS / IDE
+.DS_Store
+.idea/
+.vscode/
+
+#
+.fused/*
+
+
+rustc-ice*

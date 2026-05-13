@@ -1,0 +1,43 @@
+project_name: "lean"
+
+execution:
+  # lean elaborates/type-checks the file; driver resolves the actual binary
+  command: "lean {seed_path}"
+  timeout: 15
+  concurrency: 8
+
+analysis:
+  crash_patterns:
+    - "INTERNAL PANIC"
+    - "internal exception"
+    - "Segmentation fault"
+    - "core dumped"
+    - "thread 'main' panicked"
+    - "SIGSEGV"
+    - "double free"
+    - "heap-buffer-overflow"
+    - "SUMMARY:"
+    - "uncaught exception"
+  # rc=1 is lean's normal exit for any elaboration failure (type errors, unsolved
+  # goals, syntax errors, etc.) — treat it as an expected/invalid seed, not a crash.
+  error_return_codes: [1]
+  syntax_patterns:
+    - "error:"
+    - "unknown identifier"
+    - "type mismatch"
+    - "application type mismatch"
+    - "failed to synthesize"
+    - "function expected"
+    - "unknown constant"
+
+paths:
+  seed_source: "projects/lean/seeds"
+  seed_corpus: "projects/lean/corpus.db"
+
+llm:
+  provider: "vllm"  # Options: gemini, openai, vllm, ollama
+  model: "Qwen/Qwen3-Coder-30B-A3B-Instruct"
+  # api_key: ""  # Defaults to LLM_API_KEY env var
+  # api_base: ""  # Optional, for vllm/ollama
+  timeout: 30
+  # rate: 0.05  # Probability to use LLM generation in fuzz loop

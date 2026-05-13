@@ -1,0 +1,42 @@
+project_name: "cangjie"
+
+execution:
+  # The driver handles the binary path dynamically; this acts as a fallback/template
+  command: "/opt/cangjie/bin/cjc {seed_path} -o /dev/null"
+  timeout: 15
+  concurrency: 24
+  memory_limit_mb: 512  # Per-execution RSS cap; 0 = no limit
+
+analysis:
+  crash_patterns:
+    - "Internal Compiler Error:"
+    - "internal compiler error"
+    - "ICE:"
+    - "LLVM ERROR"
+    - "thread 'main' panicked"
+    - "panicked at"
+    - "Segmentation fault"
+    - "(core dumped)"
+    - "SIGSEGV"
+    - "SIGABRT"
+    - "Aborted"
+    - "stack overflow"
+    - "SUMMARY: AddressSanitizer"
+    - "SUMMARY: UndefinedBehaviorSanitizer"
+  syntax_patterns:
+    - "error: expected"
+    - "error:"
+    - "error["
+    - "undeclared"
+    - "undefined"
+    - "unresolved"
+
+paths:
+  seed_source: "projects/cangjie/seeds"
+  seed_corpus: "projects/cangjie/corpus.db"
+
+llm:
+  provider: "openai"
+  model: "gpt-5.4-mini"
+  api_key: ""
+  timeout: 30
