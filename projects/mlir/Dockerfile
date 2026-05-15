@@ -3,9 +3,6 @@ FROM ubuntu:22.04
 LABEL maintainer="yuancheng@comp.nus.edu.sg"
 
 ARG DEBIAN_FRONTEND=noninteractive
-# Limit parallelism so we don't OOM on machines with many cores (each compile
-# unit with -O2 can consume 1-2 GB; 16 jobs × 2 GB = 32 GB, fits in 31 GB).
-ARG JOBS=8
 
 # 1. Install system dependencies and LLVM 21 toolchain
 RUN apt-get update && \
@@ -30,31 +27,6 @@ ENV PATH="/usr/lib/llvm-21/bin:${PATH}"
 
 # 2. Python dependencies needed by the FFL framework
 RUN pip3 install --no-cache-dir pyyaml requests numpy pybind11
-
-# 3. Build mlir-opt from source (no sanitizers to keep memory usage manageable).
-#    The fuzzer driver still detects crashes via exit codes and stderr patterns.
-#    Installed to /opt/mlir-install so setup.py can symlink it at runtime
-#    without any further compilation.
-RUN git clone --depth=1 https://github.com/llvm/llvm-project.git /opt/llvm-project \
-    && cmake -S /opt/llvm-project/llvm -B /opt/mlir-build -G Ninja \
-        -DCMAKE_C_COMPILER=gcc \
-        -DCMAKE_CXX_COMPILER=g++ \
-        -DCMAKE_BUILD_TYPE=RelWithDebInfo \
-        -DLLVM_ENABLE_PROJECTS=mlir \
-        -DLLVM_ENABLE_ASSERTIONS=ON \
-        -DLLVM_ENABLE_RTTI=ON \
-        -DLLVM_OPTIMIZED_TABLEGEN=ON \
-        -DLLVM_TARGETS_TO_BUILD=host \
-        -DLLVM_BUILD_TOOLS=ON \
-        -DLLVM_PARALLEL_LINK_JOBS=1 \
-        -DCMAKE_EXE_LINKER_FLAGS="-fuse-ld=lld" \
-        -DCMAKE_MODULE_LINKER_FLAGS="-fuse-ld=lld" \
-        -DCMAKE_SHARED_LINKER_FLAGS="-fuse-ld=lld" \
-        -DCMAKE_INSTALL_PREFIX=/opt/mlir-install \
-    && cmake --build /opt/mlir-build --target mlir-opt -- -j${JOBS} \
-    && mkdir -p /opt/mlir-install/bin \
-    && cp /opt/mlir-build/bin/mlir-opt /opt/mlir-install/bin/ \
-    && rm -rf /opt/mlir-build /opt/llvm-project
 
 # Add user "fuzz"
 RUN useradd -m fuzz && \

@@ -337,6 +337,42 @@ def _translate_one(row_id: int, name: str, program: str, src_lang: str,
     return row_id, None
 
 
+def _success_refine_one(row_id: int, name: str, program: str, src_lang: str,
+                        current_code: str, tgt_lang: str,
+                        config: dict) -> tuple[int, str | None, str]:
+    """
+    Worker: run current_code through the driver; if it fails, re-translate from
+    program using the error output as context.
+    Returns (row_id, new_code | None, status) where status is one of:
+      "ok"       – translation already passes the driver (nothing to do)
+      "improved" – was failing; LLM produced a new version
+      "failed"   – was failing; LLM produced nothing
+      "error"    – unexpected exception
+    """
+    try:
+        from core.driver import get_driver
+        from core.fusion import Seed
+        from core.llmgen import LLMGenerator
+
+        driver = get_driver(config)
+        result = driver.execute(Seed(content=current_code))
+
+        if result.return_code == 0:
+            return row_id, None, "ok"
+
+        error_parts = [p.strip() for p in (result.stderr, result.stdout) if p and p.strip()]
+        error_msg = "\n".join(error_parts)[:2000]
+
+        llm = LLMGenerator(config)
+        new_seed = llm.translate(program, src_lang, tgt_lang, previous_error=error_msg)
+        if new_seed and new_seed.content:
+            return row_id, new_seed.content, "improved"
+        return row_id, None, "failed"
+    except Exception as e:
+        print(f"  WARN [{name}]: {e}", file=sys.stderr)
+        return row_id, None, "error"
+
+
 def _refine_one(row_id: int, name: str, code: str, lang: str,
                 avoid: list[str], extra: str, config: dict) -> tuple[int, str | None]:
     """Worker: refine a single translation. Returns (row_id, refined_code | None)."""
@@ -381,6 +417,82 @@ def cmd_translate_llm(args, conn: sqlite3.Connection):
     # REFINE MODE
     # ------------------------------------------------------------------
     if args.refine:
+        # ---- Success-rate refine (no --filter / --avoid) ----
+        if not args.filter and not args.avoid:
+            rows = conn.execute(
+                f"""
+                SELECT id, project, name, program,
+                       json_extract(translations, '$.{target_lang}') AS code
+                FROM   corpus
+                WHERE  json_extract(translations, '$.{target_lang}') IS NOT NULL
+                       {source_clause}
+                ORDER  BY id
+                """
+            ).fetchall()
+
+            if not rows:
+                print(f"No '{target_lang}' translations found. Nothing to do.")
+                return
+
+            total = len(rows)
+            print(f"Success-rate refine: checking {total} '{target_lang}' translations "
+                  f"using project '{cfg_project}' driver + LLM config")
+
+            if args.dry_run:
+                for r in rows:
+                    print(f"  [{r['id']}] {r['name']}")
+                print("(dry-run — no changes made)")
+                return
+
+            done = ok_count = improved = failed = 0
+
+            with ThreadPoolExecutor(max_workers=concurrency) as executor:
+                future_map = {
+                    executor.submit(
+                        _success_refine_one,
+                        r["id"], r["name"] or str(r["id"]),
+                        r["program"],
+                        project_to_lang(r["project"]).capitalize(),
+                        r["code"],
+                        target_lang.capitalize(),
+                        config,
+                    ): (r["id"], r["name"])
+                    for r in rows
+                }
+                try:
+                    for future in as_completed(future_map):
+                        row_id, name = future_map[future]
+                        done += 1
+                        try:
+                            rid, new_code, status = future.result()
+                            if status == "ok":
+                                ok_count += 1
+                                if args.verbose:
+                                    print(f"  [{rid}] {name} → already passing")
+                            elif status == "improved":
+                                set_translation(conn, rid, target_lang, new_code)
+                                improved += 1
+                                if args.verbose:
+                                    print(f"  [{rid}] {name} → improved and saved")
+                            else:
+                                failed += 1
+                                if args.verbose:
+                                    print(f"  [{rid}] {name} → {status}", file=sys.stderr)
+                        except Exception as e:
+                            print(f"  ERROR [{name}]: {e}", file=sys.stderr)
+                            failed += 1
+
+                        if done % 20 == 0 or done == total:
+                            print(f"  Progress: {done}/{total} "
+                                  f"(ok={ok_count}, improved={improved}, failed={failed})")
+                except KeyboardInterrupt:
+                    print("\nInterrupted by user.")
+
+            print(f"Done: {ok_count} already passing, {improved} improved and saved, "
+                  f"{failed} failed out of {done} processed.")
+            return
+
+        # ---- Pattern-based refine (requires both --filter and --avoid) ----
         if not args.filter or not args.avoid:
             sys.exit("--refine requires both --filter PATTERN and --avoid NAMES")
 

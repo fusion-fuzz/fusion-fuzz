@@ -2,7 +2,6 @@ import os
 import sys
 import subprocess
 import multiprocessing
-import shutil
 
 
 def setup(project_root):
@@ -29,29 +28,15 @@ def setup(project_root):
         print("MLIR setup complete.")
         return
 
-    # 2. Clone llvm-project for seed sources (projects/mlir/llvm-project/mlir/test)
+    # 2. Clone llvm-project
     if not os.path.exists(src_root):
-        print("Cloning llvm-project (needed for seed sources)...")
+        print("Cloning llvm-project...")
         _run(f"git clone --depth=1 https://github.com/llvm/llvm-project.git {src_root}")
 
-    # 3. Use mlir-opt pre-built in the Docker image
-    docker_mlir_opt = "/opt/mlir-install/bin/mlir-opt"
-    system_mlir_opt = (
-        docker_mlir_opt if os.path.exists(docker_mlir_opt)
-        else shutil.which("mlir-opt")
-    )
-    if system_mlir_opt:
-        print(f"Found pre-built mlir-opt at {system_mlir_opt}, creating symlink...")
-        os.makedirs(os.path.join(install_dir, "bin"), exist_ok=True)
-        os.symlink(system_mlir_opt, mlir_opt)
-        print("MLIR setup complete.")
-        return
-
-    # 4. Fallback: build from source
+    # 3. Build from source
     os.makedirs(build_dir, exist_ok=True)
     os.makedirs(install_dir, exist_ok=True)
 
-    jobs = multiprocessing.cpu_count()
     build_script = f"""
 set -e
 echo "Configuring CMake..."
@@ -66,8 +51,8 @@ cmake -S {src_root}/llvm -B {build_dir} -G Ninja \\
     -DLLVM_TARGETS_TO_BUILD=host \\
     -DLLVM_BUILD_TOOLS=ON \\
     -DCMAKE_INSTALL_PREFIX={install_dir}
-echo "Building mlir-opt (parallel: {jobs})..."
-cmake --build {build_dir} --target mlir-opt -- -j {jobs}
+echo "Building mlir-opt (parallel: 4)..."
+cmake --build {build_dir} --target mlir-opt -- -j4
 mkdir -p {install_dir}/bin
 cp {build_dir}/bin/mlir-opt {install_dir}/bin/
 """
