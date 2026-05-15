@@ -13,7 +13,7 @@ Unlike traditional grammar-based fuzzers (which generate code from scratch) or m
 | ![PHP](https://img.shields.io/badge/PHP-supported-brightgreen?logo=php&logoColor=white) | **Supported** | ASAN/UBSan-instrumented build; full driver & mutation |
 | ![CPython](https://img.shields.io/badge/CPython-supported-brightgreen?logo=python&logoColor=white) | **Supported** | ASAN-instrumented build; full driver & mutation |
 | ![Swift](https://img.shields.io/badge/Swift-supported-brightgreen?logo=swift&logoColor=white) | **Supported** | Official Nightly Build; Driver and parser functional; TODO: Enable ASan |
-| ![Rust](https://img.shields.io/badge/Rust-in%20development-yellow?logo=rust&logoColor=white) | **In Development** | Driver and parser functional; may have bugs |
+| ![Rust](https://img.shields.io/badge/Rust-supported-brightgreen?logo=rust&logoColor=white) | **Supported** | Official Nightly Build; Driver and parser functional |
 | ![MLIR](https://img.shields.io/badge/MLIR-in%20development-yellow?logo=llvm&logoColor=white) | **In Development** | Driver and parser functional; may have bugs |
 | ![Go](https://img.shields.io/badge/Go-experimental-orange?logo=go&logoColor=white) | **Experimental** | Parser and setup only; driver in progress |
 | ![Lean](https://img.shields.io/badge/Lean-experimental-orange) | **Experimental** | Driver functional; limited seed corpus |
@@ -93,6 +93,28 @@ Then go to the docker:
 ```bash
 cd /home/fuzz/WorkSpace/fusion-fuzz && python3 main.py --project swift --setup --bug-corpus
 ```
+
+---
+
+**For MLIR:**
+
+In host:
+```bash
+# 1. Build fuzzing docker
+cd ./projects/mlir
+docker build -t fusion-fuzz-mlir . # this may cost some time
+cd ../..
+# 2. Start docker and mount fusion fuzz
+docker run --name fuzz-mlir -dit -m 24g -v .:/home/fuzz/WorkSpace/fusion-fuzz fusion-fuzz-mlir:latest
+```
+
+Then go to the docker:
+```bash
+cd /home/fuzz/WorkSpace/fusion-fuzz && python3 main.py --project mlir --setup --bug-corpus
+```
+
+(first setup MLIR could take a long time..(a few hours) it can easily go OOM when compilation in personal computer, e.g., 32G RAM; thus only run it with 4 jobs)
+
 
 
 ## Output Structure
