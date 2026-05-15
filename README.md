@@ -13,8 +13,8 @@ Unlike traditional grammar-based fuzzers (which generate code from scratch) or m
 | ![PHP](https://img.shields.io/badge/PHP-supported-brightgreen?logo=php&logoColor=white) | **Supported** | ASAN/UBSan-instrumented build; full driver & mutation |
 | ![CPython](https://img.shields.io/badge/CPython-supported-brightgreen?logo=python&logoColor=white) | **Supported** | ASAN-instrumented build; full driver & mutation |
 | ![Swift](https://img.shields.io/badge/Swift-supported-brightgreen?logo=swift&logoColor=white) | **Supported** | Official nightly build; driver and parser functional; ASan not yet enabled |
-| ![MLIR](https://img.shields.io/badge/MLIR-supported-brightgreen?logo=llvm&logoColor=white) | **In Development** | Official nightly build; driver and parser functional |
-| ![Rust](https://img.shields.io/badge/Rust-in%20development-blue?logo=rust&logoColor=white) | **Supported** | Driver and parser functional; may have edge-case bugs |
+| ![MLIR](https://img.shields.io/badge/MLIR-supported-brightgreen?logo=llvm&logoColor=white) | **Supported** | Official nightly build; driver and parser functional |
+| ![Rust](https://img.shields.io/badge/Rust-in%20development-blue?logo=rust&logoColor=white) | **In Development** | Driver and parser functional; may have edge-case bugs |
 | ![Go](https://img.shields.io/badge/Go-experimental-orange?logo=go&logoColor=white) | **Experimental** | Parser and setup only; driver in progress |
 | ![Lean](https://img.shields.io/badge/Lean-experimental-orange) | **Experimental** | Driver functional; limited seed corpus |
 | ![WGSL](https://img.shields.io/badge/WGSL-experimental-orange) | **Experimental** | Naga/wgslc driver; limited testing |
