@@ -4,7 +4,7 @@ execution:
   # The driver handles the binary path dynamically, but this acts as a fallback/template
   command: "/rust-src/build/x86_64-unknown-linux-gnu/stage1/bin/rustc {seed_path} -o {output_bin}"
   timeout: 10
-  concurrency: 4
+  concurrency: 16
 
 analysis:
   crash_patterns:

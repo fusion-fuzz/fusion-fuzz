@@ -12,7 +12,7 @@ class RustDriver(BaseDriver):
     The rustc binary lives at /rust-src/build/x86_64-unknown-linux-gnu/stage1/bin/rustc.
     """
 
-    RUSTC_BIN = "/rust-src/build/x86_64-unknown-linux-gnu/stage1/bin/rustc"
+    RUSTC_BIN = "/usr/local/cargo/bin/rustc"
 
     EDITIONS = ["2015", "2018", "2021"]
     OPT_LEVELS = ["0", "1", "2", "3", "s", "z"]
