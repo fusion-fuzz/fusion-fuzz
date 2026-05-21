@@ -27,9 +27,7 @@ class GoDriver(BaseDriver):
 
     def __init__(self, config):
         super().__init__(config)
-        self.go_bin = os.path.join(
-            self.ffl_root, "projects", "go", "go", "bin", "go"
-        )
+        self.go_bin = "/usr/local/go/bin/go"
         self.go_cache = os.path.join(self.fused_base, "go_cache")
         self.go_tmp = os.path.join(self.fused_base, "go_tmp")
 
