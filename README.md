@@ -15,7 +15,7 @@ Unlike traditional grammar-based fuzzers (which generate code from scratch) or m
 | ![Swift](https://img.shields.io/badge/Swift-supported-brightgreen?logo=swift&logoColor=white) | **Supported** | Official nightly build; driver and parser functional; ASan not yet enabled |
 | ![MLIR](https://img.shields.io/badge/MLIR-supported-brightgreen?logo=llvm&logoColor=white) | **Supported** | Official nightly build; driver and parser functional |
 | ![Rust](https://img.shields.io/badge/Rust-supported-brightgreen?logo=rust&logoColor=white) | **Supported** | Official nightly build; driver and parser functional |
-| ![Go](https://img.shields.io/badge/Go-experimental-orange?logo=go&logoColor=white) | **Experimental** | Parser and setup only; driver in progress |
+| ![Go](https://img.shields.io/badge/Go-supported-brightgreen?logo=go&logoColor=white) | **Supported** | Official nightly build; driver and parser functional |
 | ![Lean](https://img.shields.io/badge/Lean-experimental-orange) | **Experimental** | Driver functional; limited seed corpus |
 | ![WGSL](https://img.shields.io/badge/WGSL-experimental-orange) | **Experimental** | Naga/wgslc driver; limited testing |
 | ![JavaScript](https://img.shields.io/badge/JavaScript-planned-lightgrey?logo=javascript&logoColor=white) | **Planned** | Not yet integrated |
