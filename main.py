@@ -55,6 +55,10 @@ if __name__ == "__main__":
                         help="Override the crash signature used by --reduce. "
                              "Any crash whose output contains this string counts. "
                              'Example: --signature "core dumped"')
+    parser.add_argument("--statement-fusion", action="store_true", default=False,
+                        help="Enable statement fusion (dependency-graph interleave)")
+    parser.add_argument("--dataflow-fusion", action="store_true", default=False,
+                        help="Enable dataflow fusion (bridge variable linking)")
 
     args = parser.parse_args()
 
@@ -310,7 +314,9 @@ if __name__ == "__main__":
     # 6. Initialize & Run Orchestrator
     fuzzer = FusionFuzzLoop(
         config=config,
-        strategies=get_strategies(args.project),
+        strategies=get_strategies(args.project,
+                                  stmt_fusion=args.statement_fusion,
+                                  dataflow_fusion=args.dataflow_fusion),
         initial_corpus=_valid_corpus
     )
     
