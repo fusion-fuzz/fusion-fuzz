@@ -315,6 +315,8 @@ class PHPFusionStrategy(GenericDataflowStrategy):
         self.apifuzz = True
         self.ini = True
         self.mutation = True
+        self.stmt_fusion = False
+        self.dataflow_fusion = True
         self.apis = []
         self.classes = []
         self._load_apis()
@@ -476,6 +478,378 @@ class PHPFusionStrategy(GenericDataflowStrategy):
             _instruments.append(_wrapper)
         return '\n'.join(_instruments) + '\n'
 
+    # ── Statement Fusion helpers ──────────────────────────────────
+
+    _PHP_VAR_RE = re.compile(r'\$[a-zA-Z_\x80-\xff][a-zA-Z0-9_\x80-\xff]*')
+    _PHP_FUNC_CALL_RE = re.compile(r'(?<![->:])\b([a-zA-Z_\x80-\xff][a-zA-Z0-9_\x80-\xff]*)\s*\(')
+    _PHP_NEW_RE = re.compile(r'\bnew\s+([a-zA-Z_\x80-\xff][a-zA-Z0-9_\x80-\xff]*)')
+    _PHP_ASSIGN_RE = re.compile(r'(\$[a-zA-Z_\x80-\xff][a-zA-Z0-9_\x80-\xff]*)\s*=[^=]')
+    _PHP_COMPOUND_KW = re.compile(
+        r'^\s*(?:function\s|class\s|interface\s|trait\s|enum\s|abstract\s+class\s'
+        r'|if\s*\(|else\s*\{|elseif\s*\(|else\s+if\s*\('
+        r'|for\s*\(|foreach\s*\(|while\s*\(|do\s*\{'
+        r'|switch\s*\(|match\s*\('
+        r'|try\s*\{|catch\s*\(|finally\s*\{)')
+    _PHP_NORM_VAR = re.compile(r'\$[a-zA-Z_\x80-\xff][a-zA-Z0-9_\x80-\xff]*')
+    _PHP_NORM_STR = re.compile(r"(?:\"[^\"]*\"|'[^']*')")
+    _PHP_NORM_NUM = re.compile(r'\b\d+(?:\.\d+)?\b')
+
+    _PHP_CONTINUATION_RE = re.compile(
+        r'^\s*(?:catch\s*\(|finally\s*\{|else\s*\{|elseif\s*\(|else\s+if\s*\()')
+
+    @classmethod
+    def _split_statements(cls, code: str) -> List[str]:
+        """Split PHP code into statement units respecting brace/paren depth
+        and string literals.  Compound blocks (functions, classes, control
+        structures including try/catch/finally and if/elseif/else chains)
+        are kept as single units."""
+        statements: List[str] = []
+        current: List[str] = []
+        brace_depth = 0
+        paren_depth = 0
+        in_sq = False
+        in_dq = False
+        in_heredoc = False
+        heredoc_tag = ""
+        escaped = False
+        i = 0
+        n = len(code)
+
+        def _lookahead_is_continuation(pos: int) -> bool:
+            """Check if text after pos starts with catch/finally/else/elseif."""
+            rest = code[pos:]
+            return bool(cls._PHP_CONTINUATION_RE.match(rest))
+
+        while i < n:
+            ch = code[i]
+            nch = code[i + 1] if i + 1 < n else ''
+
+            # ── string literal tracking ──
+            if escaped:
+                current.append(ch)
+                escaped = False
+                i += 1
+                continue
+            if ch == '\\' and (in_sq or in_dq):
+                current.append(ch)
+                escaped = True
+                i += 1
+                continue
+            if in_sq:
+                current.append(ch)
+                if ch == "'":
+                    in_sq = False
+                i += 1
+                continue
+            if in_dq:
+                current.append(ch)
+                if ch == '"':
+                    in_dq = False
+                i += 1
+                continue
+            if in_heredoc:
+                current.append(ch)
+                if ch == '\n':
+                    rest = code[i + 1:]
+                    if rest.startswith(heredoc_tag + ';') or rest.startswith(heredoc_tag + '\n') or rest.rstrip() == heredoc_tag:
+                        end_len = len(heredoc_tag)
+                        current.append(code[i + 1:i + 1 + end_len])
+                        i += 1 + end_len
+                        in_heredoc = False
+                        if i < n and code[i] == ';':
+                            current.append(';')
+                            i += 1
+                        continue
+                i += 1
+                continue
+
+            # ── skip single-line comments ──
+            if ch == '/' and nch == '/':
+                while i < n and code[i] != '\n':
+                    current.append(code[i])
+                    i += 1
+                continue
+            if ch == '#' and nch != '[':
+                while i < n and code[i] != '\n':
+                    current.append(code[i])
+                    i += 1
+                continue
+            # ── skip multi-line comments ──
+            if ch == '/' and nch == '*':
+                current.append(ch)
+                i += 1
+                while i < n:
+                    current.append(code[i])
+                    if code[i] == '*' and i + 1 < n and code[i + 1] == '/':
+                        current.append('/')
+                        i += 2
+                        break
+                    i += 1
+                continue
+
+            # ── detect string starts ──
+            if ch == "'" and brace_depth + paren_depth >= 0:
+                in_sq = True
+                current.append(ch)
+                i += 1
+                continue
+            if ch == '"' and brace_depth + paren_depth >= 0:
+                in_dq = True
+                current.append(ch)
+                i += 1
+                continue
+            # ── heredoc / nowdoc ──
+            if ch == '<' and code[i:i+3] == '<<<':
+                current.append('<<<')
+                i += 3
+                tag_start = i
+                while i < n and code[i] not in ('\n', '\r'):
+                    i += 1
+                raw_tag = code[tag_start:i].strip().strip("'\"")
+                heredoc_tag = raw_tag
+                current.append(code[tag_start:i])
+                in_heredoc = True
+                continue
+
+            current.append(ch)
+
+            if ch == '(':
+                paren_depth += 1
+            elif ch == ')':
+                paren_depth -= 1
+            elif ch == '{':
+                brace_depth += 1
+            elif ch == '}':
+                brace_depth -= 1
+                if brace_depth <= 0 and paren_depth <= 0:
+                    brace_depth = 0
+                    # Before emitting, check if the next non-whitespace is a
+                    # continuation keyword (catch, finally, else, elseif).
+                    # If so, keep accumulating into the same statement.
+                    j = i + 1
+                    while j < n and code[j] in (' ', '\t', '\n', '\r'):
+                        j += 1
+                    if _lookahead_is_continuation(j):
+                        # Absorb whitespace and continue
+                        i += 1
+                        continue
+                    stmt = ''.join(current).strip()
+                    if stmt:
+                        statements.append(stmt)
+                    current = []
+                    i += 1
+                    continue
+            elif ch == ';' and brace_depth <= 0 and paren_depth <= 0:
+                stmt = ''.join(current).strip()
+                if stmt:
+                    statements.append(stmt)
+                current = []
+                i += 1
+                continue
+
+            i += 1
+
+        leftover = ''.join(current).strip()
+        if leftover:
+            statements.append(leftover)
+        return statements
+
+    def _stmt_defines_uses(self, stmt: str):
+        """Return (defines: set, uses: set) for a single PHP statement.
+        'defines' = variable assignments + function/class declarations.
+        'uses'    = variables and user-defined function/class references
+                    that appear but are not the assignment target."""
+        defines = set()
+        uses = set()
+
+        # Function / class / interface / trait / enum definitions
+        for name in self._PHP_FUNC_DEF_RE.findall(stmt):
+            if name not in self._PHP_SKIP_NAMES:
+                defines.add(name)
+        for name in self._PHP_CLASS_DEF_RE.findall(stmt):
+            if name not in self._PHP_SKIP_NAMES:
+                defines.add(name)
+
+        # Variable assignments: $x = ...
+        for m in self._PHP_ASSIGN_RE.finditer(stmt):
+            defines.add(m.group(1))
+
+        # All variables referenced
+        all_vars = set(self._PHP_VAR_RE.findall(stmt))
+        uses |= all_vars
+
+        # Function calls (user-defined, not builtins — we can't distinguish
+        # perfectly, but that's fine: extra edges just add ordering constraints)
+        for m in self._PHP_FUNC_CALL_RE.finditer(stmt):
+            uses.add(m.group(1))
+
+        # new ClassName
+        for m in self._PHP_NEW_RE.finditer(stmt):
+            uses.add(m.group(1))
+
+        return defines, uses
+
+    def _normalize_stmt(self, stmt: str) -> str:
+        """Normalize a statement for similarity comparison:
+        strip variable names, string literals, and numeric literals."""
+        s = self._PHP_NORM_VAR.sub('$_', stmt)
+        s = self._PHP_NORM_STR.sub('"_"', s)
+        s = self._PHP_NORM_NUM.sub('0', s)
+        return s
+
+    @staticmethod
+    def _token_similarity(norm_a: str, norm_b: str) -> float:
+        """Jaccard similarity on whitespace-split tokens of normalized statements."""
+        toks_a = set(norm_a.split())
+        toks_b = set(norm_b.split())
+        if not toks_a and not toks_b:
+            return 1.0
+        intersection = toks_a & toks_b
+        union = toks_a | toks_b
+        return len(intersection) / len(union) if union else 0.0
+
+    def _dependency_graph_interleave(self, stmts_a: List[str], stmts_b: List[str]) -> List[str]:
+        """Interleave statements from seed A and seed B using dependency-graph
+        topological sort with token-similarity tie-breaking.
+
+        1. Build a dependency DAG across all statements (A ∪ B).
+        2. Topologically sort: at each step, among ready statements (all
+           dependencies met), pick the one most similar to the last emitted
+           statement (with randomness in the top-k for diversity).
+        3. The result is a valid interleaving that respects def-use order
+           and clusters structurally similar statements.
+        """
+        # Tag each statement with its origin for bookkeeping
+        tagged = [(s, 'a') for s in stmts_a] + [(s, 'b') for s in stmts_b]
+        n = len(tagged)
+        if n == 0:
+            return []
+
+        # Pre-compute defines/uses and normalized forms
+        info = []
+        for stmt, origin in tagged:
+            defines, uses = self._stmt_defines_uses(stmt)
+            norm = self._normalize_stmt(stmt)
+            info.append({
+                'stmt': stmt,
+                'origin': origin,
+                'defines': defines,
+                'uses': uses,
+                'norm': norm,
+            })
+
+        # Build dependency edges: stmt j depends on stmt i if j uses
+        # something i defines.  We only add the edge to the *last* definer
+        # within the same seed to avoid over-constraining across seeds
+        # (cross-seed deps don't exist in the original programs).
+        # However, for function/class names we add cross-seed edges too,
+        # since a call to a function defined in the other seed must come after.
+        deps = [set() for _ in range(n)]  # deps[j] = set of indices j depends on
+
+        # Map: name → list of (index, origin) that define it
+        def_map: Dict[str, List[Tuple[int, str]]] = {}
+        for i, inf in enumerate(info):
+            for name in inf['defines']:
+                def_map.setdefault(name, []).append((i, inf['origin']))
+
+        for j, inf_j in enumerate(info):
+            for name in inf_j['uses']:
+                if name not in def_map:
+                    continue
+                definers = def_map[name]
+                for di, d_origin in definers:
+                    if di == j:
+                        continue
+                    # Same-seed edge: always add (preserves original order intent)
+                    if d_origin == inf_j['origin']:
+                        deps[j].add(di)
+                    else:
+                        # Cross-seed edge: only for function/class definitions
+                        # (not variables — cross-seed variable refs are intentionally
+                        # invalid to stress the interpreter)
+                        if not name.startswith('$'):
+                            deps[j].add(di)
+
+        # Topological sort with similarity tie-breaking
+        emitted = [False] * n
+        emit_count = [0]  # use list for mutability in nested func
+        result: List[str] = []
+
+        # in-degree for each node
+        in_degree = [len(d) for d in deps]
+
+        # reverse map: who depends on me
+        dependents = [[] for _ in range(n)]
+        for j in range(n):
+            for di in deps[j]:
+                dependents[di].append(j)
+
+        ready = [i for i in range(n) if in_degree[i] == 0]
+
+        last_norm = ""
+        while ready:
+            if not result:
+                pick_idx = random.choice(ready)
+            else:
+                # Score each ready statement by similarity to the last emitted
+                scored = []
+                for ri in ready:
+                    sim = self._token_similarity(last_norm, info[ri]['norm'])
+                    scored.append((sim, ri))
+                scored.sort(key=lambda x: -x[0])
+                # Pick from top-3 for diversity
+                top_k = min(3, len(scored))
+                pick_idx = random.choice([s[1] for s in scored[:top_k]])
+
+            ready.remove(pick_idx)
+            emitted[pick_idx] = True
+            result.append(info[pick_idx]['stmt'])
+            last_norm = info[pick_idx]['norm']
+
+            # Unblock dependents
+            for dep_j in dependents[pick_idx]:
+                in_degree[dep_j] -= 1
+                if in_degree[dep_j] == 0 and not emitted[dep_j]:
+                    ready.append(dep_j)
+
+        # If there are remaining statements (cycles — shouldn't happen with
+        # valid seeds, but be defensive), append them in original order
+        for i in range(n):
+            if not emitted[i]:
+                result.append(info[i]['stmt'])
+
+        return result
+
+    def _stmt_cross_replace_variable(self, code: str, vars_a: List[str], vars_b: List[str]) -> str:
+        """Pick one random variable from B's set and replace one random
+        occurrence with a random variable from A's set."""
+        if not vars_a or not vars_b:
+            return code
+        var_b = random.choice(vars_b)
+        var_a = random.choice(vars_a)
+        if var_a == var_b:
+            return code
+        return replace_random_occurrence(code, var_b, var_a)
+
+    def _statement_fuse(self, clean1: str, clean2: str,
+                        vars1: List[str], vars2: List[str]) -> str:
+        """Statement fusion: split both seeds into statements, interleave
+        via dependency-graph topological sort with similarity tie-breaking,
+        then cross-replace one variable."""
+        stmts_a = self._split_statements(clean1)
+        stmts_b = self._split_statements(clean2)
+
+        if not stmts_a and not stmts_b:
+            return clean1 + '\n' + clean2
+
+        interleaved = self._dependency_graph_interleave(stmts_a, stmts_b)
+        fused_code = '\n'.join(interleaved)
+
+        # Cross-replace one variable from B with one from A
+        fused_code = self._stmt_cross_replace_variable(fused_code, vars1, vars2)
+
+        return fused_code
+
     # Matches goto jump and label statements that break when merged across seeds.
     _PHP_GOTO_RE = re.compile(r'^\s*goto\s+\w+\s*;.*$', re.M)
     _PHP_LABEL_RE = re.compile(r'^\s*\w+\s*:\s*$', re.M)
@@ -512,15 +886,11 @@ class PHPFusionStrategy(GenericDataflowStrategy):
         clean1 = self.clean_php_header_tail(phpcode1)
         clean2 = self.clean_php_header_tail(phpcode2)
 
-        # Extract declare()/namespace statements — they must be the very first
-        # statements in a PHP file. Collect from both parents, deduplicate, and
-        # emit them at the top of the fused file.
         preamble1, clean1 = self._extract_preamble(clean1)
         preamble2, clean2 = self._extract_preamble(clean2)
         preamble_lines = list(dict.fromkeys(preamble1 + preamble2))
         preamble_code = '\n'.join(preamble_lines)
 
-        # Resolve function/class name conflicts between the two code blocks.
         clean2 = self._resolve_name_conflicts(clean1, clean2)
 
         _pre_cls = ""
@@ -532,16 +902,24 @@ class PHPFusionStrategy(GenericDataflowStrategy):
             if class_vars:
                 extra_class_flows = [class_vars]
                 all_vars.extend(class_vars)
-        new_code1, new_code2 = self.interleave_code_blocks(clean1, clean2, dataflow1, dataflow2, extra_flows=extra_class_flows)
+
+        if self.stmt_fusion:
+            # Statement fusion: dependency-graph interleave + variable cross-replace
+            fused_body = self._statement_fuse(clean1, clean2, variable1, variable2)
+            inner = f"{_pre_cls}\n{fused_body}\n"
+        else:
+            # Dataflow fusion: sequential concatenation + bridge variable
+            new_code1, new_code2 = self.interleave_code_blocks(
+                clean1, clean2, dataflow1, dataflow2,
+                extra_flows=extra_class_flows)
+            inner = f"{_pre_cls}\n{new_code1}\n{new_code2}\n"
+
         _inst_api = ""
         if self.apifuzz and random.random() < 0.2:
             _inst_api = self._instrumentation_apifuzz(all_vars)
         _inst_dump = "\nvar_dump(get_defined_vars());\n"
-        # Wrap the executable body in try/catch so runtime errors (blocked
-        # functions, type errors, network failures, etc.) return rc=0 rather
-        # than rc=255.  ASAN/UBSAN crashes are signals and cannot be caught by
-        # PHP, so real crashes are still detected.
-        inner = f"{_pre_cls}\n{new_code1}\n{new_code2}\n{_inst_dump}\n{_inst_api}\n{_after_cls}"
+
+        inner += f"{_inst_dump}\n{_inst_api}\n{_after_cls}"
         php_body = f"{preamble_code}\ntry {{\n{inner}\n}} catch (\\Throwable $_ffl_e) {{}}\n"
         fused_file = f"\n--FILE--\n<?php\n{php_body}"
         desc = f"--TEST--\nFused {parent_a.id} + {parent_b.id}\n"
@@ -553,7 +931,11 @@ class PHPFusionStrategy(GenericDataflowStrategy):
         fused_test = f"{desc}{conf}{ext}{fused_file}{expect}"
         fused_test = re.sub("\n+", "\n", fused_test)
         fused_test = self.adhoc_syntax_patch(fused_test)
-        return Seed(content=fused_test, metadata={"parents": [parent_a.id, parent_b.id], "type": "phpt", "description": f"Fused {parent_a.id} + {parent_b.id}"})
+        return Seed(content=fused_test, metadata={
+            "parents": [parent_a.id, parent_b.id],
+            "type": "phpt",
+            "description": f"Fused {parent_a.id} + {parent_b.id}",
+        })
 
 # ==========================================
 # CPython Specific Fusion Strategy
@@ -3509,7 +3891,11 @@ class CangjieFusionStrategy(FusionStrategy):
 # Strategy Factory (Updated)
 # ==========================================
 
-def get_strategies(project_name=None):
+def get_strategies(project_name=None, stmt_fusion=False, dataflow_fusion=False):
+    # Default: if neither flag given, enable dataflow fusion only
+    if not stmt_fusion and not dataflow_fusion:
+        dataflow_fusion = True
+
     strategies = []
 
     if project_name == "cangjie":
@@ -3519,7 +3905,10 @@ def get_strategies(project_name=None):
 
     if project_name == "php":
         if os.path.exists("projects/php"):
-            strategies.append(PHPFusionStrategy(project_root="projects/php"))
+            s = PHPFusionStrategy(project_root="projects/php")
+            s.stmt_fusion = stmt_fusion
+            s.dataflow_fusion = dataflow_fusion
+            strategies.append(s)
         return strategies
 
     if project_name == "cpython":
