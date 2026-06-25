@@ -831,10 +831,114 @@ class PHPFusionStrategy(GenericDataflowStrategy):
             return code
         return replace_random_occurrence(code, var_b, var_a)
 
+    _PHP_BLOCK_HEAD_RE = re.compile(
+        r'^\s*(?:function\s|class\s|interface\s|trait\s|enum\s|abstract\s+class\s'
+        r'|if\s*\(|elseif\s*\(|else\s*\{'
+        r'|for\s*\(|foreach\s*\(|while\s*\(|do\s*\{'
+        r'|switch\s*\(|match\s*\('
+        r'|try\s*\{|catch\s*\(|finally\s*\{)')
+
+    @staticmethod
+    def _find_outermost_brace_body(stmt: str):
+        """Find the span of the outermost { body } in a statement.
+        Returns (body_start, body_end) indices into stmt where body_start
+        is the index after '{' and body_end is the index of the matching '}'.
+        Returns None if no brace block found."""
+        in_sq = False
+        in_dq = False
+        escaped = False
+        depth = 0
+        body_start = -1
+        for i, ch in enumerate(stmt):
+            if escaped:
+                escaped = False
+                continue
+            if ch == '\\' and (in_sq or in_dq):
+                escaped = True
+                continue
+            if in_sq:
+                if ch == "'":
+                    in_sq = False
+                continue
+            if in_dq:
+                if ch == '"':
+                    in_dq = False
+                continue
+            if ch == "'":
+                in_sq = True
+                continue
+            if ch == '"':
+                in_dq = True
+                continue
+            if ch == '{':
+                depth += 1
+                if depth == 1:
+                    body_start = i + 1
+            elif ch == '}':
+                depth -= 1
+                if depth == 0 and body_start != -1:
+                    return (body_start, i)
+        return None
+
+    def _inject_into_block(self, stmts: List[str]) -> List[str]:
+        """Pick a random compound block from stmts, inject 1-3 random atomic
+        statements (also from stmts) into its body at a random position.
+        Returns the modified statement list."""
+        candidates = []
+        atomic = []
+        for idx, s in enumerate(stmts):
+            if self._PHP_BLOCK_HEAD_RE.match(s) and '{' in s:
+                span = self._find_outermost_brace_body(s)
+                if span:
+                    body_start, body_end = span
+                    body = s[body_start:body_end].strip()
+                    if len(body) > 5:
+                        candidates.append((idx, body_start, body_end))
+            else:
+                if s.strip():
+                    atomic.append((idx, s))
+
+        if not candidates or not atomic:
+            return stmts
+
+        target_idx, body_start, body_end = random.choice(candidates)
+        target = stmts[target_idx]
+        body = target[body_start:body_end]
+
+        # Pick 1-3 atomic statements (not the target itself) to inject
+        donors = [(i, s) for i, s in atomic if i != target_idx]
+        if not donors:
+            return stmts
+        n_inject = min(random.randint(1, 3), len(donors))
+        chosen = random.sample(donors, n_inject)
+        inject_stmts = [s for _, s in chosen]
+
+        # Find injection point: split body into lines, pick a random line boundary
+        body_lines = body.split('\n')
+        insert_pos = random.randint(0, len(body_lines))
+
+        # Detect indentation from existing body lines
+        indent = "    "
+        for ln in body_lines:
+            stripped = ln.lstrip()
+            if stripped:
+                indent = ln[:len(ln) - len(stripped)]
+                break
+
+        injected = [indent + s.strip() for s in inject_stmts]
+        new_body_lines = body_lines[:insert_pos] + injected + body_lines[insert_pos:]
+        new_body = '\n'.join(new_body_lines)
+
+        new_stmt = target[:body_start] + new_body + target[body_end:]
+        result = list(stmts)
+        result[target_idx] = new_stmt
+        return result
+
     def _statement_fuse(self, clean1: str, clean2: str,
                         vars1: List[str], vars2: List[str]) -> str:
         """Statement fusion: split both seeds into statements, interleave
         via dependency-graph topological sort with similarity tie-breaking,
+        optionally inject statements into compound block bodies,
         then cross-replace one variable."""
         stmts_a = self._split_statements(clean1)
         stmts_b = self._split_statements(clean2)
@@ -843,6 +947,11 @@ class PHPFusionStrategy(GenericDataflowStrategy):
             return clean1 + '\n' + clean2
 
         interleaved = self._dependency_graph_interleave(stmts_a, stmts_b)
+
+        # Block injection pass: inject atomic statements into a compound block body
+        if random.random() < 0.3:
+            interleaved = self._inject_into_block(interleaved)
+
         fused_code = '\n'.join(interleaved)
 
         # Cross-replace one variable from B with one from A
