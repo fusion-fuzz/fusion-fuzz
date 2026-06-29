@@ -1,7 +1,9 @@
 import argparse
 import logging
 import os
+import re
 import sys
+import subprocess
 import time
 import random
 import importlib.util
@@ -55,10 +57,17 @@ if __name__ == "__main__":
                         help="Override the crash signature used by --reduce. "
                              "Any crash whose output contains this string counts. "
                              'Example: --signature "core dumped"')
+    parser.add_argument("--setup-cov", action="store_true", default=False,
+                        help="Build project with gcov (no sanitizers) for coverage measurement")
+    parser.add_argument("--gcov", action="store_true", default=False,
+                        help="After fuzzing, collect and print gcov line coverage information")
     parser.add_argument("--statement-fusion", action="store_true", default=False,
                         help="Enable statement fusion (dependency-graph interleave)")
     parser.add_argument("--dataflow-fusion", action="store_true", default=False,
                         help="Enable dataflow fusion (bridge variable linking)")
+    parser.add_argument("--all-fusion", action="store_true", default=False,
+                        help="Generate all 4 fusion variants per pair (stmt A→B, stmt B→A, "
+                             "dataflow A+B, dataflow B+A). Each pair counts as one iteration.")
 
     args = parser.parse_args()
 
@@ -168,7 +177,7 @@ if __name__ == "__main__":
     project_corpus_path = os.path.join("projects", args.project, "corpus.db")
     
     # Auto-detect if setup is needed
-    should_run_setup = args.setup or not os.path.exists(project_corpus_path)
+    should_run_setup = args.setup or args.setup_cov or not os.path.exists(project_corpus_path)
 
     if should_run_setup:
         logger.info("Initializing Corpus (Setup Mode)...")
@@ -186,8 +195,15 @@ if __name__ == "__main__":
                 setup_module = importlib.util.module_from_spec(spec)
                 spec.loader.exec_module(setup_module)
                 
-                if hasattr(setup_module, "setup"):
-                    project_root = os.path.abspath(os.path.join("projects", args.project))
+                project_root = os.path.abspath(os.path.join("projects", args.project))
+                if args.setup_cov and hasattr(setup_module, "setup_cov"):
+                    logger.info(f"Executing setup_cov() with root: {project_root}")
+                    try:
+                        setup_module.setup_cov(project_root)
+                        logger.info("Setup (gcov) function finished successfully.")
+                    finally:
+                        os.chdir(original_cwd)
+                elif hasattr(setup_module, "setup"):
                     logger.info(f"Executing setup() with root: {project_root}")
                     try:
                         setup_module.setup(project_root)
@@ -316,9 +332,75 @@ if __name__ == "__main__":
         config=config,
         strategies=get_strategies(args.project,
                                   stmt_fusion=args.statement_fusion,
-                                  dataflow_fusion=args.dataflow_fusion),
-        initial_corpus=_valid_corpus
+                                  dataflow_fusion=args.dataflow_fusion,
+                                  all_fusion=args.all_fusion),
+        initial_corpus=_valid_corpus,
+        all_fusion=args.all_fusion,
     )
     
+    # === GCOV RESET (before fuzzing) ===
+    if args.gcov:
+        php_src_dir = os.path.join("projects", args.project, "php-src")
+        if os.path.isdir(php_src_dir):
+            logger.info("Resetting gcov counters (deleting .gcda files)...")
+            subprocess.run(
+                ["find", php_src_dir, "-name", "*.gcda", "-delete"],
+                check=False
+            )
+
     sample_log = args.sample_log.replace("{project}", args.project) if args.sample_log else None
     fuzzer.run(max_iterations=args.iterations, sample_log=sample_log)
+
+    # === GCOV COVERAGE COLLECTION ===
+    if args.gcov:
+        php_src_dir = os.path.join("projects", args.project, "php-src")
+        if not os.path.isdir(php_src_dir):
+            logger.error(f"Cannot collect gcov data: {php_src_dir} not found")
+            sys.exit(1)
+
+        logger.info("Collecting gcov line coverage...")
+        try:
+            gcov_result = subprocess.run(
+                ["sh", "-c", f"cd {php_src_dir} && find . -name '*.gcda' | head -1"],
+                capture_output=True, text=True
+            )
+            if not gcov_result.stdout.strip():
+                logger.warning("No .gcda files found. Was PHP built with --enable-gcov (--setup-cov)?")
+            else:
+                result = subprocess.run(
+                    ["sh", "-c", f"""
+cd {php_src_dir}
+find . -name '*.gcno' -printf '%h\\n' | sort -u | while read dir; do
+    (cd "$dir" && gcov -n *.gcno 2>/dev/null)
+done
+"""],
+                    capture_output=True, text=True, timeout=300
+                )
+                total_lines = 0
+                exec_lines = 0
+                for line in result.stdout.splitlines():
+                    m = re.match(r"Lines executed:(\d+\.\d+)% of (\d+)", line)
+                    if m:
+                        pct = float(m.group(1))
+                        n = int(m.group(2))
+                        exec_lines += int(pct * n / 100)
+                        total_lines += n
+
+                if total_lines > 0:
+                    overall_pct = exec_lines / total_lines * 100
+                    print(f"\n{'='*60}")
+                    print(f"GCOV Line Coverage Summary")
+                    print(f"{'='*60}")
+                    print(f"  Lines executed: {exec_lines:,} / {total_lines:,} ({overall_pct:.2f}%)")
+                    print(f"{'='*60}\n")
+                else:
+                    logger.warning("No gcov coverage data could be parsed.")
+
+                if result.stderr:
+                    for err_line in result.stderr.strip().splitlines()[:5]:
+                        logger.debug(f"gcov stderr: {err_line}")
+
+        except subprocess.TimeoutExpired:
+            logger.error("gcov collection timed out after 300s")
+        except FileNotFoundError:
+            logger.error("gcov not found. Install gcc/gcov.")

@@ -53,7 +53,7 @@ def _extract_display_code(content: str, ext: str) -> tuple[str, str]:
     return content, ext.lstrip(".")
 
 class FusionFuzzLoop:
-    def __init__(self, config, strategies, initial_corpus):
+    def __init__(self, config, strategies, initial_corpus, all_fusion=False):
         self.config = config
         self.strategies = strategies
         
@@ -80,6 +80,7 @@ class FusionFuzzLoop:
 
         # Initialize the specific driver (e.g., PHPDriver) via factory
         self.driver = get_driver(config)
+        self.all_fusion = all_fusion
         self.iterations = 0
         self.project_name = config.get("project_name", "default_project")
         
@@ -182,6 +183,39 @@ class FusionFuzzLoop:
         except Exception as e:
             logger.error(f"Execution driver error: {e}")
             return None, None
+
+    def process_iteration_all_fusion(self) -> List[Tuple[Optional[Seed], Optional[object]]]:
+        """All-fusion mode: select one pair, produce 4 variants, execute all.
+        Returns a list of (child, result) tuples."""
+        parent_a, parent_b = self.select_parents()
+        if not parent_a or not parent_b:
+            return [(None, None)]
+
+        strategy = random.choice(self.strategies)
+        if not hasattr(strategy, 'fuse_all'):
+            try:
+                child = strategy.fuse(parent_a, parent_b)
+                result = self.driver.execute(child)
+                return [(child, result)]
+            except Exception as e:
+                logger.warning(f"Fusion error: {e}")
+                return [(None, None)]
+
+        try:
+            children = strategy.fuse_all(parent_a, parent_b)
+        except Exception as e:
+            logger.warning(f"All-fusion error: {e}")
+            return [(None, None)]
+
+        results = []
+        for child in children:
+            try:
+                result = self.driver.execute(child)
+                results.append((child, result))
+            except Exception as e:
+                logger.error(f"Execution driver error: {e}")
+                results.append((None, None))
+        return results
 
     def _extract_crash_signature(self, result) -> Optional[str]:
         """
@@ -753,7 +787,7 @@ class FusionFuzzLoop:
                 # REPLENISH PHASE
                 # Submit tasks only if not rotating
                 while len(active_futures) < max_workers and should_submit() and not rotate_pending:
-                    f = executor.submit(self.process_iteration)
+                    f = executor.submit(self.process_iteration_all_fusion if self.all_fusion else self.process_iteration)
                     active_futures.add(f)
                     submitted_count += 1
                 
@@ -796,22 +830,29 @@ class FusionFuzzLoop:
                             # PROCESS RESULTS
                             try:
                                 self.iterations += 1
-                                
+
                                 # Check for rotation triggers
                                 if self.iterations % 2000 == 0:
                                     rotate_pending = True
-                                
+
                                 # Periodic Process Cleanup
                                 if self.iterations % 2000 == 0:
                                     self._cleanup_stale_processes()
-                                
+
                                 # Periodic GC
                                 if self.iterations % 2000 == 0:
                                     gc.collect()
 
-                                child, result = future.result()
-                                
-                                if child and result:
+                                raw_result = future.result()
+                                # Normalize: all-fusion returns a list, normal returns a tuple
+                                if self.all_fusion:
+                                    pairs = raw_result
+                                else:
+                                    pairs = [raw_result]
+
+                                for child, result in pairs:
+                                    if not child or not result:
+                                        continue
                                     # Log sample details
                                     self._log_sample(child, result)
 
@@ -822,7 +863,7 @@ class FusionFuzzLoop:
                                     if result.crashed:
                                         # Deduplication logic
                                         signature = self._extract_crash_signature(result)
-                                        
+
                                         if signature:
                                             if signature not in self.unique_crashes:
                                                 self.unique_crashes.add(signature)
@@ -837,13 +878,12 @@ class FusionFuzzLoop:
                                             sys.stdout.write("\n")
                                             logger.error(f"CRASH FOUND! ID: {child.id} (No Sig - Saving)")
                                             self._save_crash_bundle(child, result, fallback_sig)
-                                    
+
                                     if self.is_interesting(result):
                                         self.corpus.append(child)
-                                        
-                                # Truncate large outputs to save memory,
-                                # keeping content around the crash signature.
-                                if result:
+
+                                    # Truncate large outputs to save memory,
+                                    # keeping content around the crash signature.
                                     if len(result.stdout or "") > 50000:
                                         result.stdout = smart_truncate(result.stdout or "", max_chars=50000)
                                     if len(result.stderr or "") > 50000:
