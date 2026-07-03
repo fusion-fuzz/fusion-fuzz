@@ -62,12 +62,26 @@ if __name__ == "__main__":
     parser.add_argument("--gcov", action="store_true", default=False,
                         help="After fuzzing, collect and print gcov line coverage information")
     parser.add_argument("--statement-fusion", action="store_true", default=False,
-                        help="Enable statement fusion (dependency-graph interleave)")
+                        help="Enable statement fusion (dependency-graph interleave). "
+                             "Each fusion randomly picks A->B or B->A direction.")
     parser.add_argument("--dataflow-fusion", action="store_true", default=False,
-                        help="Enable dataflow fusion (bridge variable linking)")
+                        help="Enable dataflow fusion (bridge variable linking). "
+                             "Each fusion randomly picks A->B or B->A direction.")
     parser.add_argument("--all-fusion", action="store_true", default=False,
                         help="Generate all 4 fusion variants per pair (stmt A→B, stmt B→A, "
                              "dataflow A+B, dataflow B+A). Each pair counts as one iteration.")
+    parser.add_argument("--corpus-size", type=int, default=None, metavar="N",
+                        help="Sample N seeds from the loaded corpus for fusion "
+                             "instead of using all seed programs")
+    parser.add_argument("--diverse", action="store_true", default=False,
+                        help="With --corpus-size, select dissimilar seeds (best-effort "
+                             "greedy farthest-point sampling) instead of a uniform random sample")
+    parser.add_argument("--save-subset", type=str, default=None, metavar="PATH",
+                        help="Save the selected corpus subset (after --corpus-size/--diverse) "
+                             "to PATH for reuse via --load-subset")
+    parser.add_argument("--load-subset", type=str, default=None, metavar="PATH",
+                        help="Load a previously saved corpus subset from PATH instead of "
+                             "the project corpus (skips --corpus-size/--diverse selection)")
 
     args = parser.parse_args()
 
@@ -285,21 +299,51 @@ if __name__ == "__main__":
         logger.error(f"Corpus DB not found at {project_corpus_path}. Setup failed.")
         sys.exit(1)
 
-    logger.info(f"Loading corpus from {project_corpus_path}...")
-    
-    parser_path = os.path.join("projects", args.project, "parser.py")
-    spec = importlib.util.spec_from_file_location("project_parser", parser_path)
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    
-    raw_seeds = module.load_corpus(project_corpus_path)
+    if args.load_subset:
+        from core.corpus_sampling import load_subset
+        logger.info(f"Loading saved corpus subset from {args.load_subset}...")
+        initial_corpus = load_subset(args.load_subset)
+        logger.info(f"Loaded {len(initial_corpus)} seeds from subset (skipping --corpus-size/--diverse).")
+    else:
+        logger.info(f"Loading corpus from {project_corpus_path}...")
 
-    initial_corpus = [
-        Seed(content=s["content"], metadata=s["metadata"]) 
-        for s in raw_seeds
-    ]
-    
-    logger.info(f"Loaded {len(initial_corpus)} seeds into memory.")
+        parser_path = os.path.join("projects", args.project, "parser.py")
+        spec = importlib.util.spec_from_file_location("project_parser", parser_path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+
+        raw_seeds = module.load_corpus(project_corpus_path)
+
+        initial_corpus = [
+            Seed(content=s["content"], metadata={**s["metadata"], "filename": s["filename"]})
+            for s in raw_seeds
+        ]
+
+        logger.info(f"Loaded {len(initial_corpus)} seeds into memory.")
+
+        # 4.5. Optionally sample down to a fixed corpus size
+        if args.corpus_size is not None:
+            if args.corpus_size < len(initial_corpus):
+                if args.diverse:
+                    from core.corpus_sampling import select_diverse_seeds
+                    initial_corpus = select_diverse_seeds(initial_corpus, args.corpus_size)
+                    logger.info(
+                        f"Diversity-sampled {len(initial_corpus)} seeds "
+                        f"(--corpus-size {args.corpus_size} --diverse) for fusion."
+                    )
+                else:
+                    initial_corpus = random.sample(initial_corpus, args.corpus_size)
+                    logger.info(f"Sampled {len(initial_corpus)} seeds (--corpus-size {args.corpus_size}) for fusion.")
+            else:
+                logger.info(
+                    f"--corpus-size {args.corpus_size} >= loaded corpus size {len(initial_corpus)}; "
+                    "using all seeds."
+                )
+
+        if args.save_subset:
+            from core.corpus_sampling import save_subset
+            save_subset(initial_corpus, args.save_subset)
+            logger.info(f"Saved {len(initial_corpus)} selected seeds to {args.save_subset} for reuse via --load-subset.")
 
     # 5. Corpus dry-run: execute every seed once, collect rich metadata,
     #    persist it to the project corpus DB, and keep only rc=0 seeds.

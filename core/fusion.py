@@ -982,70 +982,20 @@ class PHPFusionStrategy(GenericDataflowStrategy):
         return phpt
 
     def fuse(self, parent_a: Seed, parent_b: Seed) -> Seed:
-        phpcode1 = parent_a.content
-        phpcode2 = parent_b.content
-        meta1 = parent_a.metadata
-        meta2 = parent_b.metadata
-        variable1 = meta1.get('variables', [])
-        variable2 = meta2.get('variables', [])
-        dataflow1 = meta1.get('dataflows', [])
-        dataflow2 = meta2.get('dataflows', [])
-        if self.mutation:
-            phpcode1 = self.mut.mutate(phpcode1)
-            phpcode2 = self.mut.mutate(phpcode2)
-        clean1 = self.clean_php_header_tail(phpcode1)
-        clean2 = self.clean_php_header_tail(phpcode2)
+        mode = 'stmt_ab' if self.stmt_fusion else 'df_ab'
+        return self._build_fused_test(parent_a, parent_b, mode)
 
-        preamble1, clean1 = self._extract_preamble(clean1)
-        preamble2, clean2 = self._extract_preamble(clean2)
-        preamble_lines = list(dict.fromkeys(preamble1 + preamble2))
-        preamble_code = '\n'.join(preamble_lines)
-
-        clean2 = self._resolve_name_conflicts(clean1, clean2)
-
-        _pre_cls = ""
-        _after_cls = ""
-        extra_class_flows = []
-        all_vars = variable1 + variable2 + ['$fusion']
-        if random.random() < 0.2:
-            _pre_cls, _after_cls, class_vars = self._instrumentation_classfuzz(all_vars)
-            if class_vars:
-                extra_class_flows = [class_vars]
-                all_vars.extend(class_vars)
-
+    def fuse_bidirectional(self, parent_a: Seed, parent_b: Seed) -> List[Seed]:
+        """Produce both A->B and B->A variants for the active fusion kind."""
         if self.stmt_fusion:
-            # Statement fusion: dependency-graph interleave + variable cross-replace
-            fused_body = self._statement_fuse(clean1, clean2, variable1, variable2)
-            inner = f"{_pre_cls}\n{fused_body}\n"
-        else:
-            # Dataflow fusion: sequential concatenation + bridge variable
-            new_code1, new_code2 = self.interleave_code_blocks(
-                clean1, clean2, dataflow1, dataflow2,
-                extra_flows=extra_class_flows)
-            inner = f"{_pre_cls}\n{new_code1}\n{new_code2}\n"
-
-        _inst_api = ""
-        if self.apifuzz and random.random() < 0.2:
-            _inst_api = self._instrumentation_apifuzz(all_vars)
-        _inst_dump = "\nvar_dump(get_defined_vars());\n"
-
-        inner += f"{_inst_dump}\n{_inst_api}\n{_after_cls}"
-        php_body = f"{preamble_code}\ntry {{\n{inner}\n}} catch (\\Throwable $_ffl_e) {{}}\n"
-        fused_file = f"\n--FILE--\n<?php\n{php_body}"
-        desc = f"--TEST--\nFused {parent_a.id} + {parent_b.id}\n"
-        conf = f"\n--INI--\n{meta1.get('configuration','')}\n{meta2.get('configuration','')}\n{self.random_inis()}\n"
-        ext = ""
-        if meta1.get('extension') or meta2.get('extension'):
-            ext = f"\n--EXTENSION--\n{meta1.get('extension','')}\n{meta2.get('extension','')}\n"
-        expect = "\n--EXPECT--\nthis is a flowfusion test\n"
-        fused_test = f"{desc}{conf}{ext}{fused_file}{expect}"
-        fused_test = re.sub("\n+", "\n", fused_test)
-        fused_test = self.adhoc_syntax_patch(fused_test)
-        return Seed(content=fused_test, metadata={
-            "parents": [parent_a.id, parent_b.id],
-            "type": "phpt",
-            "description": f"Fused {parent_a.id} + {parent_b.id}",
-        })
+            return [
+                self._build_fused_test(parent_a, parent_b, 'stmt_ab'),
+                self._build_fused_test(parent_a, parent_b, 'stmt_ba'),
+            ]
+        return [
+            self._build_fused_test(parent_a, parent_b, 'df_ab'),
+            self._build_fused_test(parent_a, parent_b, 'df_ba'),
+        ]
 
     def _build_fused_test(self, parent_a, parent_b, mode):
         """Build a single fused test for a specific mode.

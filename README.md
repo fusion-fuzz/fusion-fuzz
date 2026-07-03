@@ -95,6 +95,23 @@ docker exec -it fuzz-mlir bash -c "cd /home/fuzz/WorkSpace/fusion-fuzz && python
 
 > **Note:** The first MLIR setup compiles LLVM/MLIR from source, which can take several hours and requires substantial RAM. On a 32 GB machine, limit compilation parallelism (the Dockerfile does this automatically with `-j4`).
 
+
+#### Rust
+
+```bash
+cd ./projects/rust && docker build -t fusion-fuzz-rust . && cd ../..
+docker run --name fuzz-rust -dit -m 24g -v .:/home/fuzz/WorkSpace/fusion-fuzz fusion-fuzz-rust:latest
+docker exec -it fuzz-rust bash -c "cd /home/fuzz/WorkSpace/fusion-fuzz && python3 main.py --project rust --setup --bug-corpus"
+```
+
+#### Go
+
+```bash
+cd ./projects/go && docker build -t fusion-fuzz-go . && cd ../..
+docker run --name fuzz-go -dit -m 24g -v .:/home/fuzz/WorkSpace/fusion-fuzz fusion-fuzz-go:latest
+docker exec -it fuzz-go bash -c "cd /home/fuzz/WorkSpace/fusion-fuzz && python3 main.py --project go --setup --bug-corpus"
+```
+
 ### CLI Reference
 
 ```

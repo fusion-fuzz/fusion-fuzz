@@ -101,6 +101,7 @@ class FusionFuzzLoop:
         # Stats tracking initialized here to avoid AttributeErrors
         self.start_time = time.time()
         self.syntax_error_count = 0
+        self.sample_count = 0
         self.last_status_print = 0
 
         # Sample log (set in run())
@@ -145,7 +146,7 @@ class FusionFuzzLoop:
         """Select two parents from the corpus, preferring unfused pairs."""
         return self.coverage.select_parents(self.corpus)
 
-    def process_iteration(self) -> Tuple[Optional[Seed], Optional[object]]:
+    def process_iteration(self) -> List[Tuple[Optional[Seed], Optional[object]]]:
         """
         Worker function to handle Selection, Fusion, and Execution.
         Executed in a separate thread.
@@ -167,22 +168,28 @@ class FusionFuzzLoop:
             parent_a, parent_b = self.select_parents()
 
             if not parent_a or not parent_b:
-                return None, None
+                return [(None, None)]
 
             try:
                 strategy = random.choice(self.strategies)
-                child = strategy.fuse(parent_a, parent_b)
+                if hasattr(strategy, 'fuse_bidirectional'):
+                    children = strategy.fuse_bidirectional(parent_a, parent_b)
+                else:
+                    children = [strategy.fuse(parent_a, parent_b)]
             except Exception as e:
                 logger.warning(f"Fusion error: {e}")
-                return None, None
+                return [(None, None)]
 
         # 3. Execute
-        try:
-            result = self.driver.execute(child)
-            return child, result
-        except Exception as e:
-            logger.error(f"Execution driver error: {e}")
-            return None, None
+        pairs = []
+        for child in children:
+            try:
+                result = self.driver.execute(child)
+                pairs.append((child, result))
+            except Exception as e:
+                logger.error(f"Execution driver error: {e}")
+                pairs.append((None, None))
+        return pairs
 
     def process_iteration_all_fusion(self) -> List[Tuple[Optional[Seed], Optional[object]]]:
         """All-fusion mode: select one pair, produce 4 variants, execute all.
@@ -634,22 +641,23 @@ class FusionFuzzLoop:
         elapsed = current_time - self.start_time
         if elapsed <= 0: elapsed = 1e-9
         
-        tps = self.iterations / elapsed
-        
+        throughput = self.sample_count / elapsed
+
         valid_rate = 100.0
-        if self.iterations > 0:
-            valid_rate = 100.0 * (1.0 - (self.syntax_error_count / self.iterations))
-            
+        if self.sample_count > 0:
+            valid_rate = 100.0 * (1.0 - (self.syntax_error_count / self.sample_count))
+
         n = len(self.corpus)
         total_pairs = n * (n - 1) // 2
         covered = self.coverage.covered_count()
         cov_pct = (covered / total_pairs * 100.0) if total_pairs > 0 else 100.0
+        pairs_per_sec = covered / elapsed
         status = (
             f"\r[ {str(datetime.timedelta(seconds=int(elapsed)))} ] "
-            f"Iter: {self.iterations} ({tps:.1f}/s) | "
+            f"Throughput: {throughput:.1f} tests/s | "
             f"Bugs: {len(self.unique_crashes)} | "
-            f"ZeroRate: {valid_rate:.1f}% | "
-            f"PairCov: {covered}/{total_pairs} ({cov_pct:.1f}%)"
+            f"FuseValidRate: {valid_rate:.1f}% | "
+            f"PairCov: {covered}/{total_pairs} ({cov_pct:.1f}%, {pairs_per_sec:.1f} pairs/s)"
         )
         
         # Write carriage return to overwrite line
@@ -778,6 +786,8 @@ class FusionFuzzLoop:
         try:
             # Helper to check if we should continue submitting tasks
             def should_submit():
+                if self.coverage.is_saturated(self.corpus):
+                    return False
                 if max_iterations == -1: return True
                 return submitted_count < max_iterations
 
@@ -843,12 +853,7 @@ class FusionFuzzLoop:
                                 if self.iterations % 2000 == 0:
                                     gc.collect()
 
-                                raw_result = future.result()
-                                # Normalize: all-fusion returns a list, normal returns a tuple
-                                if self.all_fusion:
-                                    pairs = raw_result
-                                else:
-                                    pairs = [raw_result]
+                                pairs = future.result()
 
                                 for child, result in pairs:
                                     if not child or not result:
@@ -857,6 +862,7 @@ class FusionFuzzLoop:
                                     self._log_sample(child, result)
 
                                     # Check Syntax Stats
+                                    self.sample_count += 1
                                     if self._is_syntax_error(result):
                                         self.syntax_error_count += 1
 
@@ -906,6 +912,11 @@ class FusionFuzzLoop:
                             pass
                 elif not should_submit():
                     # No active futures and shouldn't submit -> Done
+                    if self.coverage.is_saturated(self.corpus):
+                        sys.stdout.write("\n")
+                        logger.info(
+                            f"All {self.coverage.covered_count()} pairs covered — stopping fuzzing."
+                        )
                     break
 
         except KeyboardInterrupt:

@@ -30,6 +30,12 @@ class PairwiseCoverageMatrix:
     def covered_count(self) -> int:
         return len(self._fused)
 
+    def is_saturated(self, corpus) -> bool:
+        """Return True when every possible pair in corpus has been fused."""
+        n = len(corpus)
+        total = n * (n - 1) // 2
+        return total > 0 and len(self._fused) >= total
+
     def coverage_ratio(self, corpus) -> float:
         """Fraction of all possible pairs that have been fused."""
         n = len(corpus)
