@@ -70,6 +70,11 @@ if __name__ == "__main__":
     parser.add_argument("--all-fusion", action="store_true", default=False,
                         help="Generate all 4 fusion variants per pair (stmt A→B, stmt B→A, "
                              "dataflow A+B, dataflow B+A). Each pair counts as one iteration.")
+    parser.add_argument("--struct-fusion", action="store_true", default=False,
+                        help="[rust only] Item-level fusion: nest struct/enum/trait/impl/fn "
+                             "definitions from one seed inside a container (mod/fn body) found "
+                             "in the other, plus supertrait injection, impl grafting, and "
+                             "generic bound injection. Does not use statement/dataflow fusion.")
     parser.add_argument("--corpus-size", type=int, default=None, metavar="N",
                         help="Sample N seeds from the loaded corpus for fusion "
                              "instead of using all seed programs")
@@ -377,7 +382,8 @@ if __name__ == "__main__":
         strategies=get_strategies(args.project,
                                   stmt_fusion=args.statement_fusion,
                                   dataflow_fusion=args.dataflow_fusion,
-                                  all_fusion=args.all_fusion),
+                                  all_fusion=args.all_fusion,
+                                  struct_fusion=args.struct_fusion),
         initial_corpus=_valid_corpus,
         all_fusion=args.all_fusion,
     )

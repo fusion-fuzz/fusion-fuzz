@@ -3073,13 +3073,141 @@ func _ffl_p9() {
         )
 
 
-class RustFusionStrategy(FusionStrategy):
+class RustLexMixin:
+    """
+    Literal-aware lexing helpers for Rust source text (strings, chars,
+    comments, raw/byte strings), shared by every Rust fusion strategy that
+    needs to find item/brace boundaries without a real parser.
+    """
+
+    _RUST_RAW_STR_START = re.compile(r'(?:b)?r(#*)"')
+    _RUST_CHAR_LIT_RE = re.compile(r"'(?:\\u\{[0-9a-fA-F]+\}|\\.|[^'\\])'")
+
+    def _rust_skip_literal(self, code: str, i: int):
+        """If code[i:] starts a string/char/comment literal, return the
+        index just past its end; else return None."""
+        n = len(code)
+        two = code[i:i + 2]
+        if two == '//':
+            j = code.find('\n', i)
+            return j if j != -1 else n
+        if two == '/*':
+            j = code.find('*/', i + 2)
+            return (j + 2) if j != -1 else n
+        m = self._RUST_RAW_STR_START.match(code, i)
+        if m:
+            end_pat = '"' + m.group(1)
+            j = code.find(end_pat, m.end())
+            return (j + len(end_pat)) if j != -1 else n
+        ch = code[i]
+        if ch == '"' or two == 'b"':
+            j = i + (2 if two == 'b"' else 1)
+            while j < n:
+                if code[j] == '\\':
+                    j += 2
+                    continue
+                if code[j] == '"':
+                    return j + 1
+                j += 1
+            return n
+        if ch == "'":
+            cm = self._RUST_CHAR_LIT_RE.match(code, i)
+            if cm:
+                return cm.end()
+            # lifetime, e.g. 'a — no closing quote
+            j = i + 1
+            while j < n and (code[j].isalnum() or code[j] == '_'):
+                j += 1
+            return j
+        return None
+
+    def _rust_real_mask(self, code: str):
+        """bool list: True where code[i] is real code, False inside a
+        string/char/comment literal."""
+        n = len(code)
+        is_real = [False] * n
+        i = 0
+        while i < n:
+            ch = code[i]
+            prev = code[i - 1] if i > 0 else ''
+            maybe_literal = (
+                ch in ('"', "'") or code[i:i + 2] in ('//', '/*') or
+                (ch in ('b', 'r') and not (prev.isalnum() or prev == '_'))
+            )
+            end = self._rust_skip_literal(code, i) if maybe_literal else None
+            if end is not None:
+                i = end
+                continue
+            is_real[i] = True
+            i += 1
+        return is_real
+
+    def _rust_matching_close(self, code, is_real, open_pos, open_ch='{', close_ch='}'):
+        """open_pos is the index of an open_ch; return the index of its
+        matching close_ch, respecting nesting and literals."""
+        depth = 0
+        n = len(code)
+        i = open_pos
+        while i < n:
+            if is_real[i]:
+                if code[i] == open_ch:
+                    depth += 1
+                elif code[i] == close_ch:
+                    depth -= 1
+                    if depth == 0:
+                        return i
+            i += 1
+        return None
+
+    def _rust_split_top_level(self, text: str, sep: str = ','):
+        """Split text on `sep` at bracket depth 0 (tracks ([{< nesting)."""
+        is_real = self._rust_real_mask(text)
+        parts, cur, depth = [], [], 0
+        for i, ch in enumerate(text):
+            if is_real[i]:
+                if ch in '([{<':
+                    depth += 1
+                elif ch in ')]}>':
+                    depth = max(0, depth - 1)
+                elif ch == sep and depth == 0:
+                    parts.append(''.join(cur))
+                    cur = []
+                    continue
+            cur.append(ch)
+        if ''.join(cur).strip():
+            parts.append(''.join(cur))
+        return [p for p in parts if p.strip()]
+
+
+class RustFusionStrategy(RustLexMixin, FusionStrategy):
     """
     Rust-Specific Fusion Strategy.
-    1. Extracts 'use' statements and hoists them.
-    2. Renames 'fn main' in parents to unique names.
-    3. Creates a new 'fn main' that calls the parent mains.
-    4. Injects random dataflow bridging between variables if possible (naive regex).
+
+    Unlike the old "call both mains back-to-back" approach, this strategy
+    inlines eligible free-function calls directly into each seed's `main`
+    body (substituting the real call-site arguments — not fabricated
+    values), splits both inlined bodies into statements, and interleaves
+    them into ONE shared scope. That's what lets a variable that used to
+    live inside a helper `fn` actually interact with a variable from the
+    other seed: they now sit in the same block.
+
+    Steps:
+    1. Extract crate-level attrs / 'use' imports and hoist them.
+    2. Rename 'fn main' in each parent to a unique name.
+    3. Find top-level (non-method, non-generic, non-recursive, `?`-free)
+       free functions and inline their call sites inside `main`, rewriting
+       `return expr;` to `break 'label expr;` inside a labeled block so
+       control flow still works once the function body is flattened.
+    4. Split each inlined `main` body into statements (order preserved per
+       seed — Rust's move/borrow rules make reordering within a seed risky)
+       and riffle-interleave the two statement streams into one function.
+    5. Optionally inject one type-checked cross-seed bridge: pick a later
+       `let` in one seed and rebind it from an earlier, type-compatible
+       `let` in the other seed (Copy direct, Clone via `.clone()`).
+
+    Functions this can't safely flatten (generics, recursion, `?`, or that
+    aren't called from `main`) are left as ordinary top-level items in the
+    output — unused is harmless, a compile error is not.
     """
     def __init__(self, project_root="projects/rust"):
         self.project_root = project_root
@@ -3107,6 +3235,11 @@ class RustFusionStrategy(FusionStrategy):
                 body_lines.append(line)
 
         body = "\n".join(body_lines)
+
+        # Corpus seed ids are often derived from filenames (e.g.
+        # "aapcs-unwind.rs"), which contain hyphens/dots — invalid in Rust
+        # identifiers. Sanitize before using uid in any generated name.
+        uid = re.sub(r'[^a-zA-Z0-9_]', '_', uid)
 
         # Rename main function
         main_regex = r'(fn\s+)main(\s*\()'
@@ -3151,53 +3284,307 @@ class RustFusionStrategy(FusionStrategy):
             return True
         return False
 
-    def _pick_bridge_pair(self, meta_a: dict, meta_b: dict):
-        """
-        Pick (var_a, var_b, needs_clone) from dryrun metadata.
+    def _replace_random_identifier(self, s: str, name: str, replacement: str):
+        """Word-boundary-safe replace of one random occurrence of `name` in
+        `s` (not `->`/`::`-qualified). Returns None if no match — callers
+        must not fall back to plain substring replace, which would also
+        match `name` as a substring of unrelated identifiers (e.g. `a`
+        inside `break`)."""
+        pattern = re.compile(r'(?<![.\w:])' + re.escape(name) + r'(?!\w)')
+        matches = list(pattern.finditer(s))
+        if not matches:
+            return None
+        m = random.choice(matches)
+        return s[:m.start()] + replacement + s[m.end():]
 
-        Priority:
-          1. Matching Copy types in both seeds         → direct assignment, no clone
-          2. Matching Clone-able types in both seeds   → assignment + .clone()
-          3. Any Copy var from A × any var in B        → direct (type-unsafe but may work)
-          4. None → fall back to no bridge
-        """
-        var_types_a: dict = meta_a.get("var_types", {})
-        var_types_b: dict = meta_b.get("var_types", {})
-        prim_a: list      = meta_a.get("primitive_vars", [])
-        clone_a: list     = meta_a.get("cloneable_vars", [])
+    # ------------------------------------------------------------------
+    # Top-level free-function extraction & inlining
+    # ------------------------------------------------------------------
 
-        if not var_types_a or not var_types_b:
-            return None, None, False
+    _RUST_FN_START_RE = re.compile(
+        r'(?:pub(?:\([^)]*\))?\s+)?'
+        r'(?:(?:async|unsafe|const)\s+){0,3}'
+        r'fn\s+([a-zA-Z_][a-zA-Z0-9_]*)'
+    )
+    _RUST_PARAM_RE = re.compile(r'^\s*(?:mut\s+)?([a-zA-Z_][a-zA-Z0-9_]*)\s*:\s*(.+)$', re.S)
+    _LET_TYPE_RE = re.compile(r'\blet\s+(?:mut\s+)?([a-zA-Z_][a-zA-Z0-9_]*)\s*:\s*([^=;\n]+?)\s*(?:=|;)')
 
-        # Candidates on the B side: any variable that has a declared type
-        b_vars = list(var_types_b.keys())
-        if not b_vars:
-            return None, None, False
+    def _extract_top_level_fns(self, body: str):
+        """Find `fn` items at brace-depth 0 (i.e. not inside impl/trait/mod
+        — those are methods, not free functions, and are left alone)."""
+        is_real = self._rust_real_mask(body)
+        n = len(body)
+        depth_before = [0] * n
+        depth = 0
+        for i in range(n):
+            if is_real[i]:
+                depth_before[i] = depth
+                if body[i] == '{':
+                    depth += 1
+                elif body[i] == '}':
+                    depth = max(0, depth - 1)
 
-        # --- Pass 1: Copy-type pairs ---
-        for va in prim_a:
-            ta = var_types_a.get(va, "")
-            for vb in b_vars:
-                tb = var_types_b.get(vb, "")
-                if self._types_compatible(ta, tb):
-                    return va, vb, False        # direct: let fusion_var = va;
+        fns = []
+        for m in self._RUST_FN_START_RE.finditer(body):
+            start = m.start()
+            if not is_real[start] or depth_before[start] != 0:
+                continue
+            name = m.group(1)
+            is_unsafe = 'unsafe' in m.group(0)
+            pos = m.end()
+            while pos < n and body[pos].isspace():
+                pos += 1
+            if pos < n and body[pos] == '<':
+                gdepth = 0
+                while pos < n:
+                    if is_real[pos]:
+                        if body[pos] == '<':
+                            gdepth += 1
+                        elif body[pos] == '>':
+                            gdepth -= 1
+                            if gdepth == 0:
+                                pos += 1
+                                break
+                    pos += 1
+                generics_present = True
+                while pos < n and body[pos].isspace():
+                    pos += 1
+            else:
+                generics_present = False
+            if pos >= n or body[pos] != '(':
+                continue
+            paren_close = self._rust_matching_close(body, is_real, pos, '(', ')')
+            if paren_close is None:
+                continue
+            params_text = body[pos + 1:paren_close]
+            pos = paren_close + 1
+            bdepth = 0
+            while pos < n:
+                if is_real[pos]:
+                    ch = body[pos]
+                    if ch in '([<':
+                        bdepth += 1
+                    elif ch in ')]>':
+                        bdepth = max(0, bdepth - 1)
+                    elif ch == '{' and bdepth == 0:
+                        break
+                pos += 1
+            if pos >= n or body[pos] != '{':
+                continue
+            body_close = self._rust_matching_close(body, is_real, pos, '{', '}')
+            if body_close is None:
+                continue
+            fns.append({
+                'name': name,
+                'start': start,
+                'end': body_close + 1,
+                'params_text': params_text,
+                'generics': generics_present,
+                'is_unsafe': is_unsafe,
+                'body_text': body[pos + 1:body_close],
+            })
+        return fns
 
-        # --- Pass 2: Clone-able pairs ---
-        for va in clone_a:
-            if va in prim_a:
-                continue                        # already tried
-            ta = var_types_a.get(va, "")
-            for vb in b_vars:
-                tb = var_types_b.get(vb, "")
-                if self._types_compatible(ta, tb):
-                    return va, vb, True         # clone:  let fusion_var = va.clone();
+    def _parse_params(self, params_text: str):
+        """Return [(name, type), ...] or None if unsupported (self receiver
+        or a destructuring pattern we can't safely bind by name)."""
+        params = []
+        for p in self._rust_split_top_level(params_text, ','):
+            p = p.strip()
+            if not p:
+                continue
+            if re.match(r'^&(?:\'[a-z_]+\s+)?(?:mut\s+)?self\b', p) or p == 'self':
+                return None
+            m = self._RUST_PARAM_RE.match(p)
+            if not m:
+                return None
+            params.append((m.group(1), m.group(2).strip()))
+        return params
 
-        # --- Pass 3: Any Copy var from A × first B var (type mismatch may occur,
-        #             but Copy types are at least free of borrow issues) ---
-        if prim_a:
-            return prim_a[0], random.choice(b_vars), False
+    def _fn_is_inlinable(self, fn: dict, params) -> bool:
+        if fn['generics'] or params is None:
+            return False
+        if re.search(r'\b' + re.escape(fn['name']) + r'\s*\(', fn['body_text']):
+            return False  # (mutually) recursive-looking — skip for safety
+        is_real = self._rust_real_mask(fn['body_text'])
+        for i, ch in enumerate(fn['body_text']):
+            if ch == '?' and is_real[i]:
+                return False  # `?` operator needs the enclosing fn's Result/Option type
+        return True
 
-        return None, None, False
+    def _flatten_fn_call(self, fn: dict, params, args_text: str, label: str) -> str:
+        args = [a.strip() for a in self._rust_split_top_level(args_text, ',') if a.strip()]
+        lets = [f"let {pname}: {ptype} = {arg};" for (pname, ptype), arg in zip(params, args)]
+        body = fn['body_text']
+        body = re.sub(r'\breturn\s*;', f"break '{label};", body)
+        body = re.sub(r'\breturn\s+([^;]+);', rf"break '{label} \1;", body)
+        inner = "\n".join(lets) + "\n" + body
+        if fn['is_unsafe']:
+            inner = f"unsafe {{\n{inner}\n}}"
+        return f"'{label}: {{\n{inner}\n}}"
+
+    def _inline_calls_in_body(self, main_body: str, fn_defs: list, uid: str) -> str:
+        """Replace direct calls to any inlinable fn in fn_defs with its
+        flattened labeled-block body, substituting the real call arguments."""
+        uid = re.sub(r'[^a-zA-Z0-9_]', '_', uid)
+        counter = 0
+        for fn in fn_defs:
+            params = self._parse_params(fn['params_text'])
+            if not self._fn_is_inlinable(fn, params):
+                continue
+            # Compute the literal mask once per function and locate every
+            # call site up front, then splice back-to-front so earlier
+            # offsets stay valid — avoids re-scanning the whole (growing)
+            # body from scratch for every single occurrence.
+            is_real = self._rust_real_mask(main_body)
+            call_re = re.compile(r'\b' + re.escape(fn['name']) + r'\s*\(')
+            spans = []
+            for cand in call_re.finditer(main_body):
+                if not is_real[cand.start()]:
+                    continue
+                open_paren = cand.end() - 1
+                close_paren = self._rust_matching_close(main_body, is_real, open_paren, '(', ')')
+                if close_paren is not None:
+                    spans.append((cand.start(), open_paren, close_paren))
+            for start, open_paren, close_paren in reversed(spans):
+                args_text = main_body[open_paren + 1:close_paren]
+                counter += 1
+                label = f"ffl_{uid}_{fn['name']}_{counter}"
+                replacement = self._flatten_fn_call(fn, params, args_text, label)
+                main_body = main_body[:start] + replacement + main_body[close_paren + 1:]
+        return main_body
+
+    def _flatten_and_extract_main(self, body: str, main_name, uid: str):
+        """Returns (statements: list[str], leftover_body: str)."""
+        if not main_name:
+            return [], body
+        fns = self._extract_top_level_fns(body)
+        main_fn = next((f for f in fns if f['name'] == main_name), None)
+        if main_fn is None:
+            return [], body
+        other_fns = [f for f in fns if f['name'] != main_name]
+        inlined = self._inline_calls_in_body(main_fn['body_text'], other_fns, uid)
+        leftover = body[:main_fn['start']] + body[main_fn['end']:]
+        return self._split_rust_statements(inlined), leftover
+
+    # ------------------------------------------------------------------
+    # Statement splitting & cross-seed interleave
+    # ------------------------------------------------------------------
+
+    def _split_rust_statements(self, code: str):
+        """Split a function body into statement units. Compound
+        blocks used in statement position (if/for/while/loop/match/unsafe/
+        labeled blocks) self-terminate at their closing brace; anything
+        that looks like a `let`/`const`/`static` binding keeps accumulating
+        until its trailing `;`, since its value may itself be a block
+        expression (`let x = match ... { ... };`)."""
+        statements = []
+        current = []
+        brace_depth = paren_depth = bracket_depth = 0
+        is_real = self._rust_real_mask(code)
+        n = len(code)
+        i = 0
+        while i < n:
+            ch = code[i]
+            current.append(ch)
+            if not is_real[i]:
+                i += 1
+                continue
+            if ch == '(':
+                paren_depth += 1
+            elif ch == ')':
+                paren_depth -= 1
+            elif ch == '[':
+                bracket_depth += 1
+            elif ch == ']':
+                bracket_depth -= 1
+            elif ch == '{':
+                brace_depth += 1
+            elif ch == '}':
+                brace_depth -= 1
+                if brace_depth <= 0 and paren_depth <= 0 and bracket_depth <= 0:
+                    brace_depth = 0
+                    stmt_so_far = ''.join(current)
+                    is_binding = bool(re.match(r'^\s*(?:let\s|const\s|static\s)', stmt_so_far))
+                    if not is_binding:
+                        stripped = stmt_so_far.strip()
+                        if stripped:
+                            statements.append(stripped)
+                        current = []
+                    i += 1
+                    continue
+            elif ch == ';' and brace_depth <= 0 and paren_depth <= 0 and bracket_depth <= 0:
+                stripped = ''.join(current).strip()
+                if stripped:
+                    statements.append(stripped)
+                current = []
+                i += 1
+                continue
+            i += 1
+        leftover = ''.join(current).strip()
+        if leftover:
+            statements.append(leftover)
+        return statements
+
+    def _interleave_preserving_order(self, stmts_a, stmts_b):
+        """Riffle-merge two statement streams, keeping each seed's own
+        relative order intact (Rust's move/borrow rules make reordering
+        within a seed risky; interleaving across seeds is the safe axis)."""
+        tagged = []
+        ia = ib = 0
+        while ia < len(stmts_a) or ib < len(stmts_b):
+            if ia >= len(stmts_a):
+                tagged.append(('b', stmts_b[ib])); ib += 1
+            elif ib >= len(stmts_b):
+                tagged.append(('a', stmts_a[ia])); ia += 1
+            elif random.random() < 0.5:
+                tagged.append(('a', stmts_a[ia])); ia += 1
+            else:
+                tagged.append(('b', stmts_b[ib])); ib += 1
+        return tagged
+
+    def _bridge_across_seeds(self, tagged_stmts):
+        """Pick one later `let` in one seed and rebind it from an earlier,
+        type-compatible `let` in the other seed — the actual cross-seed
+        variable fusion. Only bridges typed `let`s, and only from a
+        definition that appears earlier in the merged order."""
+        defs = []
+        for idx, (origin, stmt) in enumerate(tagged_stmts):
+            m = self._LET_TYPE_RE.search(stmt)
+            if m:
+                norm_t = re.sub(r"&(?:'[a-z_]+\s+)?(?:mut\s+)?", "", m.group(2)).strip()
+                defs.append((idx, origin, m.group(1), norm_t))
+        if len(defs) < 2:
+            return tagged_stmts
+
+        order = list(range(len(defs)))
+        random.shuffle(order)
+        for k in order:
+            tgt_idx, tgt_origin, tgt_name, tgt_type = defs[k]
+            candidates = [d for d in defs if d[0] < tgt_idx and d[1] != tgt_origin
+                          and self._types_compatible(d[3], tgt_type)]
+            if not candidates:
+                continue
+            src_idx, src_origin, src_name, src_type = random.choice(candidates)
+            needs_clone = self._base_type(src_type) not in self._COPY_TYPES
+            rhs = f"{src_name}.clone()" if needs_clone else src_name
+            bridge_stmt = f"let {self.bridge_var_name} = {rhs};"
+            tagged_stmts.insert(src_idx + 1, (src_origin, bridge_stmt))
+            # src_idx < tgt_idx, so inserting before tgt shifts its position by 1.
+            new_tgt_idx = tgt_idx + 1
+
+            # Search strictly *after* tgt's own definition line, so we rebind a
+            # later use of tgt_name — never the `let tgt_name = ...;` line itself
+            # (that would silently discard the binding and dangle later uses).
+            for j in range(new_tgt_idx + 1, len(tagged_stmts)):
+                o, s = tagged_stmts[j]
+                if o == tgt_origin:
+                    new_s = self._replace_random_identifier(s, tgt_name, self.bridge_var_name)
+                    if new_s is not None:
+                        tagged_stmts[j] = (o, new_s)
+                        break
+            break
+        return tagged_stmts
 
     # ------------------------------------------------------------------
 
@@ -3209,52 +3596,42 @@ class RustFusionStrategy(FusionStrategy):
             code_a = self.mut.mutate(code_a)
             code_b = self.mut.mutate(code_b)
 
-        meta_a = parent_a.metadata or {}
-        meta_b = parent_b.metadata or {}
-
         # Process A and B: separate crate attrs, use lines, and body
         attrs_a, uses_a, body_a, main_a = self._process_seed(code_a, parent_a.id)
         attrs_b, uses_b, body_b, main_b = self._process_seed(code_b, parent_b.id)
 
-        # Merge: crate-level attrs MUST come first (dedup), then use lines
         all_attrs = list(dict.fromkeys(attrs_a + attrs_b))
         all_uses = sorted(set(uses_a + uses_b))
 
-        # ── Type-aware bridge ──────────────────────────────────────────
-        # Attempt to inject a bridge statement that passes a value from
-        # seed A into the fn main of seed B, using metadata collected
-        # during the dry-run. This keeps the fused program ownership-safe.
-        bridge_stmt = ""
-        var_a, var_b, needs_clone = self._pick_bridge_pair(meta_a, meta_b)
-        if var_a and var_b:
-            rhs = f"{var_a}.clone()" if needs_clone else var_a
-            bridge_stmt = (
-                f"\n    // FFL bridge: {var_a} ({'cloned' if needs_clone else 'copy'}) "
-                f"→ {var_b}\n"
-                f"    let {self.bridge_var_name} = {rhs};\n"
-                f"    let _ = {self.bridge_var_name}; // suppress unused warning\n"
-            )
+        # ── Inline eligible free-function calls inside each seed's main,
+        #    then split into statements ──────────────────────────────────
+        main_stmts_a, leftover_a = self._flatten_and_extract_main(body_a, main_a, parent_a.id)
+        main_stmts_b, leftover_b = self._flatten_and_extract_main(body_b, main_b, parent_b.id)
 
-        # ── Assemble new fn main ───────────────────────────────────────
-        new_main_body = ["fn main() {"]
-        if main_a:
-            new_main_body.append(f"    {main_a}();")
-        if bridge_stmt:
-            new_main_body.append(bridge_stmt)
-        if main_b:
-            new_main_body.append(f"    {main_b}();")
-        new_main_body.append('    println!("FFL Fusion Done");')
-        new_main_body.append("}")
+        # ── Interleave the two statement streams into one shared scope,
+        #    then attempt one type-checked cross-seed variable bridge ─────
+        tagged = self._interleave_preserving_order(main_stmts_a, main_stmts_b)
+        tagged = self._bridge_across_seeds(tagged)
+        merged_main_body = "\n".join(stmt for _, stmt in tagged)
 
-        # Assemble: #![...] attrs → use lines → bodies → new main
+        new_main = (
+            "fn main() {\n"
+            f"{merged_main_body}\n"
+            '    println!("FFL Fusion Done");\n'
+            "}"
+        )
+
+        # Assemble: #![...] attrs → use lines → leftover items → new main
         parts = []
         if all_attrs:
             parts.append("\n".join(all_attrs))
         if all_uses:
             parts.append("\n".join(all_uses))
-        parts.append(f"// Seed A\n{body_a}")
-        parts.append(f"// Seed B\n{body_b}")
-        parts.append("\n".join(new_main_body))
+        if leftover_a.strip():
+            parts.append(f"// Seed A (non-inlined items)\n{leftover_a}")
+        if leftover_b.strip():
+            parts.append(f"// Seed B (non-inlined items)\n{leftover_b}")
+        parts.append(new_main)
         final_content = "\n\n".join(parts)
 
         return Seed(
@@ -3263,9 +3640,393 @@ class RustFusionStrategy(FusionStrategy):
                 "parents":     [parent_a.id, parent_b.id],
                 "type":        "rust",
                 "description": f"Fused {parent_a.id} + {parent_b.id}",
-                "bridge_var":  var_a,
+                "fusion_mode": "stmt_inline",
             }
         )
+
+
+class RustStructFusionStrategy(RustLexMixin, FusionStrategy):
+    """
+    "Struct fusion": item-level (struct/enum/trait/impl/fn) fusion for Rust.
+
+    Governing idea: since we never execute the compiled binary, only the
+    compiler's own static analyses (name resolution, trait solving,
+    coherence checking, monomorphization, layout/discriminant computation)
+    are worth stressing — runtime dataflow is irrelevant. Rust's item
+    grammar is also recursively self-similar: the crate root, `mod { }`
+    bodies, and `fn { }` bodies (including method bodies inside impl/
+    trait) are all valid places to declare arbitrary items. So instead of
+    a menu of special-case splices, most of what's interesting reduces to
+    ONE primitive: take item(s) from one seed and nest them inside a
+    container found in the other.
+
+    `impl`/`trait` bodies themselves are NOT general containers (they only
+    allow associated items: fn/const/type), so two more operations are
+    handled separately because they aren't reducible to nesting:
+      - supertrait injection — Rust's nearest analogue to inheritance
+        (`trait Foo` -> `trait Foo: OtherTrait`)
+      - impl grafting — make a struct/enum from one seed implement a
+        trait from the other, auto-stubbing whatever the trait requires
+      - generic bound injection — add an extra trait bound from one seed
+        onto a generic parameter defined in the other
+
+    This strategy does NOT do statement-level/dataflow fusion at all — it
+    only rearranges item definitions.
+    """
+
+    def __init__(self, project_root="projects/rust"):
+        self.project_root = project_root
+        self.mut = RustMutator()
+
+    # ------------------------------------------------------------------
+    # Splitting a crate body into top-level items
+    # ------------------------------------------------------------------
+
+    _ITEM_KW_RE = re.compile(
+        r'(?:pub(?:\([^)]*\))?\s+)?'
+        r'(?:(?:async|unsafe|extern(?:\s+"[^"]*")?)\s+){0,2}'
+        r'(fn|struct|enum|trait|impl|mod|union|type|static|const)\b'
+    )
+
+    _NUMERIC_TYPES = frozenset({
+        "i8", "i16", "i32", "i64", "i128", "isize",
+        "u8", "u16", "u32", "u64", "u128", "usize", "f32", "f64",
+    })
+
+    def _extend_for_attrs(self, body: str, start: int) -> int:
+        """Walk backward from `start` over blank lines, `#[...]`
+        attributes, and doc comments, so an item's span includes its own
+        attributes/derives instead of orphaning them."""
+        lines = body[:start].splitlines(keepends=True)
+        i = len(lines)
+        while i > 0:
+            s = lines[i - 1].strip()
+            if s == '' or s.startswith('#') or s.startswith('//'):
+                i -= 1
+                continue
+            break
+        return sum(len(l) for l in lines[:i])
+
+    def _split_top_level_items(self, body: str):
+        """Split `body` into an ordered list of dicts covering the ENTIRE
+        text (so reconstruction via ''.join(it['text'] for it in items) is
+        lossless). Recognized items get kind/name/header/inner; anything
+        else (use lines, macro_rules!, stray text) becomes kind='other'
+        and is never selected as a nest/graft/bound-inject target."""
+        is_real = self._rust_real_mask(body)
+        n = len(body)
+        depth_before = [0] * n
+        depth = 0
+        for i in range(n):
+            if is_real[i]:
+                depth_before[i] = depth
+                if body[i] == '{':
+                    depth += 1
+                elif body[i] == '}':
+                    depth = max(0, depth - 1)
+
+        raw_starts = sorted(
+            (m.start(), m.group(1)) for m in self._ITEM_KW_RE.finditer(body)
+            if is_real[m.start()] and depth_before[m.start()] == 0
+        )
+
+        items = []
+        cursor = 0
+        for start, kind in raw_starts:
+            if start < cursor:
+                continue
+            ext_start = self._extend_for_attrs(body, start)
+            name_m = re.match(re.escape(kind) + r'\s*!?\s+([A-Za-z_][A-Za-z0-9_]*)', body[start:start + 200])
+            name = name_m.group(1) if name_m else None
+
+            j = start
+            found_brace = found_semi = None
+            while j < n:
+                if is_real[j]:
+                    if body[j] == '{':
+                        found_brace = j
+                        break
+                    if body[j] == ';':
+                        found_semi = j
+                        break
+                j += 1
+            if found_brace is not None:
+                close = self._rust_matching_close(body, is_real, found_brace, '{', '}')
+                if close is None:
+                    break
+                end = close + 1
+                header = body[ext_start:found_brace].strip()
+                inner = body[found_brace + 1:close]
+            elif found_semi is not None:
+                end = found_semi + 1
+                header = body[ext_start:found_semi].strip()
+                inner = None
+            else:
+                break
+
+            if ext_start > cursor:
+                items.append({'kind': 'other', 'text': body[cursor:ext_start]})
+            items.append({
+                'kind': kind, 'name': name, 'header': header, 'inner': inner,
+                'text': body[ext_start:end],
+            })
+            cursor = end
+        if cursor < n:
+            items.append({'kind': 'other', 'text': body[cursor:]})
+        return items
+
+    def _rebuild_container(self, item: dict, extra_texts: list):
+        """Return new item text with `extra_texts` prepended inside its body."""
+        new_inner = "\n".join(extra_texts) + "\n" + (item['inner'] or '')
+        item = dict(item, inner=new_inner)
+        item['text'] = f"{item['header']} {{\n{new_inner}\n}}"
+        return item
+
+    # ------------------------------------------------------------------
+    # Cross-seed name collision handling
+    # ------------------------------------------------------------------
+
+    def _rename_collisions(self, items_a, items_b, uid_b):
+        names_a = {it['name'] for it in items_a if it['kind'] != 'other' and it['name']}
+        collisions = {it['name'] for it in items_b
+                      if it['kind'] != 'other' and it['name'] and it['name'] in names_a}
+        if not collisions:
+            return items_b
+        out = []
+        for it in items_b:
+            if it['kind'] == 'other':
+                out.append(it)
+                continue
+            text = it['text']
+            for name in sorted(collisions, key=len, reverse=True):
+                new_name = f"{name}_b{uid_b}"
+                text = re.sub(r'(?<![.\w:])' + re.escape(name) + r'(?!\w)', new_name, text)
+            new_name_field = f"{it['name']}_b{uid_b}" if it['name'] in collisions else it['name']
+            out.append(dict(it, text=text, name=new_name_field))
+        return out
+
+    # ------------------------------------------------------------------
+    # Operation 1: nesting — the core primitive
+    # ------------------------------------------------------------------
+
+    def _op_nest(self, items_a, items_b):
+        """Pick a container (fn/mod item with a body) from either seed's
+        item list, and move 1-2 whole items from either seed's top-level
+        list into it. Moving (not copying) means we never end up with the
+        same definition both nested AND still visible at crate root."""
+        pools = [('a', items_a), ('b', items_b)]
+        containers = [(tag, idx, it) for tag, lst in pools for idx, it in enumerate(lst)
+                      if it['kind'] in ('fn', 'mod') and it['inner'] is not None]
+        movable = [(tag, idx, it) for tag, lst in pools for idx, it in enumerate(lst)
+                   if it['kind'] in ('fn', 'struct', 'enum', 'trait', 'impl', 'mod', 'union')]
+        if not containers or len(movable) < 2:
+            return items_a, items_b
+        c_tag, c_idx, container = random.choice(containers)
+        candidates = [m for m in movable if not (m[0] == c_tag and m[1] == c_idx)]
+        if not candidates:
+            return items_a, items_b
+        chosen = random.sample(candidates, min(random.randint(1, 2), len(candidates)))
+
+        # Remove chosen units from their origin lists (mark for deletion by identity).
+        remove_a = {idx for tag, idx, _ in chosen if tag == 'a'}
+        remove_b = {idx for tag, idx, _ in chosen if tag == 'b'}
+        new_a = [it for i, it in enumerate(items_a) if i not in remove_a]
+        new_b = [it for i, it in enumerate(items_b) if i not in remove_b]
+
+        # Re-locate the container in its (possibly shrunk) list by identity.
+        target_list = new_a if c_tag == 'a' else new_b
+        for i, it in enumerate(target_list):
+            if it is container:
+                target_list[i] = self._rebuild_container(it, [u['text'] for _, _, u in chosen])
+                break
+        return new_a, new_b
+
+    # ------------------------------------------------------------------
+    # Operation 2: supertrait injection (the "inheritance" analogue)
+    # ------------------------------------------------------------------
+
+    def _op_supertrait(self, items_a, items_b):
+        traits_a = [it for it in items_a if it['kind'] == 'trait']
+        traits_b = [it for it in items_b if it['kind'] == 'trait']
+        pool = [('a', items_a, it, traits_b) for it in traits_a if traits_b] + \
+               [('b', items_b, it, traits_a) for it in traits_b if traits_a]
+        if not pool:
+            return items_a, items_b
+        tag, lst, target, other_traits = random.choice(pool)
+        super_name = random.choice(other_traits)['name']
+        if not super_name:
+            return items_a, items_b
+        header = target['header']
+        header_wo_generics = re.sub(r'<[^<>]*>', '', header)
+        if 'where' in header_wo_generics:
+            pre, _, post = header.partition('where')
+            has_bound = ':' in re.sub(r'<[^<>]*>', '', pre)
+            sep = ' + ' if has_bound else ': '
+            new_header = f"{pre.rstrip()}{sep}{super_name} where{post}"
+        else:
+            has_bound = ':' in header_wo_generics
+            sep = ' + ' if has_bound else ': '
+            new_header = f"{header}{sep}{super_name}"
+        new_target = dict(target, header=new_header, text=f"{new_header} {{\n{target['inner']}\n}}")
+        new_lst = [new_target if it is target else it for it in lst]
+        return (new_lst, items_b) if tag == 'a' else (items_a, new_lst)
+
+    # ------------------------------------------------------------------
+    # Operation 3: impl grafting
+    # ------------------------------------------------------------------
+
+    _REQ_FN_RE = re.compile(
+        r'\bfn\s+([a-zA-Z_][a-zA-Z0-9_]*)\s*(<[^>]*>)?\s*\(([^)]*)\)(?:\s*->\s*([^;{]+?))?\s*;'
+    )
+    _REQ_TYPE_RE = re.compile(r'\btype\s+([A-Za-z_][A-Za-z0-9_]*)\s*(?::[^=;]+)?\s*;')
+    _REQ_CONST_RE = re.compile(r'\bconst\s+([A-Za-z_][A-Za-z0-9_]*)\s*:\s*([^=;]+);')
+
+    def _filler_for_type(self, ty: str) -> str:
+        ty = ty.strip()
+        base = re.sub(r"^&(?:'[a-z_]+\s+)?(?:mut\s+)?", "", ty)
+        if base in self._NUMERIC_TYPES:
+            return "0"
+        if base == "bool":
+            return "false"
+        if base in ("str",) or ty in ("&str", "&'static str"):
+            return '""'
+        return "Default::default()"
+
+    def _stub_impl_body(self, trait_inner: str) -> str:
+        members = []
+        for m in self._REQ_FN_RE.finditer(trait_inner):
+            name, generics, params, ret = m.group(1), m.group(2) or '', m.group(3), m.group(4)
+            ret_ty = (ret or '').strip()
+            body = "todo!()" if not ret_ty or ret_ty == '()' else "todo!()"
+            members.append(f"fn {name}{generics}({params}) -> {ret_ty or '()'} {{ {body} }}"
+                            if ret_ty else f"fn {name}{generics}({params}) {{ {body} }}")
+        for m in self._REQ_TYPE_RE.finditer(trait_inner):
+            members.append(f"type {m.group(1)} = ();")
+        for m in self._REQ_CONST_RE.finditer(trait_inner):
+            ty = m.group(2).strip()
+            members.append(f"const {m.group(1)}: {ty} = {self._filler_for_type(ty)};")
+        return "\n".join(members)
+
+    def _op_impl_graft(self, items_a, items_b):
+        types_a = [it for it in items_a if it['kind'] in ('struct', 'enum')]
+        types_b = [it for it in items_b if it['kind'] in ('struct', 'enum')]
+        traits_a = [it for it in items_a if it['kind'] == 'trait' and '<' not in it['header']]
+        traits_b = [it for it in items_b if it['kind'] == 'trait' and '<' not in it['header']]
+        pool = [('a', items_a, t, tr) for t in types_a for tr in traits_b] + \
+               [('b', items_b, t, tr) for t in types_b for tr in traits_a]
+        if not pool:
+            return items_a, items_b
+        tag, lst, target_type, trait_item = random.choice(pool)
+        if not target_type['name'] or not trait_item['name']:
+            return items_a, items_b
+        stub_body = self._stub_impl_body(trait_item['inner'] or '')
+        impl_text = f"impl {trait_item['name']} for {target_type['name']} {{\n{stub_body}\n}}"
+        new_impl = {'kind': 'impl', 'name': None, 'header': impl_text.split('{', 1)[0].strip(),
+                    'inner': stub_body, 'text': impl_text}
+        new_lst = lst + [new_impl]
+        return (new_lst, items_b) if tag == 'a' else (items_a, new_lst)
+
+    # ------------------------------------------------------------------
+    # Operation 4: generic bound injection
+    # ------------------------------------------------------------------
+
+    def _op_bound_inject(self, items_a, items_b):
+        traits_a = [it for it in items_a if it['kind'] == 'trait']
+        traits_b = [it for it in items_b if it['kind'] == 'trait']
+        candidates_a = [it for it in items_a
+                        if it['kind'] in ('fn', 'struct', 'trait', 'impl') and re.search(r'<[A-Z]\w*', it['header'])]
+        candidates_b = [it for it in items_b
+                        if it['kind'] in ('fn', 'struct', 'trait', 'impl') and re.search(r'<[A-Z]\w*', it['header'])]
+        pool = [('a', items_a, it, traits_b) for it in candidates_a if traits_b] + \
+               [('b', items_b, it, traits_a) for it in candidates_b if traits_a]
+        if not pool:
+            return items_a, items_b
+        tag, lst, target, other_traits = random.choice(pool)
+        trait_name = random.choice(other_traits)['name']
+        if not trait_name:
+            return items_a, items_b
+        m = re.search(r'<([A-Z]\w*)(\s*:\s*[^,<>]+)?([,>])', target['header'])
+        if not m:
+            return items_a, items_b
+        if m.group(2):
+            new_header = target['header'][:m.end(2)] + f" + {trait_name}" + target['header'][m.end(2):]
+        else:
+            new_header = target['header'][:m.end(1)] + f": {trait_name}" + target['header'][m.end(1):]
+        new_target = dict(target, header=new_header)
+        if target['inner'] is not None:
+            new_target['text'] = f"{new_header} {{\n{target['inner']}\n}}"
+        else:
+            # semicolon item — reconstruct from the original text's tail
+            tail = target['text'][len(target['header']):]
+            new_target['text'] = new_header + tail
+        new_lst = [new_target if it is target else it for it in lst]
+        return (new_lst, items_b) if tag == 'a' else (items_a, new_lst)
+
+    # ------------------------------------------------------------------
+
+    def fuse(self, parent_a: Seed, parent_b: Seed) -> Seed:
+        code_a = parent_a.content
+        code_b = parent_b.content
+        if self.mut:
+            code_a = self.mut.mutate(code_a)
+            code_b = self.mut.mutate(code_b)
+
+        uid_a = re.sub(r'[^a-zA-Z0-9_]', '_', parent_a.id)
+        uid_b = re.sub(r'[^a-zA-Z0-9_]', '_', parent_b.id)
+
+        # Separate crate-level attrs / use-imports from the rest, same as
+        # RustFusionStrategy — these must be hoisted above everything else.
+        crate_attrs, use_lines, body_lines_a, body_lines_b = [], [], [], []
+        for code, body_lines in ((code_a, body_lines_a), (code_b, body_lines_b)):
+            for line in code.splitlines():
+                stripped = line.strip()
+                if stripped.startswith("#!"):
+                    crate_attrs.append(line)
+                elif stripped.startswith("use ") or stripped.startswith("extern crate "):
+                    use_lines.append(line)
+                else:
+                    body_lines.append(line)
+        all_attrs = list(dict.fromkeys(crate_attrs))
+        all_uses = sorted(set(use_lines))
+
+        items_a = self._split_top_level_items("\n".join(body_lines_a))
+        items_b = self._split_top_level_items("\n".join(body_lines_b))
+        items_b = self._rename_collisions(items_a, items_b, uid_b)
+
+        # Apply a random combination of the 4 operations — at least one,
+        # since that's the whole point of this strategy.
+        ops = [self._op_nest, self._op_supertrait, self._op_impl_graft, self._op_bound_inject]
+        applied_any = False
+        for op in ops:
+            if random.random() < 0.5:
+                items_a, items_b = op(items_a, items_b)
+                applied_any = True
+        if not applied_any:
+            items_a, items_b = self._op_nest(items_a, items_b)
+
+        body = "\n".join(it['text'] for it in items_a) + "\n" + "\n".join(it['text'] for it in items_b)
+
+        if not re.search(r'\bfn\s+main\s*\(', body):
+            body += "\nfn main() {}\n"
+
+        parts = []
+        if all_attrs:
+            parts.append("\n".join(all_attrs))
+        if all_uses:
+            parts.append("\n".join(all_uses))
+        parts.append(body)
+        final_content = "\n\n".join(parts)
+
+        return Seed(
+            content=final_content,
+            metadata={
+                "parents":     [parent_a.id, parent_b.id],
+                "type":        "rust",
+                "description": f"Struct-fused {parent_a.id} + {parent_b.id}",
+                "fusion_mode": "struct",
+            }
+        )
+
 
 # ==========================================
 # Strategy Factory (Updated)
@@ -4037,7 +4798,7 @@ class CangjieFusionStrategy(FusionStrategy):
 # Strategy Factory (Updated)
 # ==========================================
 
-def get_strategies(project_name=None, stmt_fusion=False, dataflow_fusion=False, all_fusion=False):
+def get_strategies(project_name=None, stmt_fusion=False, dataflow_fusion=False, all_fusion=False, struct_fusion=False):
     # Default: if neither flag given, enable dataflow fusion only
     if not stmt_fusion and not dataflow_fusion and not all_fusion:
         dataflow_fusion = True
@@ -4070,7 +4831,10 @@ def get_strategies(project_name=None, stmt_fusion=False, dataflow_fusion=False, 
 
     if project_name == "rust":
         if os.path.exists("projects/rust"):
-            strategies.append(RustFusionStrategy(project_root="projects/rust"))
+            if struct_fusion:
+                strategies.append(RustStructFusionStrategy(project_root="projects/rust"))
+            else:
+                strategies.append(RustFusionStrategy(project_root="projects/rust"))
         return strategies
 
     if project_name == "go":
