@@ -250,6 +250,17 @@ class FusionFuzzLoop:
         if m:
             return f"UBSAN:{m.group(1).strip()[:120]}"
 
+        # 3b. Rust internal compiler error (ICE) — keep the whole diagnostic
+        # line verbatim, e.g.:
+        #   "internal compiler error: /rustc-dev/<rev>/compiler/.../layout.rs:192:13: layout_of: unexpected const: {const error}"
+        # This already carries the exact source file:line:col of the failing
+        # compiler assertion plus the actual bug detail, so it's more
+        # specific than the generic "panicked at ...: Box<dyn Any>" line
+        # that follows it in stderr — check this first so that one wins.
+        m = re.search(r"internal compiler error:.*", combined)
+        if m:
+            return m.group(0).strip()[:200]
+
         # 4. Rust panic — extract file:line (stable across duplicate triggers)
         # "thread 'main' panicked at src/foo.rs:123:45:\nmessage"
         m = re.search(r"panicked at ([^:]+\.rs:\d+:\d+):\s*\n?(.*)", combined)
