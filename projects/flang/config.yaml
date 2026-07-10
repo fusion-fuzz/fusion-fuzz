@@ -1,0 +1,37 @@
+project_name: "flang"
+
+execution:
+  # The driver picks flags dynamically per seed; this template is only
+  # used as a BaseDriver fallback.
+  command: "flang -fsyntax-only {seed_path}"
+  timeout: 10
+  concurrency: 16
+
+analysis:
+  crash_patterns:
+    - "SUMMARY: AddressSanitizer"
+    - "SUMMARY: UndefinedBehaviorSanitizer"
+    - "LLVM ERROR"
+    - "Assertion `"
+    - "Stack dump:"
+    - "Segmentation fault"
+    - "Aborted"
+    - "core dumped"
+    - "PLEASE submit a bug report"
+    - "internal compiler error"
+  syntax_patterns:
+    - "error: "
+    - "fatal error: "
+
+paths:
+  seed_source: "projects/flang/llvm-project/flang/test"
+  seed_corpus: "projects/flang/corpus.db"
+  # flang/test also carries .fir/.mlir dumps and other non-source
+  # artifacts under the same tree; the parser only picks up Fortran
+  # source extensions, so no blacklist is needed here.
+
+llm:
+  provider: "openai"  # Options: gemini, openai, vllm, ollama
+  model: "gpt-5.4-mini"
+  api_key: "" # Defaults to LLM_API_KEY env var
+  timeout: 30

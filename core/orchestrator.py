@@ -361,6 +361,14 @@ class FusionFuzzLoop:
         elif "rust" in self.project_name: ext = ".rs"
         elif "naga" in self.project_name or "wgslc" in self.project_name: ext = ".wgsl"
         elif "go" in self.project_name: ext = ".go"
+        elif "clang" in self.project_name or "gcc" in self.project_name:
+            # C/C++/Obj-C are all valid here — a blanket ".c" mislabels C++
+            # seeds (test.sh still records the real "clang++ ... -std=c++20"
+            # invocation against a file that no longer exists under that
+            # name, so the saved reproducer silently can't be re-run).
+            ext = seed.metadata.get("extension") or ".c"
+        elif "flang" in self.project_name:
+            ext = seed.metadata.get("extension") or ".f90"
 
         test_filename = f"test{ext}"
 
@@ -558,6 +566,43 @@ class FusionFuzzLoop:
             try:
                 subprocess.run(
                     ["pkill", "-9", "-f", "build/python"],
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+                )
+            except Exception:
+                pass
+
+        # 3b. Clang Cleanup
+        # NOTE: must NOT use `-f` (full command-line match) here — the
+        # orchestrator's own process is `python3 main.py --project clang
+        # ...`, and the watchdog wrapping it is `bash ./watchdog --project
+        # clang ...`. Both contain the substring "clang", so `pkill -9 -f
+        # clang` matched and SIGKILL'd the orchestrator (and watchdog) that
+        # was calling it, every ~2000 iterations. `-x` matches the exact
+        # process name only (clang/clang++), never python3 or bash.
+        if self.project_name == "clang":
+            try:
+                subprocess.run(
+                    ["pkill", "-9", "-x", "clang"],
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+                )
+                subprocess.run(
+                    ["pkill", "-9", "-x", "clang++"],
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+                )
+            except Exception:
+                pass
+
+        # 3c. Flang Cleanup — same `-x` (exact process name) requirement as
+        # clang above: the orchestrator's own cmdline is `python3 main.py
+        # --project flang ...`, so `pkill -f flang` would self-kill.
+        if self.project_name == "flang":
+            try:
+                subprocess.run(
+                    ["pkill", "-9", "-x", "flang"],
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+                )
+                subprocess.run(
+                    ["pkill", "-9", "-x", "flang-22"],
                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
                 )
             except Exception:
