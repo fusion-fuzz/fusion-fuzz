@@ -4795,6 +4795,1324 @@ class CangjieFusionStrategy(FusionStrategy):
 
 
 # ==========================================
+# Clang / C-C++ Specific Fusion Strategy
+# ==========================================
+
+class ClangFusionStrategy(GenericDataflowStrategy):
+    """
+    Clang (C/C++) fusion strategy. Supports two modes, mirroring PHP:
+
+    - Dataflow fusion (default): concatenates the two seeds and links them
+      with a bridge variable (`interleave_code_blocks`, inherited from
+      GenericDataflowStrategy) — a global `static long ffl_fusion = (long)(x);`
+      whose value is threaded into an occurrence of a variable from the other
+      seed. Cross-seed variable references are intentionally best-effort
+      (may not be a compile-time constant) — clang emits a diagnostic and
+      keeps going rather than crashing, which is fine; we're stressing the
+      frontend/diagnostics paths, not compiling working programs.
+
+    - Statement fusion: splits both seeds into top-level "statement" units
+      (a unit is a full function/struct/enum/class definition, a single
+      declaration, or a preprocessor directive — never partially split), then
+      interleaves them via dependency-graph topological sort (variable/
+      function/type def-use), with optional injection of a top-level unit
+      into a compound block body.
+    """
+
+    def __init__(self, project_root="projects/clang"):
+        super().__init__(mutator=BaseMutator())
+        self.project_root = project_root
+        self.bridge_var_name = "ffl_fusion"
+        self.mutation = True
+        self.stmt_fusion = False
+        self.dataflow_fusion = True
+        self.all_fusion = False
+
+    def format_assignment(self, lhs: str, rhs: str) -> str:
+        # Top-level declaration — valid C/C++ syntax even when `rhs` turns out
+        # not to be a real compile-time constant (clang just diagnoses it).
+        return f"static long {lhs} = (long)({rhs});"
+
+    @staticmethod
+    def _replace_random_occurrence_word(s: str, old: str, new: str) -> str:
+        """Word-boundary-safe replacement. Unlike PHP's `$`-sigil or MLIR's
+        `%`-sigil variables, bare C identifiers have no unambiguous prefix,
+        so a naive substring replace (replace_random_occurrence) can corrupt
+        unrelated identifiers or even keywords that merely contain `old` as
+        a substring (e.g. replacing bare `r` would turn `struct` into
+        `styuct`, or `for` into `foy`)."""
+        matches = list(re.finditer(rf'(?<!\w){re.escape(old)}(?!\w)', s))
+        if not matches:
+            return s
+        match = random.choice(matches)
+        start, end = match.span()
+        return s[:start] + new + s[end:]
+
+    def interleave_code_blocks(self, code1, code2, dataflow1, dataflow2, extra_flows=None):
+        """Override of GenericDataflowStrategy.interleave_code_blocks that
+        substitutes via word boundaries instead of raw substring replace —
+        see _replace_random_occurrence_word."""
+        if not dataflow1 or not dataflow2:
+            return code1, code2
+
+        if extra_flows:
+            dataflow1 = dataflow1 + extra_flows
+
+        bridge = self.bridge_var_name
+
+        if random.choice([True, False]):
+            try:
+                group1 = random.choice(dataflow1)
+                var1 = random.choice(group1)
+                group2 = random.choice(dataflow2)
+                var2 = random.choice(group2)
+                bridge_stmt = self.format_assignment(bridge, var1)
+                code1 += f"\n{bridge_stmt}\n"
+                code2 = self._replace_random_occurrence_word(code2, var2, bridge)
+            except IndexError:
+                pass
+            return code1, code2
+
+        max_df1 = max(dataflow1, key=len) if dataflow1 else []
+        max_df2 = max(dataflow2, key=len) if dataflow2 else []
+
+        if max_df1 and max_df2:
+            var1 = random.choice(max_df1)
+            var2 = random.choice(max_df2)
+            bridge_stmt = self.format_assignment(bridge, var1)
+            code1 += f"\n{bridge_stmt}\n"
+            code2 = self._replace_random_occurrence_word(code2, var2, bridge)
+
+        return code1, code2
+
+    # ── Statement Fusion helpers ──────────────────────────────────
+
+    _C_KEYWORDS = frozenset({
+        "auto", "break", "case", "char", "const", "continue", "default", "do",
+        "double", "else", "enum", "extern", "float", "for", "goto", "if",
+        "inline", "int", "long", "register", "restrict", "return", "short",
+        "signed", "sizeof", "static", "struct", "switch", "typedef", "union",
+        "unsigned", "void", "volatile", "while",
+        "_Alignas", "_Alignof", "_Atomic", "_Bool", "_Complex", "_Generic",
+        "_Imaginary", "_Noreturn", "_Static_assert", "_Thread_local",
+        "alignas", "alignof", "and", "and_eq", "asm", "bitand", "bitor",
+        "bool", "catch", "class", "compl", "concept", "const_cast",
+        "consteval", "constexpr", "constinit", "co_await", "co_return",
+        "co_yield", "decltype", "delete", "dynamic_cast", "explicit",
+        "export", "false", "friend", "mutable", "namespace", "new",
+        "noexcept", "not", "not_eq", "nullptr", "operator", "or", "or_eq",
+        "private", "protected", "public", "reinterpret_cast", "requires",
+        "static_assert", "static_cast", "template", "this", "thread_local",
+        "throw", "true", "try", "typeid", "typename", "using", "virtual",
+        "wchar_t", "xor", "xor_eq", "NULL",
+    })
+    _C_CONTROL_KW = frozenset({"if", "for", "while", "switch", "catch"})
+
+    _C_VAR_ASSIGN_RE = re.compile(r'\b([A-Za-z_]\w*)\s*=(?!=)')
+    _C_FUNC_DEF_RE = re.compile(r'\b([A-Za-z_]\w*)\s*\([^;{}]*\)\s*(?:const\s*)?\{')
+    _C_TYPE_DEF_RE = re.compile(r'\b(?:struct|class|union|enum)\s+([A-Za-z_]\w*)')
+    _C_IDENT_RE = re.compile(r'\b([A-Za-z_]\w*)\b')
+    _C_NORM_STR = re.compile(r'"(?:[^"\\]|\\.)*"')
+    _C_NORM_CHAR = re.compile(r"'(?:[^'\\]|\\.)*'")
+    _C_NORM_NUM = re.compile(r'\b0[xX][0-9a-fA-F]+[uUlL]*\b|\b\d+(?:\.\d+)?[uUlLfF]*\b')
+
+    _C_BLOCK_HEAD_RE = re.compile(
+        r'^\s*(?:'
+        r'if\s*\(|else\b|for\s*\(|while\s*\(|do\b|switch\s*\('
+        r'|try\b|catch\s*\('
+        r'|struct\s+\w+|class\s+\w+|union\s+\w+|enum\s+\w+|namespace\s+\w+'
+        r'|[A-Za-z_][\w:\*&<>,\s]*?\s+[A-Za-z_]\w*\s*\([^;{}]*\)\s*(?:const\s*)?'
+        r')'
+    )
+
+    _CONTINUATION_RE = re.compile(r'^\s*(?:else\b|while\s*\(|catch\s*\()')
+
+    @classmethod
+    def _split_statements(cls, code: str) -> List[str]:
+        """Split C/C++ code into top-level statement units, respecting
+        brace/paren depth, string/char literals, comments, and preprocessor
+        directives (kept as a single atomic line, honouring `\\`-continuation).
+        Compound blocks (functions, structs, control structures, including
+        do/while and if/else chains) are kept as single units."""
+        statements: List[str] = []
+        current: List[str] = []
+        brace_depth = 0
+        paren_depth = 0
+        in_sq = False
+        in_dq = False
+        escaped = False
+        i = 0
+        n = len(code)
+
+        def _is_blank(buf: List[str]) -> bool:
+            return not ''.join(buf).strip()
+
+        def _lookahead_is_continuation(pos: int) -> bool:
+            rest = code[pos:]
+            return bool(cls._CONTINUATION_RE.match(rest))
+
+        while i < n:
+            ch = code[i]
+            nch = code[i + 1] if i + 1 < n else ''
+
+            if escaped:
+                current.append(ch)
+                escaped = False
+                i += 1
+                continue
+            if ch == '\\' and (in_sq or in_dq):
+                current.append(ch)
+                escaped = True
+                i += 1
+                continue
+            if in_sq:
+                current.append(ch)
+                if ch == "'":
+                    in_sq = False
+                i += 1
+                continue
+            if in_dq:
+                current.append(ch)
+                if ch == '"':
+                    in_dq = False
+                i += 1
+                continue
+
+            # ── preprocessor directive: consume the whole (possibly
+            #    continued) line as one atomic statement ──
+            if (ch == '#' and brace_depth == 0 and paren_depth == 0
+                    and _is_blank(current)):
+                current = []
+                while i < n:
+                    c = code[i]
+                    current.append(c)
+                    if c == '\\' and i + 1 < n and code[i + 1] == '\n':
+                        current.append(code[i + 1])
+                        i += 2
+                        continue
+                    if c == '\n':
+                        i += 1
+                        break
+                    i += 1
+                stmt = ''.join(current).strip()
+                if stmt:
+                    statements.append(stmt)
+                current = []
+                continue
+
+            # ── comments ──
+            if ch == '/' and nch == '/':
+                while i < n and code[i] != '\n':
+                    current.append(code[i])
+                    i += 1
+                continue
+            if ch == '/' and nch == '*':
+                current.append(ch)
+                i += 1
+                while i < n:
+                    current.append(code[i])
+                    if code[i] == '*' and i + 1 < n and code[i + 1] == '/':
+                        current.append('/')
+                        i += 2
+                        break
+                    i += 1
+                continue
+
+            if ch == "'":
+                in_sq = True
+                current.append(ch)
+                i += 1
+                continue
+            if ch == '"':
+                in_dq = True
+                current.append(ch)
+                i += 1
+                continue
+
+            current.append(ch)
+
+            if ch == '(':
+                paren_depth += 1
+            elif ch == ')':
+                paren_depth -= 1
+            elif ch == '{':
+                brace_depth += 1
+            elif ch == '}':
+                brace_depth -= 1
+                if brace_depth <= 0 and paren_depth <= 0:
+                    brace_depth = 0
+                    j = i + 1
+                    while j < n and code[j] in (' ', '\t', '\n', '\r'):
+                        j += 1
+                    if _lookahead_is_continuation(j):
+                        i += 1
+                        continue
+                    stmt = ''.join(current).strip()
+                    if stmt:
+                        statements.append(stmt)
+                    current = []
+                    i += 1
+                    continue
+            elif ch == ';' and brace_depth <= 0 and paren_depth <= 0:
+                stmt = ''.join(current).strip()
+                if stmt:
+                    statements.append(stmt)
+                current = []
+                i += 1
+                continue
+
+            i += 1
+
+        leftover = ''.join(current).strip()
+        if leftover:
+            statements.append(leftover)
+        return statements
+
+    def _stmt_defines_uses(self, stmt: str):
+        """Return (defines, func_or_type_defines, uses) for a statement unit.
+        `func_or_type_defines` (functions/structs/classes/enums/unions) is a
+        subset of `defines` eligible for cross-seed dependency edges — plain
+        variable assignments stay seed-local (cross-seed variable refs are
+        intentionally invalid/best-effort, same rationale as PHP fusion)."""
+        func_defines = set()
+        for m in self._C_FUNC_DEF_RE.finditer(stmt):
+            name = m.group(1)
+            if name not in self._C_KEYWORDS and name not in self._C_CONTROL_KW:
+                func_defines.add(name)
+        for m in self._C_TYPE_DEF_RE.finditer(stmt):
+            func_defines.add(m.group(1))
+
+        var_defines = set()
+        for m in self._C_VAR_ASSIGN_RE.finditer(stmt):
+            name = m.group(1)
+            if name not in self._C_KEYWORDS:
+                var_defines.add(name)
+
+        uses = {t for t in self._C_IDENT_RE.findall(stmt) if t not in self._C_KEYWORDS}
+
+        return (var_defines | func_defines), func_defines, uses
+
+    def _normalize_stmt(self, stmt: str) -> str:
+        """Normalize for similarity comparison: blank out string/char
+        literals, numeric literals, and non-keyword identifiers."""
+        s = self._C_NORM_STR.sub('"_"', stmt)
+        s = self._C_NORM_CHAR.sub("'_'", s)
+        s = self._C_NORM_NUM.sub('0', s)
+        s = self._C_IDENT_RE.sub(
+            lambda m: m.group(0) if m.group(0) in self._C_KEYWORDS else '_', s)
+        return s
+
+    @staticmethod
+    def _token_similarity(norm_a: str, norm_b: str) -> float:
+        toks_a = set(norm_a.split())
+        toks_b = set(norm_b.split())
+        if not toks_a and not toks_b:
+            return 1.0
+        union = toks_a | toks_b
+        return len(toks_a & toks_b) / len(union) if union else 0.0
+
+    def _dependency_graph_interleave(self, stmts_a: List[str], stmts_b: List[str]) -> List[str]:
+        """Interleave statement units from seed A and seed B using a
+        dependency-graph topological sort with token-similarity tie-breaking
+        (same approach as PHP statement fusion)."""
+        tagged = [(s, 'a') for s in stmts_a] + [(s, 'b') for s in stmts_b]
+        n = len(tagged)
+        if n == 0:
+            return []
+
+        info = []
+        for stmt, origin in tagged:
+            defines, func_defines, uses = self._stmt_defines_uses(stmt)
+            info.append({
+                'stmt': stmt, 'origin': origin, 'defines': defines,
+                'func_defines': func_defines, 'uses': uses,
+                'norm': self._normalize_stmt(stmt),
+            })
+
+        def_map: Dict[str, List[Tuple[int, str]]] = {}
+        for i, inf in enumerate(info):
+            for name in inf['defines']:
+                def_map.setdefault(name, []).append((i, inf['origin']))
+
+        deps = [set() for _ in range(n)]
+        for j, inf_j in enumerate(info):
+            for name in inf_j['uses']:
+                if name not in def_map:
+                    continue
+                for di, d_origin in def_map[name]:
+                    if di == j:
+                        continue
+                    if d_origin == inf_j['origin']:
+                        deps[j].add(di)
+                    elif name in info[di]['func_defines']:
+                        # Cross-seed edge only for function/type names — a
+                        # call to a function defined in the other seed must
+                        # come after its definition.
+                        deps[j].add(di)
+
+        emitted = [False] * n
+        result: List[str] = []
+        in_degree = [len(d) for d in deps]
+        dependents = [[] for _ in range(n)]
+        for j in range(n):
+            for di in deps[j]:
+                dependents[di].append(j)
+
+        ready = [i for i in range(n) if in_degree[i] == 0]
+        last_norm = ""
+        while ready:
+            if not result:
+                pick_idx = random.choice(ready)
+            else:
+                scored = sorted(
+                    ((self._token_similarity(last_norm, info[ri]['norm']), ri) for ri in ready),
+                    key=lambda x: -x[0])
+                top_k = min(3, len(scored))
+                pick_idx = random.choice([s[1] for s in scored[:top_k]])
+
+            ready.remove(pick_idx)
+            emitted[pick_idx] = True
+            result.append(info[pick_idx]['stmt'])
+            last_norm = info[pick_idx]['norm']
+
+            for dep_j in dependents[pick_idx]:
+                in_degree[dep_j] -= 1
+                if in_degree[dep_j] == 0 and not emitted[dep_j]:
+                    ready.append(dep_j)
+
+        for i in range(n):
+            if not emitted[i]:
+                result.append(info[i]['stmt'])
+
+        return result
+
+    def _stmt_cross_replace_variable(self, code: str, vars_a: List[str], vars_b: List[str]) -> str:
+        if not vars_a or not vars_b:
+            return code
+        var_b = random.choice(vars_b)
+        var_a = random.choice(vars_a)
+        if var_a == var_b:
+            return code
+        return self._replace_random_occurrence_word(code, var_b, var_a)
+
+    @staticmethod
+    def _find_outermost_brace_body(stmt: str):
+        in_sq = in_dq = escaped = False
+        depth = 0
+        body_start = -1
+        for i, ch in enumerate(stmt):
+            if escaped:
+                escaped = False
+                continue
+            if ch == '\\' and (in_sq or in_dq):
+                escaped = True
+                continue
+            if in_sq:
+                if ch == "'":
+                    in_sq = False
+                continue
+            if in_dq:
+                if ch == '"':
+                    in_dq = False
+                continue
+            if ch == "'":
+                in_sq = True
+                continue
+            if ch == '"':
+                in_dq = True
+                continue
+            if ch == '{':
+                depth += 1
+                if depth == 1:
+                    body_start = i + 1
+            elif ch == '}':
+                depth -= 1
+                if depth == 0 and body_start != -1:
+                    return (body_start, i)
+        return None
+
+    def _inject_into_block(self, stmts: List[str]) -> List[str]:
+        candidates = []
+        atomic = []
+        for idx, s in enumerate(stmts):
+            if self._C_BLOCK_HEAD_RE.match(s) and '{' in s:
+                span = self._find_outermost_brace_body(s)
+                if span:
+                    body_start, body_end = span
+                    body = s[body_start:body_end].strip()
+                    if len(body) > 5:
+                        candidates.append((idx, body_start, body_end))
+            elif s.strip():
+                atomic.append((idx, s))
+
+        if not candidates or not atomic:
+            return stmts
+
+        target_idx, body_start, body_end = random.choice(candidates)
+        target = stmts[target_idx]
+        body = target[body_start:body_end]
+
+        donors = [(i, s) for i, s in atomic if i != target_idx]
+        if not donors:
+            return stmts
+        n_inject = min(random.randint(1, 3), len(donors))
+        chosen = random.sample(donors, n_inject)
+        inject_stmts = [s for _, s in chosen]
+
+        body_lines = body.split('\n')
+        insert_pos = random.randint(0, len(body_lines))
+
+        indent = "    "
+        for ln in body_lines:
+            stripped = ln.lstrip()
+            if stripped:
+                indent = ln[:len(ln) - len(stripped)]
+                break
+
+        injected = [indent + s.strip() for s in inject_stmts]
+        new_body_lines = body_lines[:insert_pos] + injected + body_lines[insert_pos:]
+        new_body = '\n'.join(new_body_lines)
+
+        new_stmt = target[:body_start] + new_body + target[body_end:]
+        result = list(stmts)
+        result[target_idx] = new_stmt
+        return result
+
+    def _statement_fuse(self, clean1: str, clean2: str,
+                         vars1: List[str], vars2: List[str]) -> str:
+        stmts_a = self._split_statements(clean1)
+        stmts_b = self._split_statements(clean2)
+
+        if not stmts_a and not stmts_b:
+            return clean1 + '\n' + clean2
+
+        interleaved = self._dependency_graph_interleave(stmts_a, stmts_b)
+
+        if random.random() < 0.3:
+            interleaved = self._inject_into_block(interleaved)
+
+        fused_code = '\n'.join(interleaved)
+        fused_code = self._stmt_cross_replace_variable(fused_code, vars1, vars2)
+        return fused_code
+
+    # ── Top-level name-conflict resolution ────────────────────────
+
+    def _extract_top_level_names(self, code: str):
+        names = set(self._C_FUNC_DEF_RE.findall(code)) | set(self._C_TYPE_DEF_RE.findall(code))
+        return names - self._C_KEYWORDS - self._C_CONTROL_KW
+
+    def _resolve_name_conflicts(self, code_a: str, code_b: str) -> str:
+        """Rename top-level functions/types in code_b that clash with names
+        defined in code_a, to reduce duplicate-symbol diagnostics."""
+        conflicts = self._extract_top_level_names(code_a) & self._extract_top_level_names(code_b)
+        if not conflicts:
+            return code_b
+        result = code_b
+        for name in sorted(conflicts, key=len, reverse=True):
+            result = re.sub(
+                rf'(?<![\w.:>])\b{re.escape(name)}\b',
+                name + '_ffl',
+                result,
+            )
+        return result
+
+    # ── Entry points ───────────────────────────────────────────────
+
+    def _build_fused_test(self, parent_a: Seed, parent_b: Seed, mode: str) -> Seed:
+        code1 = parent_a.content
+        code2 = parent_b.content
+        meta1 = parent_a.metadata
+        meta2 = parent_b.metadata
+        variable1 = meta1.get('variables', [])
+        variable2 = meta2.get('variables', [])
+        dataflow1 = meta1.get('dataflows', [])
+        dataflow2 = meta2.get('dataflows', [])
+
+        if self.mutation:
+            code1 = self.mut.mutate(code1)
+            code2 = self.mut.mutate(code2)
+
+        code2 = self._resolve_name_conflicts(code1, code2)
+
+        if mode == 'stmt_ab':
+            fused = self._statement_fuse(code1, code2, variable1, variable2)
+        elif mode == 'stmt_ba':
+            fused = self._statement_fuse(code2, code1, variable2, variable1)
+        elif mode == 'df_ab':
+            new_code1, new_code2 = self.interleave_code_blocks(code1, code2, dataflow1, dataflow2)
+            fused = f"{new_code1}\n{new_code2}"
+        elif mode == 'df_ba':
+            new_code2, new_code1 = self.interleave_code_blocks(code2, code1, dataflow2, dataflow1)
+            fused = f"{new_code1}\n{new_code2}"
+        else:
+            raise ValueError(f"Unknown mode: {mode}")
+
+        # Prefer C++/Obj-C metadata from either parent so the driver picks
+        # clang++ when either side actually needs it.
+        cxx_exts = ('.cpp', '.cc', '.cxx', '.mm')
+        ext = meta1.get('extension', '.c')
+        seed_type = meta1.get('type', 'c')
+        if meta2.get('extension') in cxx_exts:
+            ext = meta2.get('extension')
+            seed_type = meta2.get('type', 'cpp')
+
+        return Seed(content=fused, metadata={
+            "parents": [parent_a.id, parent_b.id],
+            "type": seed_type,
+            "extension": ext,
+            "mode": mode,
+            "description": f"Fused {parent_a.id} + {parent_b.id} ({mode})",
+        })
+
+    def fuse(self, parent_a: Seed, parent_b: Seed) -> Seed:
+        mode = 'stmt_ab' if self.stmt_fusion else 'df_ab'
+        return self._build_fused_test(parent_a, parent_b, mode)
+
+    def fuse_bidirectional(self, parent_a: Seed, parent_b: Seed) -> List[Seed]:
+        """Produce both A->B and B->A variants for the active fusion kind."""
+        if self.stmt_fusion:
+            return [
+                self._build_fused_test(parent_a, parent_b, 'stmt_ab'),
+                self._build_fused_test(parent_a, parent_b, 'stmt_ba'),
+            ]
+        return [
+            self._build_fused_test(parent_a, parent_b, 'df_ab'),
+            self._build_fused_test(parent_a, parent_b, 'df_ba'),
+        ]
+
+    def fuse_all(self, parent_a: Seed, parent_b: Seed) -> List[Seed]:
+        """Produce all four fusion variants for one pair."""
+        return [
+            self._build_fused_test(parent_a, parent_b, 'stmt_ab'),
+            self._build_fused_test(parent_a, parent_b, 'stmt_ba'),
+            self._build_fused_test(parent_a, parent_b, 'df_ab'),
+            self._build_fused_test(parent_a, parent_b, 'df_ba'),
+        ]
+
+
+# ==========================================
+# Flang / Fortran Specific Fusion Strategy
+# ==========================================
+
+class FlangFusionStrategy(GenericDataflowStrategy):
+    """
+    Flang (Fortran) fusion strategy. Same two modes as ClangFusionStrategy,
+    adapted for Fortran's very different structure:
+
+    - No braces — blocks are opened/closed by keyword pairs (IF...THEN /
+      END IF, DO / END DO, SUBROUTINE ... / END SUBROUTINE, ...). Depth
+      tracking here uses two counters instead of one: `udepth` (nesting of
+      PROGRAM/MODULE/SUBROUTINE/FUNCTION/BLOCK DATA "program units") and
+      `idepth` (nesting of inner control blocks — IF/DO/SELECT/...).
+      Almost all Fortran source lives inside a program unit (unlike C,
+      where bare top-level statements are common), so the granularity
+      statement fusion actually interleaves is the *body* of the first
+      program unit (udepth==1, idepth==0) — a nested IF/DO block or a
+      second, CONTAINS-nested unit is kept atomic, exactly like a
+      compound-statement block in the C/PHP splitters.
+
+    - No unconditional "append a global declaration at file scope" trick
+      for dataflow fusion's bridge variable — a bare statement after the
+      last END is not valid Fortran (there is no such thing as top-level
+      executable code outside any program unit). Instead the bridge
+      assignment is inserted just before the outermost unit's closing END.
+
+    - String literals use doubled-quote escaping ('' / "") instead of
+      backslash escaping.
+    """
+
+    def __init__(self, project_root="projects/flang"):
+        super().__init__(mutator=BaseMutator())
+        self.project_root = project_root
+        self.bridge_var_name = "ffl_fusion"
+        self.mutation = True
+        self.stmt_fusion = False
+        self.dataflow_fusion = True
+        self.all_fusion = False
+
+    def format_assignment(self, lhs: str, rhs: str) -> str:
+        return f"{lhs} = ({rhs})"
+
+    # ── Shared lexical helpers ──────────────────────────────────────
+
+    @staticmethod
+    def _strip_comment(line: str) -> str:
+        """Strip a trailing '! comment', respecting string literals with
+        Fortran's doubled-quote escaping ('' inside '...', "" inside "...")."""
+        in_sq = in_dq = False
+        i, n = 0, len(line)
+        while i < n:
+            ch = line[i]
+            if in_sq:
+                if ch == "'":
+                    if i + 1 < n and line[i + 1] == "'":
+                        i += 2
+                        continue
+                    in_sq = False
+                i += 1
+                continue
+            if in_dq:
+                if ch == '"':
+                    if i + 1 < n and line[i + 1] == '"':
+                        i += 2
+                        continue
+                    in_dq = False
+                i += 1
+                continue
+            if ch == "'":
+                in_sq = True
+                i += 1
+                continue
+            if ch == '"':
+                in_dq = True
+                i += 1
+                continue
+            if ch == '!':
+                return line[:i]
+            i += 1
+        return line
+
+    @classmethod
+    def _join_continuations(cls, code: str) -> List[str]:
+        """Merge free-form continuation lines (trailing '&', outside strings
+        and comments) into logical lines — each returned entry may itself
+        contain embedded '\\n' for a multi-physical-line statement, original
+        text preserved."""
+        physical = code.split('\n')
+        logical: List[str] = []
+        buf: List[str] = []
+        in_sq = in_dq = False
+        for line in physical:
+            j, ll = 0, len(line)
+            code_end = ll
+            local_sq, local_dq = in_sq, in_dq
+            while j < ll:
+                c = line[j]
+                if local_sq:
+                    if c == "'":
+                        if j + 1 < ll and line[j + 1] == "'":
+                            j += 2
+                            continue
+                        local_sq = False
+                    j += 1
+                    continue
+                if local_dq:
+                    if c == '"':
+                        if j + 1 < ll and line[j + 1] == '"':
+                            j += 2
+                            continue
+                        local_dq = False
+                    j += 1
+                    continue
+                if c == "'":
+                    local_sq = True
+                    j += 1
+                    continue
+                if c == '"':
+                    local_dq = True
+                    j += 1
+                    continue
+                if c == '!':
+                    code_end = j
+                    break
+                j += 1
+            in_sq, in_dq = local_sq, local_dq
+            code_part = line[:code_end]
+            is_cont = (not in_sq and not in_dq) and code_part.rstrip().endswith('&')
+            buf.append(line)
+            if is_cont:
+                continue
+            logical.append('\n'.join(buf))
+            buf = []
+        if buf:
+            logical.append('\n'.join(buf))
+        return logical
+
+    # ── Statement Fusion helpers ──────────────────────────────────
+
+    _KEYWORDS = frozenset(w.upper() for w in (
+        "program", "end", "module", "submodule", "subroutine", "function",
+        "use", "only", "implicit", "none", "integer", "real", "logical",
+        "character", "complex", "double", "precision", "type", "class",
+        "dimension", "allocatable", "pointer", "target", "intent", "in",
+        "out", "inout", "optional", "parameter", "save", "public",
+        "private", "protected", "value", "external", "intrinsic",
+        "recursive", "pure", "elemental", "impure", "result", "contains",
+        "interface", "generic", "operator", "assignment", "if", "then",
+        "else", "elseif", "endif", "do", "while", "concurrent", "enddo",
+        "exit", "cycle", "select", "case", "selecttype", "default",
+        "where", "elsewhere", "endwhere", "forall", "endforall",
+        "associate", "endassociate", "block", "endblock", "critical",
+        "endcritical", "goto", "continue", "stop", "errorstop", "return",
+        "call", "allocate", "deallocate", "nullify", "read", "write",
+        "print", "format", "open", "close", "inquire", "rewind",
+        "backspace", "endfile", "common", "equivalence", "data",
+        "namelist", "entry", "procedure", "abstract", "deferred", "nopass",
+        "pass", "bind", "import", "enum", "enumerator", "sequence",
+        "volatile", "asynchronous", "codimension", "contiguous", "errmsg",
+        "mold", "source", "sync", "lock", "unlock", "team", "event",
+        "images", "kind", "len", "blockdata", "final", "extends",
+    ))
+
+    _VAR_ASSIGN_RE = re.compile(r'^\s*([A-Za-z_]\w*)\s*=(?!=)')
+    _DECL_RE = re.compile(
+        r'^\s*(?:integer|real|logical|character|complex|double\s*precision'
+        r'|type\s*\(|class\s*\()[^:]*::\s*(.+)$',
+        re.IGNORECASE,
+    )
+    _DECL_NAME_RE = re.compile(r'([A-Za-z_]\w*)')
+    _UNIT_NAME_RE = re.compile(
+        r'^\s*(?:[A-Za-z_][\w()*,: \t]*?\s+)?(?:program|module|submodule|subroutine|function)\s+([A-Za-z_]\w*)',
+        re.IGNORECASE,
+    )
+    _CALL_RE = re.compile(r'\bcall\s+([A-Za-z_]\w*)', re.IGNORECASE)
+    _IDENT_RE = re.compile(r'\b([A-Za-z_]\w*)\b')
+    _NORM_STR = re.compile(r"'(?:[^']|'')*'|\"(?:[^\"]|\"\")*\"")
+    _NORM_NUM = re.compile(r'\b\d+\.?\d*(?:[eEdD][+-]?\d+)?\b')
+
+    _UNIT_OPEN_RE = re.compile(
+        r'^(?:[A-Za-z_][\w()*,: \t]*?\s+)?(program|module|submodule|subroutine|function|block\s*data)\b',
+        re.IGNORECASE,
+    )
+    _INNER_OPEN_RE = re.compile(
+        r'^(if\s*\(.*\)\s*then\s*$|do\b|select\s*(?:case|type)\b'
+        r'|where\s*\(.*\)\s*$|forall\b.*$|type\s*(?!\()(?:,|::|\s|$)'
+        r'|interface\b|associate\s*\(|block(?!\s*data)\b|critical\b'
+        r'|enum\b|change\s+team\b)',
+        re.IGNORECASE,
+    )
+    _INNER_CLOSE_RE = re.compile(
+        r'^end\s*(if|do|select|where|forall|type|interface|associate|block|critical|enum|team)\b',
+        re.IGNORECASE,
+    )
+    _UNIT_CLOSE_RE = re.compile(r'^end\b', re.IGNORECASE)
+
+    @classmethod
+    def _classify(cls, code_line: str):
+        """Classify a (comment-stripped) line as one of:
+        'inner_close', 'unit_close', 'inner_open', 'unit_open', or None."""
+        if not code_line:
+            return None
+        if cls._INNER_CLOSE_RE.match(code_line):
+            return 'inner_close'
+        if cls._UNIT_CLOSE_RE.match(code_line):
+            return 'unit_close'
+        if cls._INNER_OPEN_RE.match(code_line):
+            return 'inner_open'
+        if cls._UNIT_OPEN_RE.match(code_line):
+            return 'unit_open'
+        return None
+
+    @classmethod
+    def _split_statements(cls, code: str) -> List[str]:
+        """Split Fortran source into statement units. Each program-unit
+        header/footer (PROGRAM/SUBROUTINE/.../END ...) and each ordinary
+        body line directly inside a unit (at any unit-nesting depth, e.g.
+        a CONTAINS-nested internal subroutine too) becomes its own
+        standalone statement; nested control-flow blocks (IF/DO/SELECT/...)
+        are kept atomic as a single multi-line unit, mirroring how the
+        C/PHP splitters treat compound-statement bodies."""
+        logical_lines = cls._join_continuations(code)
+        statements: List[str] = []
+        current: List[str] = []
+        udepth = 0
+        idepth = 0
+
+        def flush():
+            nonlocal current
+            stmt = '\n'.join(current).strip()
+            if stmt:
+                statements.append(stmt)
+            current = []
+
+        for logical in logical_lines:
+            first_phys = logical.split('\n', 1)[0]
+            code_part = cls._strip_comment(first_phys).strip()
+            kind = cls._classify(code_part)
+
+            if kind == 'inner_close':
+                # Closing line belongs to whatever inner block has been
+                # accumulating in `current` since its matching inner_open —
+                # append it there, and once idepth bottoms out the whole
+                # nested block (open line through close line) flushes as
+                # ONE atomic statement.
+                current.append(logical)
+                idepth = max(idepth - 1, 0)
+                if idepth == 0:
+                    flush()
+                continue
+
+            if kind == 'unit_close':
+                # A program-unit header (PROGRAM/SUBROUTINE/...) is emitted
+                # as its own standalone statement below (in 'unit_open'), so
+                # its closing END line must also stand alone — never glue it
+                # onto whatever inner block happened to flush last.
+                if current:
+                    flush()
+                udepth = max(udepth - 1, 0)
+                statements.append(logical)
+                continue
+
+            if kind == 'unit_open':
+                if current:
+                    flush()
+                statements.append(logical)
+                udepth += 1
+                continue
+
+            if kind == 'inner_open':
+                current.append(logical)
+                idepth += 1
+                continue
+
+            # ordinary line
+            if udepth >= 1 and idepth == 0:
+                if current:
+                    flush()
+                if logical.strip():
+                    statements.append(logical)
+            else:
+                current.append(logical)
+
+        flush()
+        return statements
+
+    def _stmt_defines_uses(self, stmt: str):
+        """Return (defines, unit_defines, uses) for a statement unit.
+        `unit_defines` (PROGRAM/MODULE/SUBROUTINE/FUNCTION names) is the
+        subset eligible for cross-seed dependency edges — plain variable
+        assignments/declarations stay seed-local."""
+        first_line = self._strip_comment(stmt.split('\n', 1)[0])
+
+        unit_defines = set()
+        m = self._UNIT_NAME_RE.match(first_line)
+        if m:
+            unit_defines.add(m.group(1).upper())
+
+        var_defines = set()
+        m = self._VAR_ASSIGN_RE.match(first_line)
+        if m and m.group(1).upper() not in self._KEYWORDS:
+            var_defines.add(m.group(1).upper())
+        m = self._DECL_RE.match(first_line)
+        if m:
+            for part in m.group(1).split(','):
+                nm = self._DECL_NAME_RE.match(part.strip())
+                if nm and nm.group(1).upper() not in self._KEYWORDS:
+                    var_defines.add(nm.group(1).upper())
+
+        uses = {t.upper() for t in self._IDENT_RE.findall(stmt) if t.upper() not in self._KEYWORDS}
+
+        return (var_defines | unit_defines), unit_defines, uses
+
+    def _normalize_stmt(self, stmt: str) -> str:
+        s = self._NORM_STR.sub("'_'", stmt)
+        s = self._NORM_NUM.sub('0', s)
+        s = self._IDENT_RE.sub(
+            lambda m: m.group(0) if m.group(0).upper() in self._KEYWORDS else '_', s)
+        return s
+
+    @staticmethod
+    def _token_similarity(norm_a: str, norm_b: str) -> float:
+        toks_a = set(norm_a.split())
+        toks_b = set(norm_b.split())
+        if not toks_a and not toks_b:
+            return 1.0
+        union = toks_a | toks_b
+        return len(toks_a & toks_b) / len(union) if union else 0.0
+
+    @classmethod
+    def _unit_order_chain(cls, stmts: List[str]) -> List[Tuple[int, int]]:
+        """Return (i, j) pairs meaning "statement i must come after
+        statement j" for consecutive entries that lie inside the same
+        still-open program unit (from its header line through its footer,
+        inclusive). Def/use edges alone don't keep a unit's body attached
+        to its own header/footer — e.g. a SUBROUTINE's local variable
+        declarations don't "use" the subroutine's name — so without this,
+        topological sort is free to scatter a unit's body outside its own
+        header/footer entirely. This forces the original relative order to
+        be preserved for anything still inside an open unit."""
+        pairs = []
+        depth = 0
+        prev_in_unit = None
+        for i, s in enumerate(stmts):
+            first = cls._strip_comment(s.split('\n', 1)[0]).strip()
+            kind = cls._classify(first)
+            if kind == 'unit_open':
+                if depth > 0 and prev_in_unit is not None:
+                    pairs.append((i, prev_in_unit))
+                depth += 1
+                prev_in_unit = i
+                continue
+            if kind == 'unit_close':
+                if prev_in_unit is not None:
+                    pairs.append((i, prev_in_unit))
+                depth = max(depth - 1, 0)
+                prev_in_unit = i if depth > 0 else None
+                continue
+            if depth > 0:
+                if prev_in_unit is not None:
+                    pairs.append((i, prev_in_unit))
+                prev_in_unit = i
+        return pairs
+
+    def _dependency_graph_interleave(self, stmts_a: List[str], stmts_b: List[str]) -> List[str]:
+        tagged = [(s, 'a') for s in stmts_a] + [(s, 'b') for s in stmts_b]
+        n = len(tagged)
+        if n == 0:
+            return []
+
+        info = []
+        for stmt, origin in tagged:
+            defines, unit_defines, uses = self._stmt_defines_uses(stmt)
+            info.append({
+                'stmt': stmt, 'origin': origin, 'defines': defines,
+                'unit_defines': unit_defines, 'uses': uses,
+                'norm': self._normalize_stmt(stmt),
+            })
+
+        def_map: Dict[str, List[Tuple[int, str]]] = {}
+        for i, inf in enumerate(info):
+            for name in inf['defines']:
+                def_map.setdefault(name, []).append((i, inf['origin']))
+
+        deps = [set() for _ in range(n)]
+        for j, inf_j in enumerate(info):
+            for name in inf_j['uses']:
+                if name not in def_map:
+                    continue
+                for di, d_origin in def_map[name]:
+                    if di == j:
+                        continue
+                    if d_origin == inf_j['origin']:
+                        deps[j].add(di)
+                    elif name in info[di]['unit_defines']:
+                        deps[j].add(di)
+
+        # Keep each seed's own program-unit bodies attached to their own
+        # header/footer (see _unit_order_chain).
+        offset_b = len(stmts_a)
+        for i, j in self._unit_order_chain(stmts_a):
+            deps[i].add(j)
+        for i, j in self._unit_order_chain(stmts_b):
+            deps[offset_b + i].add(offset_b + j)
+
+        emitted = [False] * n
+        result: List[str] = []
+        in_degree = [len(d) for d in deps]
+        dependents = [[] for _ in range(n)]
+        for j in range(n):
+            for di in deps[j]:
+                dependents[di].append(j)
+
+        ready = [i for i in range(n) if in_degree[i] == 0]
+        last_norm = ""
+        while ready:
+            if not result:
+                pick_idx = random.choice(ready)
+            else:
+                scored = sorted(
+                    ((self._token_similarity(last_norm, info[ri]['norm']), ri) for ri in ready),
+                    key=lambda x: -x[0])
+                top_k = min(3, len(scored))
+                pick_idx = random.choice([s[1] for s in scored[:top_k]])
+
+            ready.remove(pick_idx)
+            emitted[pick_idx] = True
+            result.append(info[pick_idx]['stmt'])
+            last_norm = info[pick_idx]['norm']
+
+            for dep_j in dependents[pick_idx]:
+                in_degree[dep_j] -= 1
+                if in_degree[dep_j] == 0 and not emitted[dep_j]:
+                    ready.append(dep_j)
+
+        for i in range(n):
+            if not emitted[i]:
+                result.append(info[i]['stmt'])
+
+        return result
+
+    def _replace_random_occurrence_word(self, s: str, old: str, new: str) -> str:
+        """Word-boundary-safe, case-insensitive replacement (Fortran is
+        case-insensitive, so 'X' and 'x' are the same identifier)."""
+        matches = list(re.finditer(rf'(?<!\w){re.escape(old)}(?!\w)', s, re.IGNORECASE))
+        if not matches:
+            return s
+        match = random.choice(matches)
+        start, end = match.span()
+        return s[:start] + new + s[end:]
+
+    def _stmt_cross_replace_variable(self, code: str, vars_a: List[str], vars_b: List[str]) -> str:
+        if not vars_a or not vars_b:
+            return code
+        var_b = random.choice(vars_b)
+        var_a = random.choice(vars_a)
+        if var_a.upper() == var_b.upper():
+            return code
+        return self._replace_random_occurrence_word(code, var_b, var_a)
+
+    def _find_body_span(self, stmt: str):
+        """For one atomic statement unit (e.g. a whole IF/DO block or a
+        whole program unit), return (body_start_line, body_end_line) index
+        range (exclusive of the header/footer lines) — or None."""
+        logical_lines = self._join_continuations(stmt)
+        if len(logical_lines) < 2:
+            return None
+        first = self._strip_comment(logical_lines[0].split('\n', 1)[0]).strip()
+        if self._classify(first) not in ('unit_open', 'inner_open'):
+            return None
+        depth = 1
+        for i in range(1, len(logical_lines)):
+            code_part = self._strip_comment(logical_lines[i].split('\n', 1)[0]).strip()
+            kind = self._classify(code_part)
+            if kind in ('unit_open', 'inner_open'):
+                depth += 1
+            elif kind in ('unit_close', 'inner_close'):
+                depth -= 1
+                if depth == 0:
+                    if i - 1 < 1:
+                        return None
+                    return (1, i, logical_lines)
+        return None
+
+    # Program-unit headers (PROGRAM/SUBROUTINE/...) are always standalone
+    # single-line statements now (see _split_statements), never a multi-line
+    # atomic block — only inner control-flow blocks can be injection targets.
+    _BLOCK_HEAD_RE = re.compile(
+        r'^(if\s*\(.*\)\s*then\s*$|do\b|select\s*(?:case|type)\b'
+        r'|where\s*\(.*\)\s*$|forall\b.*$)',
+        re.IGNORECASE,
+    )
+
+    def _inject_into_block(self, stmts: List[str]) -> List[str]:
+        candidates = []
+        atomic = []
+        for idx, s in enumerate(stmts):
+            first = self._strip_comment(s.split('\n', 1)[0]).strip()
+            if self._BLOCK_HEAD_RE.match(first):
+                span = self._find_body_span(s)
+                if span:
+                    start, end, lines = span
+                    body = '\n'.join(lines[start:end])
+                    if len(body.strip()) > 5:
+                        candidates.append((idx, start, end, lines))
+            elif s.strip() and self._classify(first) not in ('unit_open', 'unit_close'):
+                # A lone PROGRAM/SUBROUTINE/... header or its END footer is
+                # never a valid donor — injecting one into an unrelated
+                # block would open/close a program unit boundary in the
+                # middle of that block, breaking the balanced nesting that
+                # the rest of the seed (and its own real header/footer)
+                # depends on.
+                atomic.append((idx, s))
+
+        if not candidates or not atomic:
+            return stmts
+
+        target_idx, body_start, body_end, lines = random.choice(candidates)
+
+        donors = [(i, s) for i, s in atomic if i != target_idx]
+        if not donors:
+            return stmts
+        n_inject = min(random.randint(1, 3), len(donors))
+        chosen = random.sample(donors, n_inject)
+        inject_stmts = [s for _, s in chosen]
+
+        indent = "  "
+        for ln in lines[body_start:body_end]:
+            stripped = ln.lstrip()
+            if stripped:
+                indent = ln[:len(ln) - len(stripped)]
+                break
+
+        insert_pos = random.randint(body_start, body_end)
+        injected = [indent + s.strip() for s in inject_stmts]
+        new_lines = lines[:insert_pos] + injected + lines[insert_pos:]
+
+        result = list(stmts)
+        result[target_idx] = '\n'.join(new_lines)
+        return result
+
+    def _statement_fuse(self, clean1: str, clean2: str,
+                         vars1: List[str], vars2: List[str]) -> str:
+        stmts_a = self._split_statements(clean1)
+        stmts_b = self._split_statements(clean2)
+
+        if not stmts_a and not stmts_b:
+            return clean1 + '\n' + clean2
+
+        interleaved = self._dependency_graph_interleave(stmts_a, stmts_b)
+
+        if random.random() < 0.3:
+            interleaved = self._inject_into_block(interleaved)
+
+        fused_code = '\n'.join(interleaved)
+        fused_code = self._stmt_cross_replace_variable(fused_code, vars1, vars2)
+        return fused_code
+
+    # ── Dataflow fusion: insert before the outermost unit's END ──────
+
+    def interleave_code_blocks(self, code1, code2, dataflow1, dataflow2, extra_flows=None):
+        """Override of GenericDataflowStrategy.interleave_code_blocks:
+        Fortran has no valid "append a statement after the last program
+        unit" construct (unlike C's top-level declaration trick), so the
+        bridge assignment is inserted just before code1's outermost unit
+        closing END instead of appended at the very end."""
+        if not dataflow1 or not dataflow2:
+            return code1, code2
+
+        if extra_flows:
+            dataflow1 = dataflow1 + extra_flows
+
+        bridge = self.bridge_var_name
+
+        if random.choice([True, False]):
+            try:
+                group1 = random.choice(dataflow1)
+                var1 = random.choice(group1)
+                group2 = random.choice(dataflow2)
+                var2 = random.choice(group2)
+                bridge_stmt = self.format_assignment(bridge, var1)
+                code1 = self._insert_before_last_unit_end(code1, bridge_stmt)
+                code2 = self._replace_random_occurrence_word(code2, var2, bridge)
+            except IndexError:
+                pass
+            return code1, code2
+
+        max_df1 = max(dataflow1, key=len) if dataflow1 else []
+        max_df2 = max(dataflow2, key=len) if dataflow2 else []
+
+        if max_df1 and max_df2:
+            var1 = random.choice(max_df1)
+            var2 = random.choice(max_df2)
+            bridge_stmt = self.format_assignment(bridge, var1)
+            code1 = self._insert_before_last_unit_end(code1, bridge_stmt)
+            code2 = self._replace_random_occurrence_word(code2, var2, bridge)
+
+        return code1, code2
+
+    def _insert_before_last_unit_end(self, code: str, statement: str) -> str:
+        """Insert `statement` just before the last outermost-unit-closing
+        END line in `code` (udepth 1->0 transition). Falls back to
+        appending at the end if no complete unit is found (malformed/
+        fragment seed — same tolerant behaviour as elsewhere)."""
+        logical_lines = self._join_continuations(code)
+        udepth = 0
+        idepth = 0
+        last_close_idx = None
+        for i, logical in enumerate(logical_lines):
+            first = self._strip_comment(logical.split('\n', 1)[0]).strip()
+            kind = self._classify(first)
+            if kind == 'inner_close':
+                idepth = max(idepth - 1, 0)
+            elif kind == 'unit_close':
+                udepth = max(udepth - 1, 0)
+                if udepth == 0 and idepth == 0:
+                    last_close_idx = i
+            elif kind == 'unit_open':
+                udepth += 1
+            elif kind == 'inner_open':
+                idepth += 1
+
+        if last_close_idx is None:
+            return code + f"\n{statement}\n"
+
+        new_lines = logical_lines[:last_close_idx] + [statement] + logical_lines[last_close_idx:]
+        return '\n'.join(new_lines)
+
+    # ── Top-level name-conflict resolution ────────────────────────
+
+    def _extract_top_level_names(self, code: str):
+        names = set()
+        for logical in self._join_continuations(code):
+            first = self._strip_comment(logical.split('\n', 1)[0]).strip()
+            m = self._UNIT_NAME_RE.match(first)
+            if m:
+                names.add(m.group(1).upper())
+        return names
+
+    def _resolve_name_conflicts(self, code_a: str, code_b: str) -> str:
+        conflicts = self._extract_top_level_names(code_a) & self._extract_top_level_names(code_b)
+        if not conflicts:
+            return code_b
+        result = code_b
+        for name in sorted(conflicts, key=len, reverse=True):
+            result = re.sub(
+                rf'(?<!\w)\b{re.escape(name)}\b(?!\w)',
+                name + '_ffl',
+                result,
+                flags=re.IGNORECASE,
+            )
+        return result
+
+    # ── Entry points ───────────────────────────────────────────────
+
+    def _build_fused_test(self, parent_a: Seed, parent_b: Seed, mode: str) -> Seed:
+        code1 = parent_a.content
+        code2 = parent_b.content
+        meta1 = parent_a.metadata
+        meta2 = parent_b.metadata
+        variable1 = meta1.get('variables', [])
+        variable2 = meta2.get('variables', [])
+        dataflow1 = meta1.get('dataflows', [])
+        dataflow2 = meta2.get('dataflows', [])
+
+        if self.mutation:
+            code1 = self.mut.mutate(code1)
+            code2 = self.mut.mutate(code2)
+
+        code2 = self._resolve_name_conflicts(code1, code2)
+
+        if mode == 'stmt_ab':
+            fused = self._statement_fuse(code1, code2, variable1, variable2)
+        elif mode == 'stmt_ba':
+            fused = self._statement_fuse(code2, code1, variable2, variable1)
+        elif mode == 'df_ab':
+            new_code1, new_code2 = self.interleave_code_blocks(code1, code2, dataflow1, dataflow2)
+            fused = f"{new_code1}\n{new_code2}"
+        elif mode == 'df_ba':
+            new_code2, new_code1 = self.interleave_code_blocks(code2, code1, dataflow2, dataflow1)
+            fused = f"{new_code1}\n{new_code2}"
+        else:
+            raise ValueError(f"Unknown mode: {mode}")
+
+        ext = meta1.get('extension', '.f90')
+        seed_type = meta1.get('type', 'fortran')
+
+        return Seed(content=fused, metadata={
+            "parents": [parent_a.id, parent_b.id],
+            "type": seed_type,
+            "extension": ext,
+            "mode": mode,
+            "description": f"Fused {parent_a.id} + {parent_b.id} ({mode})",
+        })
+
+    def fuse(self, parent_a: Seed, parent_b: Seed) -> Seed:
+        mode = 'stmt_ab' if self.stmt_fusion else 'df_ab'
+        return self._build_fused_test(parent_a, parent_b, mode)
+
+    def fuse_bidirectional(self, parent_a: Seed, parent_b: Seed) -> List[Seed]:
+        """Produce both A->B and B->A variants for the active fusion kind."""
+        if self.stmt_fusion:
+            return [
+                self._build_fused_test(parent_a, parent_b, 'stmt_ab'),
+                self._build_fused_test(parent_a, parent_b, 'stmt_ba'),
+            ]
+        return [
+            self._build_fused_test(parent_a, parent_b, 'df_ab'),
+            self._build_fused_test(parent_a, parent_b, 'df_ba'),
+        ]
+
+    def fuse_all(self, parent_a: Seed, parent_b: Seed) -> List[Seed]:
+        """Produce all four fusion variants for one pair."""
+        return [
+            self._build_fused_test(parent_a, parent_b, 'stmt_ab'),
+            self._build_fused_test(parent_a, parent_b, 'stmt_ba'),
+            self._build_fused_test(parent_a, parent_b, 'df_ab'),
+            self._build_fused_test(parent_a, parent_b, 'df_ba'),
+        ]
+
+
+# ==========================================
 # Strategy Factory (Updated)
 # ==========================================
 
@@ -4813,6 +6131,24 @@ def get_strategies(project_name=None, stmt_fusion=False, dataflow_fusion=False, 
     if project_name == "php":
         if os.path.exists("projects/php"):
             s = PHPFusionStrategy(project_root="projects/php")
+            s.stmt_fusion = stmt_fusion
+            s.dataflow_fusion = dataflow_fusion
+            s.all_fusion = all_fusion
+            strategies.append(s)
+        return strategies
+
+    if project_name == "clang":
+        if os.path.exists("projects/clang"):
+            s = ClangFusionStrategy(project_root="projects/clang")
+            s.stmt_fusion = stmt_fusion
+            s.dataflow_fusion = dataflow_fusion
+            s.all_fusion = all_fusion
+            strategies.append(s)
+        return strategies
+
+    if project_name == "flang":
+        if os.path.exists("projects/flang"):
+            s = FlangFusionStrategy(project_root="projects/flang")
             s.stmt_fusion = stmt_fusion
             s.dataflow_fusion = dataflow_fusion
             s.all_fusion = all_fusion

@@ -1,0 +1,33 @@
+project_name: "clang"
+
+execution:
+  # The driver picks the binary (clang/clang++) and flags dynamically per
+  # seed; this template is only used as a BaseDriver fallback.
+  command: "clang -fsyntax-only {seed_path}"
+  timeout: 10
+  concurrency: 20
+
+analysis:
+  crash_patterns:
+    - "SUMMARY: AddressSanitizer"
+    - "SUMMARY: UndefinedBehaviorSanitizer"
+    - "LLVM ERROR"
+    - "Assertion `"
+    - "Stack dump:"
+    - "Segmentation fault"
+    - "Aborted"
+    - "core dumped"
+    - "PLEASE submit a bug report"
+  syntax_patterns:
+    - "error: "
+    - "fatal error: "
+
+paths:
+  seed_source: "projects/clang/llvm-project/clang/test"
+  seed_corpus: "projects/clang/corpus.db"
+
+llm:
+  provider: "openai"  # Options: gemini, openai, vllm, ollama
+  model: "gpt-5.4-mini"
+  api_key: "" # Defaults to LLM_API_KEY env var
+  timeout: 30
