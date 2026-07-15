@@ -8,14 +8,11 @@ from core.driver import BaseDriver, ExecutionResult
 
 class ClangDriver(BaseDriver):
     """
-    Clang driver: invokes the system clang/clang++ frontend directly.
-    FFL runs inside the ffl-clang container where 'clang'/'clang++' are
-    already in PATH (see projects/clang/Dockerfile — no from-source LLVM
-    build required).
+    Clang driver: invokes clang/clang++ built from llvm-project source.
+    FFL runs inside the fuzz-clang container; projects/clang/setup.py clones
+    llvm-project's main branch and builds it, installing to
+    {ffl_root}/projects/clang/llvm-clang-install/bin/{clang,clang++}.
     """
-
-    CLANG_BIN = "clang"
-    CLANGXX_BIN = "clang++"
 
     STD_C = ["c89", "c99", "c11", "c17", "c23", "gnu99", "gnu11", "gnu17"]
     STD_CXX = ["c++03", "c++11", "c++14", "c++17", "c++20", "c++23", "gnu++17", "gnu++20"]
@@ -53,13 +50,16 @@ class ClangDriver(BaseDriver):
         super().__init__(config)
         mem_limit_mb = config.get('execution', {}).get('mem_limit_mb', self.DEFAULT_MEM_LIMIT_MB)
         self.mem_limit_kb = int(mem_limit_mb) * 1024
+        install_bin = os.path.join(self.ffl_root, "projects", "clang", "llvm-clang-install", "bin")
+        self.clang_bin = os.path.join(install_bin, "clang")
+        self.clangxx_bin = os.path.join(install_bin, "clang++")
 
     def _lang_for(self, ext):
         if ext in self._CXX_EXTS:
-            return self.CLANGXX_BIN, self.STD_CXX
+            return self.clangxx_bin, self.STD_CXX
         if ext == ".m":
-            return self.CLANG_BIN, None  # Objective-C
-        return self.CLANG_BIN, self.STD_C
+            return self.clang_bin, None  # Objective-C
+        return self.clang_bin, self.STD_C
 
     def _get_random_flags(self, ext):
         binname, stds = self._lang_for(ext)
@@ -136,10 +136,17 @@ class ClangDriver(BaseDriver):
 
     _STACK_DUMP_BODY_RE = re.compile(r'Stack dump:\n((?:.*\n?){1,60})')
     _STACK_MSG_LINE_RE = re.compile(r'^\d+\.\t(?:\S+:\d+:\d+:\s*)?(.+)$', re.MULTILINE)
-    _STACK_FRAME_RE = re.compile(r'^\s*#\d+\s+0x[0-9a-f]+\s+([A-Za-z_][\w:<>,~ &*]*?)\s*\(', re.MULTILINE)
-    _STACK_OFFSET_RE = re.compile(r'\(([^()\s]+?)\+(0x[0-9a-f]+)\)', re.MULTILINE)
+    # LLVM's PrettyStackTrace/signal-handler dump prints frames as
+    # "<n>  <binary>  0x<addr> [<symbol>(<args>) + <offset>]" — no leading
+    # '#' and no parens around the binary+address, unlike the gdb-style
+    # format this regex was originally written for. Matching '#\d+' here
+    # silently matched zero frames on every real crash, degrading every
+    # Stack dump signature down to just the generic crash-site message.
+    _STACK_FRAME_RE = re.compile(r'^\s*\d+\s+\S+\s+0x[0-9a-f]+\s+([A-Za-z_][\w:<>,~ &*]*?)\s*\(', re.MULTILINE)
+    _STACK_OFFSET_RE = re.compile(r'^\s*\d+\s+(\S+)\s+(0x[0-9a-f]+)\s*$', re.MULTILINE)
     _NOISE_FRAME_RE = re.compile(
         r'^(?:llvm::sys::PrintStackTrace|llvm::sys::RunSignalHandlers|'
+        r'llvm::sys::CleanupOnSignal|'
         r'.*SignalHandler.*|abort|raise|gsignal|pthread_kill|'
         r'__assert_fail|__cxa_throw)$'
     )

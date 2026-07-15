@@ -21,31 +21,33 @@ class LLMGenerator:
         
         # Configuration defaults
         llm_config = config.get("llm", {})
-        self.provider = llm_config.get("provider", "gemini")  # Options: 'gemini', 'vllm', 'openai', 'ollama'
+        self.provider = llm_config.get("provider", "gemini")  # Options: 'gemini', 'vllm', 'openai', 'ollama', 'deepseek'
         self.model = llm_config.get("model", "gemini-2.5-flash-preview-09-2025")
         self.api_key = llm_config.get("api_key", "")
-        
+
         # Set default API base depending on provider
         if self.provider == "ollama":
             default_base = "http://localhost:11434"
         elif self.provider == "openai":
             default_base = "https://api.openai.com/v1"
+        elif self.provider == "deepseek":
+            default_base = "https://api.deepseek.com"
         else:
             default_base = "http://localhost:8000/v1"
-            
+
         self.api_base = llm_config.get("api_base", default_base)
         self.timeout = llm_config.get("timeout", 60) # Increased timeout for reasoning models
-        
-        # Initialize OpenAI Client if applicable
+
+        # Initialize OpenAI Client if applicable (DeepSeek is OpenAI API-compatible)
         self.openai_client = None
-        if self.provider == "openai":
+        if self.provider in ("openai", "deepseek"):
             if HAS_OPENAI_LIB and self.api_key:
                 try:
                     self.openai_client = OpenAI(api_key=self.api_key, base_url=self.api_base)
                 except Exception as e:
                     logger.error(f"Failed to initialize OpenAI client: {e}")
             elif not HAS_OPENAI_LIB:
-                logger.warning("OpenAI provider selected but 'openai' library not found. Falling back to requests.")
+                logger.warning(f"{self.provider} provider selected but 'openai' library not found. Falling back to requests.")
 
         # Prompt Engineering
         self.gen_prompt_template = llm_config.get("gen_prompt", (
@@ -168,46 +170,48 @@ class LLMGenerator:
 
     def _call_openai(self, prompt):
         """
-        Adapter for official OpenAI API.
+        Adapter for official OpenAI API, and any OpenAI-compatible API
+        (e.g. DeepSeek) reachable via the 'openai' provider name.
         Handles O-series reasoning models (o1, o3) which have specific constraints.
         """
+        provider_label = self.provider.capitalize()
         if not self.api_key:
-            logger.error("OpenAI API Key is missing. Please set LLM_API_KEY environment variable.")
+            logger.error(f"{provider_label} API Key is missing. Please set LLM_API_KEY environment variable.")
             return None
 
         # Prefer using the official library if available
         if self.openai_client:
             # o-series reasoning models (o1, o1-mini, o3, o3-mini, o4-mini, …)
-            is_reasoning = bool(re.match(r"^o\d", self.model))
-            
+            is_reasoning = bool(re.match(r"^o\d", self.model)) or self.model == "deepseek-reasoner"
+
             kwargs = {
                 "model": self.model,
                 "messages": [{"role": "user", "content": prompt}]
             }
-            
+
             if is_reasoning:
                 # Reasoning models use max_completion_tokens and generally do not support temperature
                 kwargs["max_completion_tokens"] = 8096
             else:
                 kwargs["temperature"] = 0.5
                 # kwargs["max_tokens"] = 4096
-                
+
             try:
                 response = self.openai_client.chat.completions.create(**kwargs)
                 return response.choices[0].message.content
             except Exception as e:
-                logger.error(f"OpenAI API Error (Library): {e}")
+                logger.error(f"{provider_label} API Error (Library): {e}")
                 return None
 
         # Fallback to manual requests if library is missing
         url = f"{self.api_base.rstrip('/')}/chat/completions"
-        
+
         headers = {
             "Content-Type": "application/json",
             "Authorization": f"Bearer {self.api_key}"
         }
 
-        is_reasoning = bool(re.match(r"^o\d", self.model))
+        is_reasoning = bool(re.match(r"^o\d", self.model)) or self.model == "deepseek-reasoner"
 
         payload = {
             "model": self.model,
@@ -224,16 +228,16 @@ class LLMGenerator:
             response = requests.post(url, headers=headers, json=payload, timeout=self.timeout)
             response.raise_for_status()
             data = response.json()
-            
+
             choices = data.get("choices", [])
             if not choices:
                 return None
-            
+
             raw_text = choices[0].get("message", {}).get("content", "")
             return raw_text
 
         except Exception as e:
-            logger.error(f"OpenAI API Error (Requests): {e}")
+            logger.error(f"{provider_label} API Error (Requests): {e}")
             return None
 
     def _call_api(self, prompt):
@@ -243,7 +247,7 @@ class LLMGenerator:
             raw_text = self._call_vllm(prompt)
         elif self.provider == "ollama":
             raw_text = self._call_ollama(prompt)
-        elif self.provider == "openai":
+        elif self.provider in ("openai", "deepseek"):
             raw_text = self._call_openai(prompt)
         else:
             logger.error(f"Unknown LLM provider: {self.provider}")
