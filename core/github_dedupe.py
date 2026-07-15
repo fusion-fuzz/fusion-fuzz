@@ -104,7 +104,14 @@ def build_search_terms(signature: str):
         words = detail.split()
         terms = []
         if len(words) >= 2:
-            terms.append('"' + " ".join(words[:8]) + '"')
+            # LLVM assert messages routinely embed their own literal quotes
+            # (the `assert(cond && "message")` idiom, e.g. Assertion:
+            # isa<To>(Val) && "cast<Ty>() argument of incompatible type!").
+            # Strip them before wrapping in our own quotes, or the nested
+            # quote closes the phrase early and corrupts the query.
+            phrase = " ".join(words[:8]).replace('"', '')
+            if phrase:
+                terms.append('"' + phrase + '"')
         if words:
             terms.append(words[0].strip('`\'".,;:()'))
         return terms or [detail]

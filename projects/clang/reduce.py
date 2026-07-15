@@ -118,10 +118,14 @@ def reduce_clang(testpath, clang_bin, flags, bug_output, env_prefix=""):
 
 _CXX_EXTS = (".cpp", ".cc", ".cxx", ".mm")
 
+# Built by projects/clang/setup.py from llvm-project's main branch.
+_INSTALL_BIN = os.path.join(os.path.dirname(os.path.abspath(__file__)), "llvm-clang-install", "bin")
+
 
 def _clang_bin_for(testpath):
     ext = os.path.splitext(testpath)[1].lower()
-    return "clang++" if ext in _CXX_EXTS else "clang"
+    name = "clang++" if ext in _CXX_EXTS else "clang"
+    return os.path.join(_INSTALL_BIN, name)
 
 
 def _lang_tag_for(testpath):
@@ -138,7 +142,7 @@ def _lang_tag_for(testpath):
 if __name__ == "__main__":
     # Path to the crashing test case — copy it here (or point directly at a
     # bug's test.<ext> under output/bugs/clang/<bug_dir>/) before running.
-    testpath = "/tmp/test.cpp"
+    testpath = "/tmp/test.mm"
 
     clang_bin = _clang_bin_for(testpath)
     print(clang_bin)
@@ -146,8 +150,7 @@ if __name__ == "__main__":
     # Flags that reproduced the crash — copy these from the bug's test.sh
     # (the tokens after "clang"/"clang++", before the source file). Order
     # doesn't matter; each is tried for removal independently.
-    flags = ["-S", "-o", "/dev/null", "-O2", "-std=c++17"]
-    flags = []
+    flags = ["-S", "-o", "/dev/null", "-O3", "-std=c++20"]
 
     # Matches projects/clang/driver.py's execution environment: caps address
     # space so OOM-y inputs abort cleanly ("LLVM ERROR: out of memory")

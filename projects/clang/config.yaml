@@ -5,7 +5,7 @@ execution:
   # seed; this template is only used as a BaseDriver fallback.
   command: "clang -fsyntax-only {seed_path}"
   timeout: 10
-  concurrency: 20
+  concurrency: 16
 
 analysis:
   crash_patterns:
@@ -27,7 +27,7 @@ paths:
   seed_corpus: "projects/clang/corpus.db"
 
 llm:
-  provider: "openai"  # Options: gemini, openai, vllm, ollama
-  model: "gpt-5.4-mini"
-  api_key: "" # Defaults to LLM_API_KEY env var
+  provider: "deepseek"  # Options: gemini, openai, vllm, ollama
+  model: "deepseek-v4-flash"
+  api_key: "sk-8fefc3ef0d6848858d4d5b6b5fc9ce89" # Defaults to LLM_API_KEY env var
   timeout: 30
