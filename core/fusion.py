@@ -9,7 +9,7 @@ import tokenize
 import keyword
 from dataclasses import dataclass, field
 from typing import List, Dict, Any, Tuple
-from .mutation import BaseMutator, PHPMutator, CPythonMutator, RustMutator, WGSLMutator, GoMutator, LeanMutator, JSMutator, CangjeMutator
+from .mutation import BaseMutator, PHPMutator, CPythonMutator, RustMutator, WGSLMutator, GoMutator, LeanMutator, JSMutator, CangjeMutator, HaskellMutator
 
 @dataclass
 class Seed:
@@ -4489,6 +4489,381 @@ def _ffl_p7Chain (x y z : Int) : Option Int := do
         )
 
 
+class HaskellFusionStrategy(FusionStrategy):
+    """
+    Haskell-Specific Fusion Strategy.
+
+    Supports two fusion modes, selected via `self.dataflow_fusion` /
+    `self.state_fusion` (mirroring PHP's stmt_fusion/dataflow_fusion split):
+
+    - Dataflow fusion ('df_ab'/'df_ba'): a value harvested from the source
+      seed is written into a shared top-level CAF (an `unsafePerformIO`'d
+      IORef) and spliced into a numeric-literal position in the
+      destination seed via `fromInteger`, so the splice type-unifies with
+      almost any Num context. Exercises GHC's constant folding, CAF
+      sharing, and unsafePerformIO duplication-under-optimization paths.
+
+    - State fusion ('state_ab'/'state_ba'): builds a harness where both
+      seeds' entry actions would run *concurrently* via forkIO, racing on
+      one shared top-level IORef/MVar/TVar cell (kind picked from
+      whichever stateful construct, if any, the seeds themselves already
+      use). This is the Haskell analogue of PHP/CPython's dataflow
+      bridging, adapted for an effectful, concurrent setting.
+      NOTE: projects/haskell/driver.py is compile-only (`ghc -fno-code`,
+      never links or runs the program), so today this harness is only
+      ever type-checked — it exercises GHC's handling of concurrent-
+      looking code (closures captured by forkIO, CAF/unsafePerformIO
+      typing, MVar/STM API usage), not actual runtime races. The fused
+      program is still shaped for real races (forkIO + shared cell + a
+      System.Timeout-bounded join) in case the driver ever switches back
+      to executing.
+
+    Both modes: strip module headers, merge imports/pragmas, rename `main`
+    to a unique per-seed entry point (synthesizing one if a seed had none),
+    rename colliding top-level declarations in B, and wrap each entry
+    action in `try` so one seed's ordinary runtime exception doesn't
+    prevent the other from running (relevant if the driver ever executes
+    fused output; harmless dead code under compile-only fuzzing).
+    """
+
+    _HS_KEYWORDS = frozenset({
+        'data', 'newtype', 'type', 'class', 'instance', 'where', 'let', 'in',
+        'do', 'if', 'then', 'else', 'case', 'of', 'import', 'module',
+        'deriving', 'infixl', 'infixr', 'infix', 'foreign', 'default',
+        'family', 'forall', 'main', 'True', 'False', 'Nothing', 'Just',
+        'Left', 'Right',
+    })
+
+    # Typeclass methods / Prelude staples — never rename these even if a
+    # seed happens to define a same-named top-level binding, since renaming
+    # inside an `instance ... where` block would break the instance.
+    _HS_SKIP_RENAME = frozenset({
+        'show', 'showsPrec', 'showList', 'read', 'readsPrec',
+        'compare', 'max', 'min', 'fmap', 'pure', 'return',
+        'mempty', 'mappend', 'toEnum', 'fromEnum', 'succ', 'pred',
+        'minBound', 'maxBound', 'foldr', 'foldl', 'foldMap', 'traverse',
+        'sequence', 'id', 'const', 'map', 'filter', 'length', 'head',
+        'tail', 'init', 'last', 'div', 'mod', 'quot', 'rem', 'negate',
+        'abs', 'signum', 'fromInteger', 'toInteger', 'fromRational',
+        'toRational',
+    })
+
+    _MODULE_HEADER_RE = re.compile(r'^\s*module\s+.*?\bwhere\b\s*', re.DOTALL)
+    _IMPORT_LINE_RE = re.compile(r'^\s*import\s+.*$', re.MULTILINE)
+    _PRAGMA_RE = re.compile(r'\{-#.*?#-\}', re.DOTALL)
+    _MAIN_DEF_RE = re.compile(r'^main\s*(?:::|=)', re.MULTILINE)
+    _TOPLEVEL_RE = re.compile(
+        r"^([a-z_][A-Za-z0-9_']*)\s*(?:::|[^=\n]*=)"
+        r"|^(?:data|newtype|type)\s+([A-Z][A-Za-z0-9_']*)"
+        r"|^class\s+(?:.*=>\s*)?([A-Z][A-Za-z0-9_']*)",
+        re.MULTILINE,
+    )
+    _INT_LIT_RE = re.compile(r"(?<![A-Za-z0-9_.'])[0-9]+(?![A-Za-z0-9_.'])")
+
+    # Per-kind templates for the shared mutable cell used by state fusion
+    # (and, fixed to 'ioref', by dataflow fusion). Kept generic over
+    # IORef/MVar/TVar so `state_handles` metadata can steer which
+    # primitive gets exercised.
+    _STATE_KIND_INFO = {
+        'ioref': {
+            'type': 'IORef Integer',
+            'create': 'unsafePerformIO (newIORef 0)',
+            'write': lambda shared, v: f"writeIORef {shared} ({v})",
+            'read': lambda shared: f"readIORef {shared}",
+            'import': "import Data.IORef",
+        },
+        'mvar': {
+            'type': 'MVar Integer',
+            'create': 'unsafePerformIO (newMVar 0)',
+            'write': lambda shared, v: f"modifyMVar_ {shared} (\\_ -> return ({v}))",
+            'read': lambda shared: f"readMVar {shared}",
+            'import': "import Control.Concurrent.MVar",
+        },
+        'tvar': {
+            'type': 'TVar Integer',
+            'create': 'unsafePerformIO (newTVarIO 0)',
+            'write': lambda shared, v: f"atomically (writeTVar {shared} ({v}))",
+            'read': lambda shared: f"readTVarIO {shared}",
+            'import': "import Control.Concurrent.STM",
+        },
+    }
+
+    def __init__(self, project_root="projects/haskell"):
+        self.project_root = project_root
+        self.mut = HaskellMutator()
+        self.dataflow_fusion = True
+        self.state_fusion = False
+        self.all_fusion = False
+
+    # ------------------------------------------------------------------
+    # Seed processing
+    # ------------------------------------------------------------------
+
+    def _process_seed(self, code: str, uid: str) -> dict:
+        pragmas = [p.strip() for p in self._PRAGMA_RE.findall(code)]
+        code = self._PRAGMA_RE.sub('', code)
+        code = self._MODULE_HEADER_RE.sub('', code, count=1)
+
+        imports = [ln.strip() for ln in self._IMPORT_LINE_RE.findall(code)]
+        code = self._IMPORT_LINE_RE.sub('', code)
+
+        had_main = bool(self._MAIN_DEF_RE.search(code))
+        main_name = f"fflMain_{uid}"
+        code = re.sub(r'\bmain\b', main_name, code)
+
+        toplevel = set()
+        for m in self._TOPLEVEL_RE.finditer(code):
+            name = m.group(1) or m.group(2) or m.group(3)
+            if name:
+                toplevel.add(name)
+        toplevel -= self._HS_KEYWORDS
+        toplevel.discard(main_name)
+
+        return {
+            "pragmas": pragmas,
+            "imports": imports,
+            "body": code.strip(),
+            "had_main": had_main,
+            "main_name": main_name,
+            "toplevel_names": toplevel,
+        }
+
+    def _rename_collisions(self, names_a: set, body_b: str, names_b: set, uid_b: str) -> str:
+        collisions = (names_b & names_a) - self._HS_SKIP_RENAME - self._HS_KEYWORDS
+        if not collisions:
+            return body_b
+        uid_safe = re.sub(r'[^a-zA-Z0-9]', '_', uid_b)
+        for name in sorted(collisions, key=len, reverse=True):
+            body_b = re.sub(r'\b' + re.escape(name) + r'\b', f"{name}_b{uid_safe}", body_b)
+        return body_b
+
+    def _build_entry_action(self, name: str, had_main: bool, nullary_bindings: list) -> str:
+        """
+        Return an extra top-level decl (possibly empty) providing
+        `name :: IO ()`. If the seed already declared `main`, it was
+        already renamed to `name` by _process_seed and nothing more is
+        needed. Otherwise synthesize a small IO action that forces one of
+        the seed's pure top-level bindings (if any) through `show`, so GHC
+        still exercises the seed's declarations even without an original
+        `main`.
+        """
+        if had_main:
+            return ""
+        if nullary_bindings:
+            probe = random.choice(nullary_bindings)
+            return (
+                f"{name} :: IO ()\n"
+                f"{name} = do\n"
+                f"  r <- try (evaluate (length (show ({probe})))) :: IO (Either SomeException Int)\n"
+                f"  case r of\n"
+                f"    Left e -> putStrLn (\"probe error: \" ++ show (e :: SomeException))\n"
+                f"    Right n -> putStrLn (\"probe len: \" ++ show n)\n"
+            )
+        return f"{name} :: IO ()\n{name} = return ()\n"
+
+    # ------------------------------------------------------------------
+    # Bridge helpers
+    # ------------------------------------------------------------------
+
+    def _harvest_int_literal(self, body: str, default: str = "1") -> str:
+        matches = self._INT_LIT_RE.findall(body)
+        return random.choice(matches) if matches else default
+
+    def _splice_numeric_bridge(self, body: str, bridge_read_expr: str) -> str:
+        """Replace one random integer-literal occurrence in body with a read
+        from the shared cell, wrapped in `fromInteger` so it type-unifies
+        with (almost) any Num context the literal originally sat in."""
+        matches = list(self._INT_LIT_RE.finditer(body))
+        if not matches:
+            return body
+        m = random.choice(matches)
+        start, end = m.span()
+        return body[:start] + f"(fromInteger ({bridge_read_expr}))" + body[end:]
+
+    def _pick_shared_kind(self, meta_a: dict, meta_b: dict) -> str:
+        for meta in (meta_a, meta_b):
+            handles = meta.get('state_handles') or []
+            if handles:
+                return handles[0].get('kind', 'ioref')
+        return random.choice(['ioref', 'mvar', 'tvar'])
+
+    # ------------------------------------------------------------------
+    # Fusion build
+    # ------------------------------------------------------------------
+
+    def _build_fused_test(self, parent_a: Seed, parent_b: Seed, mode: str) -> Seed:
+        code_a, code_b = parent_a.content, parent_b.content
+        meta_a, meta_b = parent_a.metadata, parent_b.metadata
+
+        if self.mut:
+            code_a = self.mut.mutate(code_a)
+            code_b = self.mut.mutate(code_b)
+
+        uid_a = re.sub(r'[^a-zA-Z0-9]', '_', str(parent_a.id))
+        uid_b = re.sub(r'[^a-zA-Z0-9]', '_', str(parent_b.id))
+
+        proc_a = self._process_seed(code_a, uid_a)
+        proc_b = self._process_seed(code_b, uid_b)
+
+        body_a = proc_a['body']
+        body_b = self._rename_collisions(proc_a['toplevel_names'], proc_b['body'], proc_b['toplevel_names'], uid_b)
+
+        entry_a = self._build_entry_action(proc_a['main_name'], proc_a['had_main'], meta_a.get('nullary_bindings', []))
+        entry_b = self._build_entry_action(proc_b['main_name'], proc_b['had_main'], meta_b.get('nullary_bindings', []))
+
+        pragmas = sorted(set(proc_a['pragmas']) | set(proc_b['pragmas']))
+        seed_imports = sorted(set(proc_a['imports']) | set(proc_b['imports']))
+        base_imports = ["import Control.Exception (SomeException, evaluate, try)"]
+
+        is_state = mode.startswith('state_')
+        src_first = mode.endswith('_ab')  # True: A is the bridge/state "source"
+
+        src_body, dst_body = (body_a, body_b) if src_first else (body_b, body_a)
+        src_name = proc_a['main_name'] if src_first else proc_b['main_name']
+        dst_name = proc_b['main_name'] if src_first else proc_a['main_name']
+        meta_src = meta_a if src_first else meta_b
+
+        if is_state:
+            base_imports += [
+                "import Control.Concurrent (forkIO)",
+                "import Control.Concurrent.MVar (newEmptyMVar, putMVar, takeMVar)",
+                "import System.Timeout (timeout)",
+                "import System.IO.Unsafe (unsafePerformIO)",
+            ]
+            kind = self._pick_shared_kind(meta_a, meta_b)
+            info = self._STATE_KIND_INFO[kind]
+            base_imports.append(info['import'])
+
+            shared = f"fflShared_{uid_a}_{uid_b}"
+            shared_decl = (
+                f"{{-# NOINLINE {shared} #-}}\n"
+                f"{shared} :: {info['type']}\n"
+                f"{shared} = {info['create']}\n"
+            )
+            seed_val = self._harvest_int_literal(src_body)
+            dst_lit = self._harvest_int_literal(dst_body, seed_val)
+            write_src = info['write'](shared, seed_val)
+            read_expr = info['read'](shared)
+
+            main_body = (
+                "main :: IO ()\n"
+                "main = do\n"
+                f"  {write_src}\n"
+                "  doneA <- newEmptyMVar\n"
+                "  doneB <- newEmptyMVar\n"
+                "  _ <- forkIO (do\n"
+                f"    _ <- (try ({src_name}) :: IO (Either SomeException ()))\n"
+                "    putMVar doneA ())\n"
+                "  _ <- forkIO (do\n"
+                f"    v <- {read_expr}\n"
+                f"    {info['write'](shared, f'v + ({dst_lit})')}\n"
+                f"    _ <- (try ({dst_name}) :: IO (Either SomeException ()))\n"
+                "    putMVar doneB ())\n"
+                "  _ <- timeout (3 * 1000000) (takeMVar doneA)\n"
+                "  _ <- timeout (3 * 1000000) (takeMVar doneB)\n"
+                f"  finalVal <- {read_expr}\n"
+                "  putStrLn (\"FFL shared state final: \" ++ show finalVal)\n"
+            )
+        else:
+            base_imports += ["import Data.IORef", "import System.IO.Unsafe (unsafePerformIO)"]
+            info = self._STATE_KIND_INFO['ioref']
+            shared = f"fflBridge_{uid_a}_{uid_b}"
+            shared_decl = (
+                f"{{-# NOINLINE {shared} #-}}\n"
+                f"{shared} :: IORef Integer\n"
+                f"{shared} = {info['create']}\n"
+            )
+
+            nullary_src = meta_src.get('nullary_bindings', [])
+            if nullary_src and random.random() < 0.5:
+                write_val = f"toInteger (length (show ({random.choice(nullary_src)})))"
+            else:
+                write_val = self._harvest_int_literal(src_body)
+            write_src = info['write'](shared, write_val)
+            read_expr = info['read'](shared)
+
+            # The splice site is a *pure* expression position in dst_body,
+            # but readIORef is an IO action — force it out-of-line via
+            # unsafePerformIO so the substituted text still type-checks.
+            dst_body = self._splice_numeric_bridge(dst_body, f"unsafePerformIO ({read_expr})")
+            if src_first:
+                body_a, body_b = src_body, dst_body
+            else:
+                body_a, body_b = dst_body, src_body
+
+            main_body = (
+                "main :: IO ()\n"
+                "main = do\n"
+                f"  {write_src}\n"
+                f"  r1 <- (try ({src_name}) :: IO (Either SomeException ()))\n"
+                "  case r1 of\n"
+                "    Left e -> putStrLn (\"A: \" ++ show (e :: SomeException))\n"
+                "    Right _ -> return ()\n"
+                f"  r2 <- (try ({dst_name}) :: IO (Either SomeException ()))\n"
+                "  case r2 of\n"
+                "    Left e -> putStrLn (\"B: \" ++ show (e :: SomeException))\n"
+                "    Right _ -> return ()\n"
+                f"  finalVal <- {read_expr}\n"
+                "  putStrLn (\"FFL bridge final: \" ++ show finalVal)\n"
+            )
+
+        all_imports = sorted(set(base_imports) | set(seed_imports))
+
+        sections = ["module Main where"]
+        if pragmas:
+            # LANGUAGE pragmas must appear before the module header.
+            sections.insert(0, "\n".join(pragmas))
+        sections.append("\n".join(all_imports))
+        sections.append(shared_decl)
+        sections.append(f"-- === Seed A: {parent_a.id} ===\n{body_a}")
+        if entry_a:
+            sections.append(entry_a)
+        sections.append(f"-- === Seed B: {parent_b.id} ===\n{body_b}")
+        if entry_b:
+            sections.append(entry_b)
+        sections.append(main_body)
+
+        final_content = "\n\n".join(s for s in sections if s.strip())
+
+        return Seed(
+            content=final_content,
+            metadata={
+                "parents": [parent_a.id, parent_b.id],
+                "type": "haskell",
+                "mode": mode,
+                "description": f"Fused {parent_a.id} + {parent_b.id} ({mode})",
+            },
+        )
+
+    def fuse(self, parent_a: Seed, parent_b: Seed) -> Seed:
+        if self.state_fusion:
+            mode = random.choice(['state_ab', 'state_ba'])
+        else:
+            mode = random.choice(['df_ab', 'df_ba'])
+        return self._build_fused_test(parent_a, parent_b, mode)
+
+    def fuse_bidirectional(self, parent_a: Seed, parent_b: Seed) -> List[Seed]:
+        """Produce both A->B and B->A variants for the active fusion kind."""
+        if self.state_fusion:
+            return [
+                self._build_fused_test(parent_a, parent_b, 'state_ab'),
+                self._build_fused_test(parent_a, parent_b, 'state_ba'),
+            ]
+        return [
+            self._build_fused_test(parent_a, parent_b, 'df_ab'),
+            self._build_fused_test(parent_a, parent_b, 'df_ba'),
+        ]
+
+    def fuse_all(self, parent_a: Seed, parent_b: Seed) -> List[Seed]:
+        """Produce all four fusion variants (dataflow + state, both directions)."""
+        return [
+            self._build_fused_test(parent_a, parent_b, 'df_ab'),
+            self._build_fused_test(parent_a, parent_b, 'df_ba'),
+            self._build_fused_test(parent_a, parent_b, 'state_ab'),
+            self._build_fused_test(parent_a, parent_b, 'state_ba'),
+        ]
+
+
 class V8FusionStrategy(FusionStrategy):
     """
     V8 / JavaScript Fusion Strategy.
@@ -6116,12 +6491,22 @@ class FlangFusionStrategy(GenericDataflowStrategy):
 # Strategy Factory (Updated)
 # ==========================================
 
-def get_strategies(project_name=None, stmt_fusion=False, dataflow_fusion=False, all_fusion=False, struct_fusion=False):
+def get_strategies(project_name=None, stmt_fusion=False, dataflow_fusion=False, all_fusion=False,
+                    struct_fusion=False, state_fusion=False):
     # Default: if neither flag given, enable dataflow fusion only
-    if not stmt_fusion and not dataflow_fusion and not all_fusion:
+    if not stmt_fusion and not dataflow_fusion and not all_fusion and not state_fusion:
         dataflow_fusion = True
 
     strategies = []
+
+    if project_name == "haskell":
+        if os.path.exists("projects/haskell"):
+            s = HaskellFusionStrategy(project_root="projects/haskell")
+            s.dataflow_fusion = dataflow_fusion
+            s.state_fusion = state_fusion
+            s.all_fusion = all_fusion
+            strategies.append(s)
+        return strategies
 
     if project_name == "cangjie":
         if os.path.exists("projects/cangjie"):

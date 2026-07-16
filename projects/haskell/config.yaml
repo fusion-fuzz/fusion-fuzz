@@ -1,0 +1,47 @@
+project_name: "haskell"
+
+execution:
+  # The driver type-checks/compiles via `ghc -fno-code` — never links or
+  # runs the seed. See projects/haskell/driver.py.
+  command: "haskell driver handles execution — see projects/haskell/driver.py"
+  timeout: 12
+  concurrency: 12
+
+analysis:
+  crash_patterns:
+    - "panic!"
+    - "Please report"
+    - "GHC internal error"
+    - "internal error:"
+    - "RTS invariant"
+    - "internal inconsistency"
+    - "ASSERT failed"
+    - "Segmentation fault"
+    - "(core dumped)"
+    - "out of memory"
+    - "Uncaught exception"
+  # rc=1 is ghc's normal exit for an ordinary compile failure (type error,
+  # scope error, etc.) — an expected/invalid-seed outcome, not a compiler
+  # bug on its own. Nothing is ever executed, so this is the only non-zero
+  # outcome that isn't potentially a compiler crash.
+  error_return_codes: [1]
+  syntax_patterns:
+    - "parse error"
+    - "error:"
+    - "Variable not in scope"
+    - "Couldn't match expected type"
+    - "No instance for"
+    - "Ambiguous type variable"
+    - "Not in scope"
+
+paths:
+  seed_source: "projects/haskell/seeds"
+  seed_corpus: "projects/haskell/corpus.db"
+
+llm:
+  provider: "openai" # Options: gemini, openai, vllm, ollama
+  model: "gpt-5.4-mini"
+  api_key: "" # Defaults to LLM_API_KEY env var
+  # api_base: "" # Optional, for vllm/ollama
+  timeout: 30
+  # rate: 0.05 # Probability to use LLM generation in fuzz loop

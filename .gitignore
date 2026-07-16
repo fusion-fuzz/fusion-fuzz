@@ -50,6 +50,12 @@ projects/go/seeds/
 projects/lean/lean4/
 projects/lean/seeds/
 
+# Haskell Project
+projects/haskell/ghc-src/
+projects/haskell/rosetta-src/
+projects/haskell/exercism-src/
+projects/haskell/seeds/
+
 # MLIR Project
 projects/mlir/llvm-project/
 projects/mlir/llvm-mlir-build/

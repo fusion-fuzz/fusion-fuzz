@@ -369,6 +369,7 @@ class FusionFuzzLoop:
             ext = seed.metadata.get("extension") or ".c"
         elif "flang" in self.project_name:
             ext = seed.metadata.get("extension") or ".f90"
+        elif "haskell" in self.project_name: ext = ".hs"
 
         test_filename = f"test{ext}"
 

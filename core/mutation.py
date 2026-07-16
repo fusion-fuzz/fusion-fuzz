@@ -1203,6 +1203,113 @@ class LeanMutator(BaseMutator):
         return code
 
 
+class HaskellMutator(BaseMutator):
+    """
+    Haskell-Specific Mutator.
+    Targets: Int/Integer boundary values, arithmetic/list operators (including
+    Haskell-unique ++ and <>), strictness annotation injection (seq/$!/bang
+    patterns), and Bool literal flips.
+    Each rule fires with a low independent probability so multiple mutations
+    can stack in a single call, producing diverse GHC/RTS inputs.
+    Overrides the base string/assign-operator rules because Haskell uses
+    double-quoted String literals only (single quotes are Char literals,
+    which the base regex would corrupt) and has no compound-assignment
+    operators (+=, -=, ...).
+    """
+
+    HS_INTS = [
+        "0", "1", "-1", "2",
+        "127", "-128",                            # Int8 boundary
+        "32767", "-32768",                        # Int16 boundary
+        "2147483647", "-2147483648",              # Int32 boundary
+        "9223372036854775807", "-9223372036854775808",  # Int64 (maxBound/minBound :: Int)
+        "maxBound", "minBound",
+    ]
+
+    # Haskell arithmetic + list/semigroup operators. ++ (list append) and
+    # <> (mappend) are Haskell-unique and heavily exercised by fusion RULES
+    # pragmas (foldr/build) in the simplifier.
+    HS_ARITH_OPS = ["+", "-", "*", "++", "<>"]
+
+    # Matches ++, <>, or a standalone +/-/* — with lookaround guards so a
+    # bare '-' is never taken from inside '->' or '<-' (function arrows /
+    # do-bind arrows), which would otherwise corrupt syntax on nearly every
+    # Haskell file (both tokens are ubiquitous: type signatures, do-blocks).
+    _ARITH_TOKEN_RE = re.compile(r'\+\+|<>|(?<!<)-(?!>)|\+(?!\+)|\*')
+
+    def _mr_arith_operators(self, code):
+        """Mutate arithmetic/list operators, including ++ and <>."""
+        if random.random() > 0.002:
+            return code
+        matches = list(self._ARITH_TOKEN_RE.finditer(code))
+        if not matches:
+            return code
+        m = choice(matches)
+        victim = m.group(0)
+        pool = [op for op in self.HS_ARITH_OPS if op != victim]
+        start, end = m.span()
+        code = code[:start] + choice(pool) + code[end:]
+        return code
+
+    def _mr_assign_operators(self, code):
+        """Haskell has no compound-assignment operators — no-op."""
+        return code
+
+    def _mr_integer(self, code):
+        """Replace integer literals with Haskell-specific boundary values."""
+        if random.random() > 0.002:
+            return code
+        target_re = r'(?<![a-zA-Z0-9_.\'])(?:0x[0-9a-fA-F]+|[0-9]+)(?![a-zA-Z0-9_.\'])'
+        victims = re.findall(target_re, code)
+        if not victims:
+            return code
+        code = code.replace(choice(victims), choice(self.HS_INTS), 1)
+        return code
+
+    def _mr_string(self, code):
+        """Mutate only double-quoted String literals (single quotes are Char literals)."""
+        if random.random() > 0.01:
+            return code
+        replacements = ['""', '"\\NUL"', '"test\\0test"']
+        matches = re.findall(r'"(?:[^"\\]|\\.)*"', code)
+        if not matches:
+            return code
+        victim = choice(matches)
+        replace = choice(replacements)
+        code = code.replace(victim, replace, 1)
+        return code
+
+    def _mr_bool(self, code):
+        """Flip Bool literals: True <-> False."""
+        if random.random() > 0.005:
+            return code
+        if re.search(r'\bTrue\b', code):
+            code = re.sub(r'\bTrue\b', "False", code, count=1)
+        elif re.search(r'\bFalse\b', code):
+            code = re.sub(r'\bFalse\b', "True", code, count=1)
+        return code
+
+    def _mr_strictness(self, code):
+        """Inject a `seq`/`$!` strictness forcing point before a print/return call."""
+        if random.random() > 0.002:
+            return code
+        m = re.search(r'\b(print|return|pure)\s+(\([^()]*\)|[A-Za-z0-9_\']+)', code)
+        if not m:
+            return code
+        whole, fn, arg = m.group(0), m.group(1), m.group(2)
+        code = code.replace(whole, f"{fn} $! {arg}", 1)
+        return code
+
+    def mutate(self, code: str) -> str:
+        code = self._mr_arith_operators(code)
+        code = self._mr_assign_operators(code)
+        code = self._mr_integer(code)
+        code = self._mr_string(code)
+        code = self._mr_bool(code)
+        code = self._mr_strictness(code)
+        return code
+
+
 class JSMutator(BaseMutator):
     """
     JavaScript-Specific Mutator.

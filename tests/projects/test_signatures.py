@@ -254,5 +254,39 @@ class TestSwiftSignatures(unittest.TestCase):
         self.assertIsNone(sig)
 
 
+# ---------------------------------------------------------------------------
+# Haskell
+# ---------------------------------------------------------------------------
+
+class TestHaskellSignatures(unittest.TestCase):
+
+    @classmethod
+    def setUpClass(cls):
+        cls.driver = _load_driver("haskell", "HaskellDriver")
+
+    def test_ghc_panic(self):
+        stderr = "ghc: panic! (the 'impossible' happened)\n  (GHC version 9.14.1)\n  Simplifier ticks exhausted\n"
+        sig = self.driver.extract_crash_signature("", stderr, 1)
+        self.assertIn("ghc panic", sig)
+
+    def test_ghc_internal_error(self):
+        stderr = "GHC internal error: unexpected coercion\n"
+        sig = self.driver.extract_crash_signature("", stderr, 1)
+        self.assertIn("GHC internal error", sig)
+
+    def test_ghc_internal_error_lowercase(self):
+        stderr = "internal error: PAP object entered!\n"
+        sig = self.driver.extract_crash_signature("", stderr, 1)
+        self.assertIn("GHC internal error", sig)
+
+    def test_segfault(self):
+        sig = self.driver.extract_crash_signature("", "Segmentation fault", 139)
+        self.assertEqual(sig, "ghc: Segmentation fault")
+
+    def test_no_crash_returns_none(self):
+        sig = self.driver.extract_crash_signature("42\n", "", 0)
+        self.assertIsNone(sig)
+
+
 if __name__ == "__main__":
     unittest.main()
