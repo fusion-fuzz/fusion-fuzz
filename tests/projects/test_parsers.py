@@ -208,5 +208,88 @@ class TestMLIRParser(unittest.TestCase):
         self.assertEqual(meta["dialects"], [])
 
 
+# ---------------------------------------------------------------------------
+# Haskell
+# ---------------------------------------------------------------------------
+
+class TestHaskellParser(unittest.TestCase):
+
+    @classmethod
+    def setUpClass(cls):
+        from projects.haskell.parser import _parser
+        cls.parser = _parser
+
+    def test_imports(self):
+        code = "import Data.IORef\nimport qualified Data.Map as Map\n"
+        meta = self.parser.parse_content(code)
+        self.assertIn("import Data.IORef", meta["imports"])
+        self.assertIn("import qualified Data.Map as Map", meta["imports"])
+
+    def test_toplevel_names(self):
+        code = (
+            "double :: Int -> Int\n"
+            "double x = x * 2\n\n"
+            "data Tree = Leaf | Node Tree Int Tree\n\n"
+            "class Shape a where\n"
+            "  area :: a -> Double\n"
+        )
+        meta = self.parser.parse_content(code)
+        self.assertIn("double", meta["toplevel_names"])
+        self.assertIn("Tree", meta["toplevel_names"])
+        self.assertIn("Shape", meta["toplevel_names"])
+        self.assertNotIn("data", meta["toplevel_names"])
+
+    def test_nullary_bindings(self):
+        code = "greeting :: String\ngreeting = \"hello\"\n\ndouble x = x * 2\n"
+        meta = self.parser.parse_content(code)
+        self.assertIn("greeting", meta["nullary_bindings"])
+        self.assertNotIn("double", meta["nullary_bindings"])
+
+    def test_has_main(self):
+        code = "main :: IO ()\nmain = print 1\n"
+        meta = self.parser.parse_content(code)
+        self.assertTrue(meta["has_main"])
+
+    def test_no_main(self):
+        meta = self.parser.parse_content("x :: Int\nx = 1\n")
+        self.assertFalse(meta["has_main"])
+
+    def test_state_handles(self):
+        code = (
+            "main :: IO ()\n"
+            "main = do\n"
+            "  ref <- newIORef (0 :: Int)\n"
+            "  writeIORef ref 5\n"
+        )
+        meta = self.parser.parse_content(code)
+        names = [h["name"] for h in meta["state_handles"]]
+        self.assertIn("ref", names)
+        kinds = {h["name"]: h["kind"] for h in meta["state_handles"]}
+        self.assertEqual(kinds["ref"], "ioref")
+        self.assertIn("ref", meta["state_used"])
+
+    def test_string_and_char_literals_do_not_confuse_extraction(self):
+        code = (
+            "greeting :: String\n"
+            "greeting = \"data class where\"\n\n"
+            "sep :: Char\n"
+            "sep = '\\''\n\n"
+            "double x = x * 2\n"
+        )
+        meta = self.parser.parse_content(code)
+        self.assertIn("double", meta["toplevel_names"])
+        self.assertNotIn("data", meta["toplevel_names"])
+        self.assertNotIn("class", meta["toplevel_names"])
+        self.assertNotIn("where", meta["toplevel_names"])
+
+    def test_empty_file(self):
+        meta = self.parser.parse_content("")
+        self.assertEqual(meta["imports"], [])
+        self.assertEqual(meta["toplevel_names"], [])
+        self.assertEqual(meta["nullary_bindings"], [])
+        self.assertFalse(meta["has_main"])
+        self.assertEqual(meta["state_handles"], [])
+
+
 if __name__ == "__main__":
     unittest.main()

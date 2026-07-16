@@ -61,9 +61,6 @@ if __name__ == "__main__":
                         help="Build project with gcov (no sanitizers) for coverage measurement")
     parser.add_argument("--gcov", action="store_true", default=False,
                         help="After fuzzing, collect and print gcov line coverage information")
-    parser.add_argument("--statement-fusion", action="store_true", default=False,
-                        help="Enable statement fusion (dependency-graph interleave). "
-                             "Each fusion randomly picks A->B or B->A direction.")
     parser.add_argument("--dataflow-fusion", action="store_true", default=False,
                         help="Enable dataflow fusion (bridge variable linking). "
                              "Each fusion randomly picks A->B or B->A direction.")
@@ -75,6 +72,18 @@ if __name__ == "__main__":
                              "definitions from one seed inside a container (mod/fn body) found "
                              "in the other, plus supertrait injection, impl grafting, and "
                              "generic bound injection. Does not use statement/dataflow fusion.")
+    parser.add_argument("--state-fusion", action="store_true", default=False,
+                        help="Enable the alternate (non-dataflow) fusion mode, meaning differs "
+                             "by project. [php/clang/flang] Statement fusion: dependency-graph "
+                             "interleave of one seed's statements into the other. [haskell] "
+                             "Effectful state fusion: builds a harness where both seeds' entry "
+                             "actions would run concurrently via forkIO, racing on one shared "
+                             "top-level IORef/MVar/TVar cell. Note: the haskell driver is "
+                             "compile-only (ghc -fno-code, never links/runs), so this currently "
+                             "only exercises GHC's handling of concurrent-looking code, not "
+                             "actual runtime races. Each fusion randomly picks A->B or B->A "
+                             "direction. Without this flag, php/clang/flang/haskell all default "
+                             "to dataflow fusion (bridging a value through a shared variable/CAF).")
     parser.add_argument("--corpus-size", type=int, default=None, metavar="N",
                         help="Sample N seeds from the loaded corpus for fusion "
                              "instead of using all seed programs")
@@ -380,10 +389,11 @@ if __name__ == "__main__":
     fuzzer = FusionFuzzLoop(
         config=config,
         strategies=get_strategies(args.project,
-                                  stmt_fusion=args.statement_fusion,
+                                  stmt_fusion=args.state_fusion,
                                   dataflow_fusion=args.dataflow_fusion,
                                   all_fusion=args.all_fusion,
-                                  struct_fusion=args.struct_fusion),
+                                  struct_fusion=args.struct_fusion,
+                                  state_fusion=args.state_fusion),
         initial_corpus=_valid_corpus,
         all_fusion=args.all_fusion,
     )
