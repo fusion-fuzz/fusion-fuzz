@@ -141,6 +141,24 @@ class BaseMetadataCollector:
             except Exception as e:
                 logger.debug(f"[{self.language}] dynamic_collect error for {seed.id}: {e}")
 
+        # State-of-interest pre-analysis (state fusion design, core/
+        # state_analysis.py): computed once here during the one-time
+        # dry-run pass and cached in seed metadata, so state fusion never
+        # has to re-scan a seed at fusion time. Language is derived from
+        # the seed's own "type" metadata (falls back to this collector's
+        # language) via state_analysis.LANGUAGE_ALIASES; a no-op for
+        # languages without patterns defined yet.
+        try:
+            from .state_analysis import find_states_of_interest, LANGUAGE_ALIASES
+            seed_type = (seed.metadata or {}).get("type") or self.language
+            lang = LANGUAGE_ALIASES.get(str(seed_type).lower())
+            if lang:
+                points = find_states_of_interest(content, lang)
+                if points:
+                    meta["states_of_interest"] = [p.to_dict() for p in points]
+        except Exception as e:
+            logger.debug(f"[{self.language}] state-of-interest pre-analysis error for {seed.id}: {e}")
+
         meta["dryrun_done"] = True
         if result is not None:
             meta["rc"] = result.return_code

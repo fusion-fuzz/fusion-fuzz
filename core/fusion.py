@@ -9,7 +9,7 @@ import tokenize
 import keyword
 from dataclasses import dataclass, field
 from typing import List, Dict, Any, Tuple
-from .mutation import BaseMutator, PHPMutator, CPythonMutator, RustMutator, WGSLMutator, GoMutator, LeanMutator, JSMutator, CangjeMutator, HaskellMutator
+from .mutation import BaseMutator, PHPMutator, CPythonMutator, RustMutator, HaskellMutator
 
 @dataclass
 class Seed:
@@ -1074,14 +1074,188 @@ class PHPFusionStrategy(GenericDataflowStrategy):
             "description": f"Fused {parent_a.id} + {parent_b.id} ({mode})",
         })
 
-    def fuse_all(self, parent_a: Seed, parent_b: Seed) -> List[Seed]:
-        """Produce all four fusion variants for one pair."""
+
+class PHPStateFusionStrategy(PHPFusionStrategy):
+    """
+    State fusion for PHP (core/state_analysis.py): grafts one seed's
+    continuation into the other's state at a profiled *state of interest*
+    (resource release / type conversion / exception boundary) rather than
+    bridging a single value through --dataflow-fusion's shared variable,
+    or interleaving whole statements by dependency graph like PHP's
+    existing --state-fusion mode. Picks an intermediate program point in
+    each seed instead of only ever combining seeds at their final state,
+    per the design's "richer search space" argument for state fusion.
+    """
+
+    def _build_state_fused(self, host: Seed, donor: Seed, direction: str) -> Seed:
+        from .state_analysis import pick_state_point, graft_continuation, StatePoint
+
+        host_code = self.clean_php_header_tail(host.content)
+        donor_code = self.clean_php_header_tail(donor.content)
+        if self.mutation:
+            host_code = self.mut.mutate(host_code)
+            donor_code = self.mut.mutate(donor_code)
+        donor_code = self._resolve_name_conflicts(host_code, donor_code)
+
+        host_point = pick_state_point(host_code, "php", self.project_root,
+                                       cached=(host.metadata or {}).get("states_of_interest"))
+        donor_point = pick_state_point(donor_code, "php", self.project_root,
+                                        cached=(donor.metadata or {}).get("states_of_interest"))
+        if host_point is None:
+            lines = host_code.splitlines()
+            host_point = StatePoint(max(len(lines) - 1, 0), "fallback", "", "")
+
+        fused_body = graft_continuation(host_code, donor_code, host_point, donor_point)
+        php_body = f"try {{\n{fused_body}\n}} catch (\\Throwable $_ffl_e) {{}}\n"
+        fused_file = f"\n--FILE--\n<?php\n{php_body}"
+        desc = f"--TEST--\nState-fused {host.id} <- {donor.id} ({direction}, {host_point.category})\n"
+        expect = "\n--EXPECT--\nthis is a flowfusion test\n"
+        fused_test = re.sub("\n+", "\n", f"{desc}{fused_file}{expect}")
+        fused_test = self.adhoc_syntax_patch(fused_test)
+
+        return Seed(content=fused_test, metadata={
+            "parents": [host.id, donor.id],
+            "type": "phpt",
+            "mode": f"state_{host_point.category}_{direction}",
+            "description": f"State-fused {host.id} <- {donor.id} ({direction})",
+        })
+
+    def fuse(self, parent_a: Seed, parent_b: Seed) -> Seed:
+        return self._build_state_fused(parent_a, parent_b, "ab")
+
+    def fuse_bidirectional(self, parent_a: Seed, parent_b: Seed) -> List[Seed]:
         return [
-            self._build_fused_test(parent_a, parent_b, 'stmt_ab'),
-            self._build_fused_test(parent_a, parent_b, 'stmt_ba'),
-            self._build_fused_test(parent_a, parent_b, 'df_ab'),
-            self._build_fused_test(parent_a, parent_b, 'df_ba'),
+            self._build_state_fused(parent_a, parent_b, "ab"),
+            self._build_state_fused(parent_b, parent_a, "ba"),
         ]
+
+
+class PHPDeclarationFusionStrategy(PHPFusionStrategy):
+    """
+    Declaration fusion for PHP: makes an extensible declaration expression
+    in one seed refer to a declaration in the other, rather than bridging
+    a runtime value. Two primitives:
+
+    - base_ref: inject a donor class/interface name into a host class's
+      `implements` list (or interface's `extends` list, which is the only
+      form PHP allows for interface-to-interface inheritance).
+    - trait_use: insert a `use DonorName;` as the first statement in a
+      host class/trait body.
+
+    Both can produce a "fatal error" purely from the class declaration
+    executing (unresolvable interface, `use` on a non-trait, incompatible
+    method signatures) — no call into the class is needed, matching the
+    paper's declare/compile-time trigger for declaration fusion. The
+    donor's declaration is placed first so it's defined by the time the
+    host's class statement executes (PHP resolves `implements`/`extends`
+    when the class declaration runs, same top-to-bottom order as any
+    other statement).
+    """
+
+    _PHP_CLASS_HEADER_RE = re.compile(
+        r'\b(?P<kind>class|interface|trait)\s+(?P<name>[A-Za-z_]\w*)'
+        r'(?P<extends>\s+extends\s+[A-Za-z_][\w\\,\s]*?)?'
+        r'(?P<implements>\s+implements\s+[A-Za-z_][\w\\,\s]*?)?'
+        r'\s*\{'
+    )
+
+    @staticmethod
+    def _matching_brace(text: str, mask: List[bool], open_pos: int):
+        depth = 0
+        for i in range(open_pos, len(text)):
+            if i >= len(mask) or not mask[i]:
+                continue
+            if text[i] == '{':
+                depth += 1
+            elif text[i] == '}':
+                depth -= 1
+                if depth == 0:
+                    return i
+        return None
+
+    def _inject_base_ref(self, code: str, donor_name: str):
+        matches = list(self._PHP_CLASS_HEADER_RE.finditer(code))
+        if not matches:
+            return code, False
+        m = random.choice(matches)
+        brace_pos = m.end() - 1
+        kind = m.group('kind')
+        if kind == 'trait':
+            return code, False  # traits can't extend/implement
+        group = 'extends' if kind == 'interface' else 'implements'
+        keyword = 'extends' if kind == 'interface' else 'implements'
+        if m.group(group):
+            new_code = code[:brace_pos].rstrip() + f", {donor_name} " + code[brace_pos:]
+        else:
+            new_code = code[:brace_pos].rstrip() + f" {keyword} {donor_name} " + code[brace_pos:]
+        return new_code, True
+
+    def _inject_trait_use(self, code: str, donor_name: str):
+        from .state_analysis import _lexical_mask
+        mask = _lexical_mask(code, 'php')
+        matches = [m for m in self._PHP_CLASS_HEADER_RE.finditer(code) if m.group('kind') in ('class', 'trait')]
+        if not matches:
+            return code, False
+        m = random.choice(matches)
+        brace_pos = m.end() - 1
+        close = self._matching_brace(code, mask, brace_pos)
+        if close is None:
+            return code, False
+        insert_at = brace_pos + 1
+        new_code = code[:insert_at] + f"\n    use {donor_name};\n" + code[insert_at:]
+        return new_code, True
+
+    def _build_declaration_fused_test(self, host: Seed, donor: Seed, direction: str) -> Seed:
+        host_code = self.clean_php_header_tail(host.content)
+        donor_code = self.clean_php_header_tail(donor.content)
+        if self.mutation:
+            host_code = self.mut.mutate(host_code)
+            donor_code = self.mut.mutate(donor_code)
+        donor_code = self._resolve_name_conflicts(host_code, donor_code)
+
+        donor_names = [m.group('name') for m in self._PHP_CLASS_HEADER_RE.finditer(donor_code)]
+        fused_host = host_code
+        technique = 'none'
+        if donor_names:
+            donor_name = random.choice(donor_names)
+            for candidate in random.sample(['base_ref', 'trait_use'], k=2):
+                if candidate == 'base_ref':
+                    fused_host, applied = self._inject_base_ref(host_code, donor_name)
+                else:
+                    fused_host, applied = self._inject_trait_use(host_code, donor_name)
+                if applied:
+                    technique = candidate
+                    break
+            else:
+                fused_host = host_code
+
+        # Donor declarations first: PHP resolves extends/implements/use
+        # when the class statement executes, top-to-bottom like any other
+        # statement, so the referenced declaration must run first.
+        inner = f"{donor_code}\n{fused_host}\n"
+        php_body = f"try {{\n{inner}\n}} catch (\\Throwable $_ffl_e) {{}}\n"
+        fused_file = f"\n--FILE--\n<?php\n{php_body}"
+        desc = f"--TEST--\nDeclaration-fused {host.id} <- {donor.id} ({direction}, {technique})\n"
+        expect = "\n--EXPECT--\nthis is a flowfusion test\n"
+        fused_test = re.sub("\n+", "\n", f"{desc}{fused_file}{expect}")
+        fused_test = self.adhoc_syntax_patch(fused_test)
+
+        return Seed(content=fused_test, metadata={
+            "parents": [host.id, donor.id],
+            "type": "phpt",
+            "mode": f"decl_{technique}_{direction}",
+            "description": f"Declaration-fused {host.id} <- {donor.id} ({direction})",
+        })
+
+    def fuse(self, parent_a: Seed, parent_b: Seed) -> Seed:
+        return self._build_declaration_fused_test(parent_a, parent_b, "ab")
+
+    def fuse_bidirectional(self, parent_a: Seed, parent_b: Seed) -> List[Seed]:
+        return [
+            self._build_declaration_fused_test(parent_a, parent_b, "ab"),
+            self._build_declaration_fused_test(parent_b, parent_a, "ba"),
+        ]
+
 
 # ==========================================
 # CPython Specific Fusion Strategy
@@ -1796,6 +1970,170 @@ except Exception as _e:
             }
         )
 
+
+class CPythonStateFusionStrategy(CPythonFusionStrategy):
+    """
+    State fusion for CPython (core/state_analysis.py): grafts one seed's
+    continuation into the other's state at a profiled state of interest
+    (a `.close()`/`del`/context-manager exit, a type-coercion call, an
+    `except`/`finally` boundary) instead of CPythonFusionStrategy's
+    single-bridge-variable substitution. Complements it rather than
+    replacing it — this class is opted into separately.
+    """
+
+    def fuse(self, parent_a: Seed, parent_b: Seed) -> Seed:
+        return self._build_state_fused(parent_a, parent_b, "ab")
+
+    def fuse_bidirectional(self, parent_a: Seed, parent_b: Seed) -> List[Seed]:
+        return [
+            self._build_state_fused(parent_a, parent_b, "ab"),
+            self._build_state_fused(parent_b, parent_a, "ba"),
+        ]
+
+    def _build_state_fused(self, host: Seed, donor: Seed, direction: str) -> Seed:
+        from .state_analysis import pick_state_point, graft_continuation, StatePoint
+
+        host_src = host.content
+        donor_src = donor.content
+        if self.mutation:
+            host_src = self.mut.mutate(host_src)
+            donor_src = self.mut.mutate(donor_src)
+
+        host_body, host_imports = self._extract_imports_and_body(host_src)
+        donor_body, donor_imports = self._extract_imports_and_body(donor_src)
+        all_imports = sorted(set(host_imports) | set(donor_imports))
+
+        host_point = pick_state_point(host_body, "cpython", self.project_root,
+                                       cached=(host.metadata or {}).get("states_of_interest"))
+        donor_point = pick_state_point(donor_body, "cpython", self.project_root,
+                                        cached=(donor.metadata or {}).get("states_of_interest"))
+        if host_point is None:
+            lines = host_body.splitlines()
+            host_point = StatePoint(max(len(lines) - 1, 0), "fallback", "", "")
+
+        fused_body = graft_continuation(host_body, donor_body, host_point, donor_point)
+        final_content = "\n".join(all_imports) + "\n" + fused_body
+
+        return Seed(
+            content=final_content,
+            metadata={
+                "parents": [host.id, donor.id],
+                "type": "python",
+                "mode": f"state_{host_point.category}_{direction}",
+                "description": f"State-fused {host.id} <- {donor.id} ({direction})",
+            }
+        )
+
+
+class CPythonDeclarationFusionStrategy(CPythonFusionStrategy):
+    """
+    Declaration fusion for CPython: injects a donor-declared class as an
+    additional base class in a host class's base-class list. CPython has
+    no separate compile-time type check, but a `class` *statement*'s base
+    tuple is still resolved the moment that statement executes — MRO
+    (C3 linearization) computation, metaclass selection/conflict
+    detection, and `__init_subclass__`/`__set_name__` hooks all run then,
+    purely from the class being declared, before any method is ever
+    called. That's the CPython analogue of the paper's declare/compile-
+    time-only trigger.
+    """
+
+    _PY_CLASS_HEADER_RE = re.compile(
+        r'^(?P<indent>[ \t]*)class\s+(?P<name>[A-Za-z_]\w*)\s*'
+        r'(?:\((?P<bases>[^)]*)\))?'
+        r'\s*:',
+        re.MULTILINE,
+    )
+
+    @staticmethod
+    def _insert_positional_base(bases_str: str, donor_name: str) -> str:
+        """Insert `donor_name` as a new positional base. A base list can
+        contain keyword args (`metaclass=Meta`) or `**kwargs`, and Python
+        requires every positional argument to precede those — appending
+        blindly at the end is a syntax error whenever the class already
+        has one of those forms, so this inserts before the first keyword-
+        like part instead of after the last part."""
+        depth = 0
+        parts, cur = [], ''
+        for ch in bases_str:
+            if ch in '([{':
+                depth += 1
+            elif ch in ')]}':
+                depth = max(0, depth - 1)
+            if ch == ',' and depth == 0:
+                parts.append(cur)
+                cur = ''
+            else:
+                cur += ch
+        parts.append(cur)
+
+        kw_idx = None
+        for i, p in enumerate(parts):
+            stripped = p.strip()
+            if stripped.startswith('**') or re.match(r'^[A-Za-z_]\w*\s*=(?!=)', stripped):
+                kw_idx = i
+                break
+        if kw_idx is None:
+            parts.append(f' {donor_name}')
+        else:
+            parts.insert(kw_idx, f' {donor_name}')
+        return ','.join(parts)
+
+    def _inject_base_class(self, code: str, donor_name: str):
+        # Restrict to top-level (indent=='') class headers — a nested
+        # donor/host class would need dotted qualification to reference,
+        # which this lightweight regex-based approach doesn't track.
+        matches = [m for m in self._PY_CLASS_HEADER_RE.finditer(code) if m.group('indent') == '']
+        if not matches:
+            return code, False
+        m = random.choice(matches)
+        if m.group('bases') is not None:
+            new_bases = self._insert_positional_base(m.group('bases'), donor_name)
+            new_code = code[:m.start('bases')] + new_bases + code[m.end('bases'):]
+        else:
+            colon_pos = m.end() - 1
+            new_code = code[:colon_pos] + f"({donor_name})" + code[colon_pos:]
+        return new_code, True
+
+    def _build_declaration_fused_test(self, host: Seed, donor: Seed, direction: str) -> Seed:
+        host_src, donor_src = host.content, donor.content
+        if self.mutation:
+            host_src = self.mut.mutate(host_src)
+            donor_src = self.mut.mutate(donor_src)
+
+        host_body, host_imports = self._extract_imports_and_body(host_src)
+        donor_body, donor_imports = self._extract_imports_and_body(donor_src)
+        all_imports = sorted(set(host_imports) | set(donor_imports))
+
+        donor_names = [m.group('name') for m in self._PY_CLASS_HEADER_RE.finditer(donor_body)
+                        if m.group('indent') == '']
+        fused_host, applied = host_body, False
+        if donor_names:
+            donor_name = random.choice(donor_names)
+            fused_host, applied = self._inject_base_class(host_body, donor_name)
+
+        # Donor first: a class statement's base tuple is evaluated the
+        # instant that statement executes, so the referenced donor class
+        # must already be defined, same top-to-bottom rule as any name.
+        final_content = "\n".join(all_imports) + "\n" + donor_body + "\n" + fused_host
+
+        return Seed(content=final_content, metadata={
+            "parents": [host.id, donor.id],
+            "type": "python",
+            "mode": f"decl_{'base_class' if applied else 'none'}_{direction}",
+            "description": f"Declaration-fused {host.id} <- {donor.id} ({direction})",
+        })
+
+    def fuse(self, parent_a: Seed, parent_b: Seed) -> Seed:
+        return self._build_declaration_fused_test(parent_a, parent_b, "ab")
+
+    def fuse_bidirectional(self, parent_a: Seed, parent_b: Seed) -> List[Seed]:
+        return [
+            self._build_declaration_fused_test(parent_a, parent_b, "ab"),
+            self._build_declaration_fused_test(parent_b, parent_a, "ba"),
+        ]
+
+
 # ==========================================
 # Swift Specific Fusion Strategy
 # ==========================================
@@ -2275,6 +2613,124 @@ do {{
             }
         )
 
+
+class SwiftStateFusionStrategy(SwiftFusionStrategy):
+    """
+    State fusion for Swift (core/state_analysis.py): grafts one seed's
+    continuation into the other's state at a profiled state of interest
+    (`deinit`/`.close()`, an `as`/`as!`/`as?` cast, a `do`/`catch`
+    boundary) instead of SwiftFusionStrategy's single-literal bridge +
+    phase-directed bug primitive. Complements it rather than replacing it.
+    """
+
+    def _build_state_fused(self, host: Seed, donor: Seed, direction: str) -> Seed:
+        from .state_analysis import pick_state_point, graft_continuation, StatePoint, truncate_to_balanced
+
+        host_src, donor_src = host.content, donor.content
+
+        host_body, host_imports = self._split_imports_and_body(host_src)
+        donor_body, donor_imports = self._split_imports_and_body(donor_src)
+        all_imports = sorted(set(host_imports) | set(donor_imports))
+
+        host_point = pick_state_point(host_body, "swift", self.project_root,
+                                       cached=(host.metadata or {}).get("states_of_interest"))
+        donor_point = pick_state_point(donor_body, "swift", self.project_root,
+                                        cached=(donor.metadata or {}).get("states_of_interest"))
+        if host_point is None:
+            lines = host_body.splitlines()
+            host_point = StatePoint(max(len(lines) - 1, 0), "fallback", "", "")
+
+        donor_lines = donor_body.splitlines()
+        start_idx = (donor_point.line_idx + 1) if donor_point else 0
+        end_idx = truncate_to_balanced(donor_body, start_idx, "swift")
+        truncated_donor = "\n".join(donor_lines[:end_idx])
+
+        fused_body = graft_continuation(host_body, truncated_donor, host_point, donor_point)
+        final_content = "\n".join(all_imports) + "\n" + fused_body
+
+        return Seed(
+            content=final_content,
+            metadata={
+                "parents": [host.id, donor.id],
+                "type": "swift",
+                "mode": f"state_{host_point.category}_{direction}",
+                "description": f"State-fused {host.id} <- {donor.id} ({direction})",
+            }
+        )
+
+    def fuse(self, parent_a: Seed, parent_b: Seed) -> Seed:
+        return self._build_state_fused(parent_a, parent_b, "ab")
+
+    def fuse_bidirectional(self, parent_a: Seed, parent_b: Seed) -> List[Seed]:
+        return [
+            self._build_state_fused(parent_a, parent_b, "ab"),
+            self._build_state_fused(parent_b, parent_a, "ba"),
+        ]
+
+
+class SwiftDeclarationFusionStrategy(SwiftFusionStrategy):
+    """
+    Declaration fusion for Swift: injects a donor-declared type/protocol
+    into a host type's inheritance/conformance clause
+    (`class Foo: Bar, DonorProto { ... }`). Swift resolves top-level
+    declarations across the whole file in a first pass before checking
+    bodies, so declaration order doesn't matter the way it does in
+    PHP/Python — but a class/struct/enum claiming to conform to a
+    protocol it doesn't fully implement, or a class trying to inherit
+    from a struct/enum/protocol (only classes support superclass
+    inheritance), is a pure declare/typecheck-time error, no call needed.
+    """
+
+    _SWIFT_TYPE_HEADER_RE = re.compile(
+        r'\b(?P<kind>class|struct|enum|protocol)\s+(?P<name>[A-Za-z_]\w*)'
+        r'(?:\s*<[^>]*>)?'
+        r'(?P<conforms>\s*:\s*[^{]+)?'
+        r'\s*\{'
+    )
+
+    def _inject_conformance(self, code: str, donor_name: str):
+        matches = list(self._SWIFT_TYPE_HEADER_RE.finditer(code))
+        if not matches:
+            return code, False
+        m = random.choice(matches)
+        brace_pos = m.end() - 1
+        if m.group('conforms'):
+            new_code = code[:brace_pos].rstrip() + f", {donor_name} " + code[brace_pos:]
+        else:
+            new_code = code[:brace_pos].rstrip() + f": {donor_name} " + code[brace_pos:]
+        return new_code, True
+
+    def _build_declaration_fused_test(self, host: Seed, donor: Seed, direction: str) -> Seed:
+        host_src, donor_src = host.content, donor.content
+        host_body, host_imports = self._split_imports_and_body(host_src)
+        donor_body, donor_imports = self._split_imports_and_body(donor_src)
+        all_imports = sorted(set(host_imports) | set(donor_imports))
+
+        donor_names = [m.group('name') for m in self._SWIFT_TYPE_HEADER_RE.finditer(donor_body)]
+        fused_host, applied = host_body, False
+        if donor_names:
+            donor_name = random.choice(donor_names)
+            fused_host, applied = self._inject_conformance(host_body, donor_name)
+
+        final_content = "\n".join(all_imports) + "\n\n" + donor_body + "\n" + fused_host
+
+        return Seed(content=final_content, metadata={
+            "parents": [host.id, donor.id],
+            "type": "swift",
+            "mode": f"decl_{'conformance' if applied else 'none'}_{direction}",
+            "description": f"Declaration-fused {host.id} <- {donor.id} ({direction})",
+        })
+
+    def fuse(self, parent_a: Seed, parent_b: Seed) -> Seed:
+        return self._build_declaration_fused_test(parent_a, parent_b, "ab")
+
+    def fuse_bidirectional(self, parent_a: Seed, parent_b: Seed) -> List[Seed]:
+        return [
+            self._build_declaration_fused_test(parent_a, parent_b, "ab"),
+            self._build_declaration_fused_test(parent_b, parent_a, "ba"),
+        ]
+
+
 # ==========================================
 # MLIR Specific Fusion Strategy
 # ==========================================
@@ -2693,384 +3149,187 @@ class MLIRFusionStrategy(FusionStrategy):
         )
 
 
-# ==========================================
-# Go Specific Fusion Strategy
-# ==========================================
-
-class GoFusionStrategy(FusionStrategy):
+class MLIRStateFusionStrategy(MLIRFusionStrategy):
     """
-    Go-Specific Fusion Strategy.
-    1. Strips package declarations and hoists merged imports.
-    2. Renames 'func main()' in each parent to a unique name.
-    3. Creates a new 'func main()' that calls both renamed mains.
-    4. Appends phase-directed bug primitives targeting the Go compiler.
+    State fusion for MLIR (core/state_analysis.py). Unlike
+    MLIRFusionStrategy's default mode — which emits seed A and seed B as
+    two independent `--split-input-file` sections plus a separate bridge
+    module, so each half stands alone — this strategy actually grafts
+    donor ops into the host's op stream at a profiled state-of-interest
+    point (right after a `memref.dealloc`, a cast op, or a `cf.assert`),
+    inside one shared `module { }`, so the verifier has to resolve the
+    donor's ops (SSA operands, types) in the host's context rather than
+    in isolation. "state of interest" is an approximation for a
+    declarative IR (see core/state_analysis.py's mlir entry) — this is
+    the closest analogue to the paper's runtime-state grafting available
+    without an execution model.
     """
 
-    # Go keywords — never treat as variable names
-    _GO_KW = frozenset({
-        'break', 'case', 'chan', 'const', 'continue', 'default', 'defer',
-        'else', 'fallthrough', 'for', 'func', 'go', 'goto', 'if', 'import',
-        'interface', 'map', 'package', 'range', 'return', 'select', 'struct',
-        'switch', 'type', 'var',
-        # predeclared identifiers
-        'nil', 'true', 'false', 'iota', 'any', 'comparable',
-        'int', 'int8', 'int16', 'int32', 'int64',
-        'uint', 'uint8', 'uint16', 'uint32', 'uint64', 'uintptr',
-        'float32', 'float64', 'complex64', 'complex128',
-        'bool', 'byte', 'rune', 'string', 'error',
-        'append', 'cap', 'close', 'complex', 'copy', 'delete',
-        'imag', 'len', 'make', 'new', 'panic', 'print', 'println',
-        'real', 'recover',
-    })
+    # MLIR blocks require exactly one terminator op, and it must be the
+    # last op in the block — unlike brace balance, this isn't something
+    # truncate_to_balanced's generic paren/brace counting can know about,
+    # so a donor continuation must also be cut before its own terminator
+    # to avoid producing a block with a terminator followed by more ops
+    # (or two terminators) once grafted into the host's block.
+    _MLIR_TERMINATOR_RE = re.compile(r'^\s*(?:func\.return|return|cf\.br|cf\.cond_br|scf\.yield)\b')
 
-    def __init__(self, project_root="projects/go"):
-        self.project_root = project_root
-        self.mut = GoMutator()
+    @classmethod
+    def _truncate_before_terminator(cls, lines: List[str], start_idx: int, end_idx: int) -> int:
+        for i in range(start_idx, end_idx):
+            if cls._MLIR_TERMINATOR_RE.match(lines[i]):
+                return i
+        return end_idx
 
-    def _process_seed(self, code, uid):
-        """
-        - Strips //go:build and // +build constraints.
-        - Strips the package declaration.
-        - Extracts all import paths (block and single form).
-        - Renames 'func main()' to 'ffl_main_<uid>'.
-        Returns (imports: set[str], body: str, new_main_name: str|None)
-        """
-        # Strip build directives
-        code = re.sub(r'//go:build[^\n]*\n', '', code)
-        code = re.sub(r'// \+build[^\n]*\n', '', code)
+    def _build_state_fused(self, host: Seed, donor: Seed, direction: str) -> Seed:
+        from .state_analysis import pick_state_point, graft_continuation, StatePoint, truncate_to_balanced
 
-        # Strip package declaration
-        code = re.sub(r'^\s*package\s+\w+[ \t]*\n?', '', code, count=1, flags=re.MULTILINE)
+        host_src = mlir_strip_directives(host.content)
+        donor_src = mlir_strip_directives(donor.content)
+        host_src = _MLIR_BARE_FUNC_RE.sub('func.func @', host_src)
+        donor_src = _MLIR_BARE_FUNC_RE.sub('func.func @', donor_src)
 
-        # Extract block imports: import ( "a"\n "b" )
-        imports: set = set()
-        block_re = re.compile(r'import\s*\(([^)]*)\)', re.S)
-        for m in block_re.finditer(code):
-            for path in re.findall(r'(?:[A-Za-z_]\w*\s+|_\s+)?"([^"]+)"', m.group(1)):
-                imports.add(path)
-        code = block_re.sub('', code)
+        host_ren = mlir_rename_symbols(host_src, f"H_{host.id}_")
+        donor_ren = mlir_rename_symbols(donor_src, f"D_{donor.id}_")
 
-        # Extract single imports: import "pkg" or import alias "pkg"
-        single_re = re.compile(r'import\s+(?:[A-Za-z_]\w*\s+|_\s+)?"([^"]+)"')
-        for m in single_re.finditer(code):
-            imports.add(m.group(1))
-        code = single_re.sub('', code)
+        host_body = mlir_strip_outer_module(host_ren).strip()
+        donor_body = mlir_strip_outer_module(donor_ren).strip()
+        host_body = re.sub(r'^\s*//\s*-{3,}.*$', '', host_body, flags=re.MULTILINE).strip()
+        donor_body = re.sub(r'^\s*//\s*-{3,}.*$', '', donor_body, flags=re.MULTILINE).strip()
 
-        # Rename func main() -> ffl_main_<uid>
-        uid_safe = re.sub(r'[^a-zA-Z0-9]', '_', uid)
-        new_main = None
-        main_re = r'(func\s+)main(\s*\(\s*\))'
-        if re.search(main_re, code):
-            new_main = f"ffl_main_{uid_safe}"
-            code = re.sub(main_re, rf'\1{new_main}\2', code, count=1)
+        if not self._is_plausible_mlir(host_body) or not self._is_plausible_mlir(donor_body):
+            # Not plausibly MLIR (e.g. LLM-authored pseudo-code seed) —
+            # emit the host alone rather than grafting unparseable text.
+            return Seed(content=f"module {{\n{host_body}\n}}\n", metadata={
+                "parents": [host.id, donor.id], "type": "mlir",
+                "mode": f"state_fallback_{direction}",
+                "description": f"State-fused (fallback, non-plausible donor) {host.id} <- {donor.id}",
+            })
 
-        return imports, code.strip(), new_main
+        host_point = pick_state_point(host_body, "mlir", self.project_root,
+                                       cached=(host.metadata or {}).get("states_of_interest"))
+        donor_point = pick_state_point(donor_body, "mlir", self.project_root,
+                                        cached=(donor.metadata or {}).get("states_of_interest"))
+        if host_point is None:
+            lines = host_body.splitlines()
+            host_point = StatePoint(max(len(lines) - 1, 0), "fallback", "", "")
 
-    # Top-level declaration keywords whose names can collide
-    _TOPLEVEL_RE = re.compile(
-        r'^(?:func|type|var|const)\s+([A-Za-z_]\w*)',
-        re.MULTILINE
-    )
+        donor_lines = donor_body.splitlines()
+        start_idx = (donor_point.line_idx + 1) if donor_point else 0
+        end_idx = truncate_to_balanced(donor_body, start_idx, "mlir")
+        end_idx = self._truncate_before_terminator(donor_lines, start_idx, end_idx)
+        truncated_donor = "\n".join(donor_lines[:end_idx])
 
-    def _rename_collisions(self, body_a: str, body_b: str, uid_b: str) -> str:
-        """
-        Find top-level identifiers (func/type/var/const) declared in both
-        body_a and body_b, and rename the colliding ones in body_b by
-        appending a uid suffix — prevents 'X redeclared in this block' errors.
-        """
-        names_a = {m.group(1) for m in self._TOPLEVEL_RE.finditer(body_a)}
-        names_b = [m.group(1) for m in self._TOPLEVEL_RE.finditer(body_b)]
-        collisions = {n for n in names_b if n in names_a} - self._GO_KW
-        if not collisions:
-            return body_b
-        uid_safe = re.sub(r'[^a-zA-Z0-9]', '_', uid_b)
-        # Rename longest names first to avoid partial matches
-        for name in sorted(collisions, key=len, reverse=True):
-            new_name = f"{name}_b{uid_safe}"
-            body_b = re.sub(r'\b' + re.escape(name) + r'\b', new_name, body_b)
-        return body_b
+        fused_body = graft_continuation(host_body, truncated_donor, host_point, donor_point)
+        final_code = f"module {{\n{fused_body}\n}}\n"
 
-    def _bug_primitives(self):
-        """
-        Phase-directed bug primitives for the Go compiler.
-        Each primitive targets a distinct compiler phase.
-        All types/functions are prefixed _ffl_ to avoid clashing with seed code.
-        """
-
-        # P1: Escape analysis — stack vs heap allocation decisions
-        p1 = '''
-// P1: Escape analysis & heap allocation
-type _ffl_p1Node struct{ val int; next *_ffl_p1Node }
-
-func _ffl_p1() {
-\tn := &_ffl_p1Node{val: 42}
-\tn.next = &_ffl_p1Node{val: n.val + 1}
-\t// Closure capturing n forces it to escape to heap
-\tfn := func() *_ffl_p1Node { return n }
-\t_ = fn()
-\t// Slice: compiler decides stack vs heap based on size
-\ts := make([]int, 1<<4)
-\tfor i := range s { s[i] = i * i }
-\t_ = s
-}'''
-
-        # P2: Inliner budget — mix of inlineable and non-inlineable calls
-        p2 = '''
-// P2: Inliner budget stress
-//go:noinline
-func _ffl_p2Heavy(x int) int {
-\tsum := 0
-\tfor i := 0; i < x; i++ { sum += i * i }
-\treturn sum
-}
-
-func _ffl_p2Trivial(x int) int { return x ^ (x >> 1) }
-
-func _ffl_p2Chain(a, b int) int {
-\treturn _ffl_p2Trivial(_ffl_p2Trivial(a) + _ffl_p2Trivial(b))
-}
-
-func _ffl_p2() {
-\t_ = _ffl_p2Heavy(10)
-\t_ = _ffl_p2Chain(3, 7)
-\t// Indirect call via function variable — devirtualization opportunity
-\tvar fn func(int) int = _ffl_p2Trivial
-\t_ = fn(99)
-}'''
-
-        # P3: Interface dispatch, itab caching, and type assertion
-        p3 = '''
-// P3: Interface dispatch & type assertion stress
-type _ffl_p3Iface interface {
-\tVal() int
-\tTag() string
-}
-type _ffl_p3A struct{ v int }
-func (a _ffl_p3A) Val() int    { return a.v }
-func (a _ffl_p3A) Tag() string { return "A" }
-type _ffl_p3B struct{ v int }
-func (b _ffl_p3B) Val() int    { return b.v * 2 }
-func (b _ffl_p3B) Tag() string { return "B" }
-
-func _ffl_p3() {
-\tvals := []_ffl_p3Iface{_ffl_p3A{1}, _ffl_p3B{2}, _ffl_p3A{3}, _ffl_p3B{4}}
-\tfor _, v := range vals {
-\t\t_ = v.Val()
-\t\t_ = v.Tag()
-\t\t// Type switch: stresses type assertion & itab lookup
-\t\tswitch x := v.(type) {
-\t\tcase _ffl_p3A:
-\t\t\t_ = x.v
-\t\tcase _ffl_p3B:
-\t\t\t_ = x.v
-\t\t}
-\t}
-\t// Empty interface boxing/unboxing
-\tvar ei interface{} = _ffl_p3A{42}
-\tif a, ok := ei.(_ffl_p3A); ok { _ = a }
-}'''
-
-        # P4: Stack growth, defer ordering, and panic/recover
-        p4 = '''
-// P4: Stack growth, defer ordering & panic/recover
-func _ffl_p4Recurse(n int) int {
-\tif n <= 0 { return 0 }
-\tdefer func() { recover() }()
-\treturn n + _ffl_p4Recurse(n-1)
-}
-
-func _ffl_p4() {
-\t_ = _ffl_p4Recurse(64)
-\t// Defer ordering under panic+recover: defers run LIFO
-\tfunc() {
-\t\tdefer func() { recover() }()
-\t\tfor i := 0; i < 4; i++ {
-\t\t\ti := i // capture loop variable
-\t\t\tdefer func() { _ = i }()
-\t\t}
-\t\tpanic("ffl: recover test")
-\t}()
-}'''
-
-        # P5: Bounds check elimination (BCE) & range loop optimizations
-        p5 = '''
-// P5: Bounds check elimination & range loop optimization
-func _ffl_p5() {
-\ts := []int{10, 20, 30, 40, 50}
-\tn := len(s)
-\t// BCE: compiler proves i < n, eliminates runtime bounds check
-\tfor i := 0; i < n; i++ { _ = s[i] }
-\tsum := 0
-\tfor _, v := range s { sum += v }
-\t_ = sum
-\t// 2D slice: nested BCE
-\tmatrix := [][]int{{1, 2}, {3, 4}, {5, 6}}
-\tfor i := range matrix {
-\t\tfor j := range matrix[i] { _ = matrix[i][j] }
-\t}
-}'''
-
-        # P6: Constant folding, overflow, and dead code elimination
-        p6 = '''
-// P6: Constant folding, integer overflow & DCE
-const (
-\t_ffl_p6C1 int64  = 1<<63 - 1  // max int64
-\t_ffl_p6C2 int64  = -1 << 63   // min int64
-\t_ffl_p6C3 uint64 = 1<<64 - 1  // max uint64
-)
-
-func _ffl_p6() {
-\t_ = _ffl_p6C1 + _ffl_p6C2    // intentional signed overflow
-\t_ = _ffl_p6C1 ^ _ffl_p6C2    // XOR of boundary constants
-\t_ = _ffl_p6C3 >> 1            // large constant right-shift
-\tconst f = 1.0 / 3.0           // irrational constant folding
-\t_ = f * 3.0
-\t// Dead code: compiler should eliminate unreachable branch via DCE
-\tif false { panic("ffl: DCE unreachable") }
-\tconst alwaysTrue = (1 == 1)
-\tif !alwaysTrue { panic("ffl: const-false branch") }
-}'''
-
-        # P7: Generics monomorphization (Go 1.18+)
-        p7 = '''
-// P7: Generics monomorphization stress (Go 1.18+)
-func _ffl_p7Min[T interface{ ~int | ~int64 | ~float64 }](a, b T) T {
-\tif a < b { return a }
-\treturn b
-}
-
-func _ffl_p7Map[T, U any](s []T, f func(T) U) []U {
-\tout := make([]U, len(s))
-\tfor i, v := range s { out[i] = f(v) }
-\treturn out
-}
-
-type _ffl_p7Stack[T any] struct{ items []T }
-func (st *_ffl_p7Stack[T]) Push(v T)       { st.items = append(st.items, v) }
-func (st *_ffl_p7Stack[T]) Pop() (T, bool) {
-\tvar zero T
-\tif len(st.items) == 0 { return zero, false }
-\tv := st.items[len(st.items)-1]
-\tst.items = st.items[:len(st.items)-1]
-\treturn v, true
-}
-
-func _ffl_p7() {
-\t// Multiple concrete instantiations — stresses monomorphization
-\t_ = _ffl_p7Min(3, 7)
-\t_ = _ffl_p7Min(3.14, 2.72)
-\t_ = _ffl_p7Map([]int{1, 2, 3}, func(x int) string { return fmt.Sprint(x) })
-\tvar st _ffl_p7Stack[int]
-\tst.Push(1); st.Push(2); st.Push(3)
-\tfor { if _, ok := st.Pop(); !ok { break } }
-}'''
-
-        # P8: Goroutine, channel, and select scheduling
-        p8 = '''
-// P8: Goroutine, channel & select stress
-func _ffl_p8() {
-\ttype _key struct{ a, b int }
-\tm := map[_key]string{_key{1, 2}: "ab", _key{3, 4}: "cd"}
-\tfor k, v := range m { _ = k; _ = v }
-\t// Buffered channel: goroutine send + main recv
-\tch := make(chan int, 1)
-\tgo func() { ch <- 42 }()
-\t_ = <-ch
-\t// Select with default: non-blocking probe
-\tselect {
-\tcase v := <-ch:
-\t\t_ = v
-\tdefault:
-\t}
-}'''
-
-        # P9: reflect & unsafe interaction with the runtime
-        p9 = '''
-// P9: reflect & interface representation stress
-import "reflect"
-
-func _ffl_p9() {
-\tvals := []interface{}{42, "hello", 3.14, true, []int{1, 2, 3}, map[string]int{"a": 1}}
-\tfor _, v := range vals {
-\t\trv := reflect.ValueOf(v)
-\t\t_ = rv.Kind()
-\t\t_ = rv.Type()
-\t\t// Stringer probe: if the type implements Stringer, call it
-\t\tif s, ok := v.(interface{ String() string }); ok { _ = s.String() }
-\t}
-\t// Struct field iteration via reflection
-\ttype _ffl_s struct { X int; Y string }
-\trv := reflect.ValueOf(_ffl_s{X: 1, Y: "ffl"})
-\tfor i := 0; i < rv.NumField(); i++ {
-\t\t_ = rv.Field(i)
-\t\t_ = rv.Type().Field(i).Name
-\t}
-}'''
-
-        # p9 uses a bare 'import "reflect"' at function scope (invalid Go);
-        # omit until reflect is added to the merged import block.
-        safe_phases = [p1, p2, p3, p4, p5, p6, p7, p8]
-        # selected = random.sample(safe_phases, k=random.choice([2, 3]))
-        return random.choice(safe_phases)
-        # return "\n".join(selected)
+        return Seed(content=final_code, metadata={
+            "parents": [host.id, donor.id],
+            "type": "mlir",
+            "mode": f"state_{host_point.category}_{direction}",
+            "description": f"State-fused {host.id} <- {donor.id} ({direction})",
+        })
 
     def fuse(self, parent_a: Seed, parent_b: Seed) -> Seed:
-        code_a = parent_a.content
-        code_b = parent_b.content
+        return self._build_state_fused(parent_a, parent_b, "ab")
 
-        if self.mut:
-            code_a = self.mut.mutate(code_a)
-            code_b = self.mut.mutate(code_b)
-
-        imports_a, body_a, main_a = self._process_seed(code_a, parent_a.id)
-        imports_b, body_b, main_b = self._process_seed(code_b, parent_b.id)
-
-        # Rename top-level declarations in B that collide with A
-        body_b = self._rename_collisions(body_a, body_b, parent_b.id)
-
-        # Merge imports; always include "fmt" (used in main and p7)
-        all_imports = sorted((imports_a | imports_b) | {"fmt"})
-        import_block = "import (\n" + "".join(f'\t"{p}"\n' for p in all_imports) + ")"
-
-        # New main: call both renamed mains + use fmt to satisfy import checker
-        main_lines = ["func main() {"]
-        if main_a:
-            main_lines.append(f"\t{main_a}()")
-        if main_b:
-            main_lines.append(f"\t{main_b}()")
-        main_lines.append('\tfmt.Println("FFL Fusion Done")')
-        main_lines.append("}")
-        new_main = "\n".join(main_lines)
-
-        bug_prims = self._bug_primitives()
-
-        parts = [
-            "package main",
-            "",
-            import_block,
-            "",
-            f"// === Seed A: {parent_a.id} ===",
-            body_a,
-            "",
-            f"// === Seed B: {parent_b.id} ===",
-            body_b,
-            "",
-            "// === FFL Bug Primitives ===",
-            bug_prims,
-            "",
-            "// === FFL Fused Main ===",
-            new_main,
+    def fuse_bidirectional(self, parent_a: Seed, parent_b: Seed) -> List[Seed]:
+        return [
+            self._build_state_fused(parent_a, parent_b, "ab"),
+            self._build_state_fused(parent_b, parent_a, "ba"),
         ]
-        final_content = "\n".join(parts)
 
-        return Seed(
-            content=final_content,
-            metadata={
-                "parents": [parent_a.id, parent_b.id],
-                "type": "go",
-                "description": f"Fused {parent_a.id} + {parent_b.id}"
-            }
-        )
+
+class MLIRDeclarationFusionStrategy(MLIRFusionStrategy):
+    """
+    Declaration fusion for MLIR — the paper's "operand type constraints"
+    instance. Swaps one declared type in a host `func.func` signature
+    (an argument type or the result type) for a type token taken from a
+    donor signature, while leaving the host's body untouched. The body
+    still produces/consumes the *original* type, so the signature no
+    longer matches what the body actually does — a pure declaration-level
+    mismatch the verifier catches at parse/verify time, requiring no
+    execution (MLIR is never executed by this fuzzer at all, only
+    verified/compiled, so the whole domain leans declaration-fusion — see
+    class docstring on MLIRStateFusionStrategy for the state-fusion
+    counterpart, which grafts ops instead of swapping a type).
+    """
+
+    _MLIR_TYPE_TOKEN_RE = re.compile(
+        r'\bi\d+\b|\bf(?:16|32|64|80|128)\b|\bindex\b'
+        r'|\bmemref<[^>]*>|\btensor<[^>]*>|\bvector<[^>]*>'
+    )
+    _MLIR_FUNC_SIG_RE = re.compile(
+        r'func\.func\s+@(?P<name>[A-Za-z_][\w.$-]*)\s*\((?P<args>[^)]*)\)'
+        r'\s*(?:->\s*(?P<ret>[^\{]+?))?\s*\{'
+    )
+
+    def _donor_type_tokens(self, body: str):
+        tokens = set()
+        for m in self._MLIR_FUNC_SIG_RE.finditer(body):
+            seg = (m.group('args') or '') + ' ' + (m.group('ret') or '')
+            tokens.update(self._MLIR_TYPE_TOKEN_RE.findall(seg))
+        return sorted(tokens)
+
+    def _inject_type_swap(self, body: str, donor_type: str):
+        matches = list(self._MLIR_FUNC_SIG_RE.finditer(body))
+        if not matches:
+            return body, False
+        m = random.choice(matches)
+        seg_start, seg_end = m.start(), m.end()
+        segment = body[seg_start:seg_end]
+        type_matches = list(self._MLIR_TYPE_TOKEN_RE.finditer(segment))
+        if not type_matches:
+            return body, False
+        tm = random.choice(type_matches)
+        new_segment = segment[:tm.start()] + donor_type + segment[tm.end():]
+        new_body = body[:seg_start] + new_segment + body[seg_end:]
+        return new_body, True
+
+    def _build_declaration_fused_test(self, host: Seed, donor: Seed, direction: str) -> Seed:
+        host_src = mlir_strip_directives(host.content)
+        donor_src = mlir_strip_directives(donor.content)
+        host_src = _MLIR_BARE_FUNC_RE.sub('func.func @', host_src)
+        donor_src = _MLIR_BARE_FUNC_RE.sub('func.func @', donor_src)
+        host_ren = mlir_rename_symbols(host_src, f"H_{host.id}_")
+        donor_ren = mlir_rename_symbols(donor_src, f"D_{donor.id}_")
+        host_body = mlir_strip_outer_module(host_ren).strip()
+        donor_body = mlir_strip_outer_module(donor_ren).strip()
+        host_body = re.sub(r'^\s*//\s*-{3,}.*$', '', host_body, flags=re.MULTILINE).strip()
+        donor_body = re.sub(r'^\s*//\s*-{3,}.*$', '', donor_body, flags=re.MULTILINE).strip()
+
+        if not self._is_plausible_mlir(host_body) or not self._is_plausible_mlir(donor_body):
+            return Seed(content=f"module {{\n{host_body}\n}}\n", metadata={
+                "parents": [host.id, donor.id], "type": "mlir",
+                "mode": f"decl_fallback_{direction}",
+                "description": f"Declaration-fused (fallback, non-plausible donor) {host.id} <- {donor.id}",
+            })
+
+        donor_types = self._donor_type_tokens(donor_body)
+        fused_host, applied = host_body, False
+        if donor_types:
+            donor_type = random.choice(donor_types)
+            fused_host, applied = self._inject_type_swap(host_body, donor_type)
+
+        # Donor kept in the same module (not grafted into host — the
+        # swap above is the whole point) so it's still a self-consistent
+        # section the verifier can check independently.
+        final_code = f"module {{\n{fused_host}\n\n{donor_body}\n}}\n"
+
+        return Seed(content=final_code, metadata={
+            "parents": [host.id, donor.id],
+            "type": "mlir",
+            "mode": f"decl_{'type_swap' if applied else 'none'}_{direction}",
+            "description": f"Declaration-fused {host.id} <- {donor.id} ({direction})",
+        })
+
+    def fuse(self, parent_a: Seed, parent_b: Seed) -> Seed:
+        return self._build_declaration_fused_test(parent_a, parent_b, "ab")
+
+    def fuse_bidirectional(self, parent_a: Seed, parent_b: Seed) -> List[Seed]:
+        return [
+            self._build_declaration_fused_test(parent_a, parent_b, "ab"),
+            self._build_declaration_fused_test(parent_b, parent_a, "ba"),
+        ]
 
 
 class RustLexMixin:
@@ -4028,473 +4287,19 @@ class RustStructFusionStrategy(RustLexMixin, FusionStrategy):
         )
 
 
-# ==========================================
-# Strategy Factory (Updated)
-# ==========================================
-
-# ==========================================
-# WGSL Specific Helpers
-# ==========================================
-
-WGSL_FN_DEF = re.compile(
-    r'((?:@\w+(?:\([^)]*\))?\s*)*)'   # attributes like @vertex, @compute @workgroup_size(N)
-    r'fn\s+([A-Za-z_]\w*)\s*\(',      # fn name(
-    re.S
-)
-
-WGSL_STRUCT_DEF = re.compile(r'struct\s+([A-Za-z_]\w*)\s*\{', re.S)
-
-WGSL_CONST_DEF = re.compile(
-    r'(const\s+)([A-Za-z_]\w*)\s*:\s*([^=;]+?)\s*=\s*([^;]+);',
-    re.S
-)
-
-def wgsl_extract_functions(src):
-    """Extract function names and their full text blocks from WGSL source."""
-    funcs = []
-    matches = list(WGSL_FN_DEF.finditer(src))
-    for i, m in enumerate(matches):
-        name = m.group(2)
-        start = m.start()
-        # Find the matching closing brace
-        brace_start = src.find('{', m.end())
-        if brace_start == -1:
-            continue
-        depth = 0
-        end = brace_start
-        for j in range(brace_start, len(src)):
-            if src[j] == '{':
-                depth += 1
-            elif src[j] == '}':
-                depth -= 1
-                if depth == 0:
-                    end = j + 1
-                    break
-        funcs.append({"name": name, "start": start, "end": end, "text": src[start:end]})
-    return funcs
-
-def wgsl_extract_globals(src, func_spans):
-    """Extract top-level declarations that are NOT inside functions."""
-    covered = set()
-    for f in func_spans:
-        for i in range(f["start"], f["end"]):
-            covered.add(i)
-
-    global_lines = []
-    pos = 0
-    for line in src.splitlines(keepends=True):
-        line_start = pos
-        pos += len(line)
-        if line_start not in covered:
-            global_lines.append(line)
-
-    return "".join(global_lines)
-
-def wgsl_rename_functions(src, suffix):
-    """Rename all user-defined functions by appending suffix."""
-    funcs = wgsl_extract_functions(src)
-    func_names = [f["name"] for f in funcs]
-
-    result = src
-    for name in sorted(func_names, key=len, reverse=True):
-        new_name = f"{name}_{suffix}"
-        result = re.sub(r'\b' + re.escape(name) + r'\b', new_name, result)
-
-    return result, func_names
-
-def wgsl_extract_consts(src):
-    """Extract const declarations with name, type, and value."""
-    consts = []
-    for m in WGSL_CONST_DEF.finditer(src):
-        consts.append({
-            "name": m.group(2),
-            "type": m.group(3).strip(),
-            "value": m.group(4).strip(),
-            "span": m.span(),
-            "line": m.group(0)
-        })
-    return consts
-
-
-class WGSLFusionStrategy(FusionStrategy):
-    """
-    WGSL-Specific Fusion Strategy for naga.
-    1. Extracts globals (struct, const, var) and functions from both parents.
-    2. Renames functions to avoid collision.
-    3. Cross-pollinates constants between parents.
-    4. Concatenates into a single WGSL module.
-    5. Applies WGSL-specific mutations.
-    """
-    def __init__(self, project_root="projects/naga"):
-        self.project_root = project_root
-        self.mut = WGSLMutator()
-
-    def fuse(self, parent_a: Seed, parent_b: Seed) -> Seed:
-        code_a = parent_a.content
-        code_b = parent_b.content
-
-        # 1. Apply mutations
-        code_a = self.mut.mutate(code_a)
-        code_b = self.mut.mutate(code_b)
-
-        # 2. Rename functions in both parents
-        a_suffix = parent_a.id.replace("-", "")[:6]
-        b_suffix = parent_b.id.replace("-", "")[:6]
-        code_a, fns_a = wgsl_rename_functions(code_a, "a" + a_suffix)
-        code_b, fns_b = wgsl_rename_functions(code_b, "b" + b_suffix)
-
-        # 3. Extract functions and globals
-        funcs_a = wgsl_extract_functions(code_a)
-        funcs_b = wgsl_extract_functions(code_b)
-        globals_a = wgsl_extract_globals(code_a, funcs_a)
-        globals_b = wgsl_extract_globals(code_b, funcs_b)
-
-        # 4. Rename structs in B to avoid collision with A
-        structs_a = set(m.group(1) for m in WGSL_STRUCT_DEF.finditer(globals_a))
-        structs_b = set(m.group(1) for m in WGSL_STRUCT_DEF.finditer(globals_b))
-        colliding = structs_a & structs_b
-        for sname in sorted(colliding, key=len, reverse=True):
-            new_name = sname + "_b" + b_suffix
-            globals_b = re.sub(r'\b' + re.escape(sname) + r'\b', new_name, globals_b)
-            for idx, f in enumerate(funcs_b):
-                funcs_b[idx]["text"] = re.sub(r'\b' + re.escape(sname) + r'\b', new_name, f["text"])
-
-        # 4b. Rename var/let/override declarations in B that collide with A
-        # Pattern: optional @group/@binding attributes before var<...> name
-        WGSL_VAR_DECL = re.compile(
-            r'(?:@\w+(?:\([^)]*\))?\s*)*'   # optional attributes
-            r'\bvar(?:<[^>]*>)?\s+'          # var<...>
-            r'([A-Za-z_]\w*)\s*:',           # name :
-            re.S
-        )
-        vars_a = set(m.group(1) for m in WGSL_VAR_DECL.finditer(globals_a))
-        vars_b = set(m.group(1) for m in WGSL_VAR_DECL.finditer(globals_b))
-        colliding_vars = vars_a & vars_b
-        for vname in sorted(colliding_vars, key=len, reverse=True):
-            new_name = vname + "_b" + b_suffix
-            globals_b = re.sub(r'\b' + re.escape(vname) + r'\b', new_name, globals_b)
-            for idx, f in enumerate(funcs_b):
-                funcs_b[idx]["text"] = re.sub(r'\b' + re.escape(vname) + r'\b', new_name, f["text"])
-
-        # 4c. Deduplicate @group/@binding pairs: if B has the same (group, binding) as A, bump B's binding
-        WGSL_BINDING = re.compile(r'@group\s*\((\d+)\)\s*@binding\s*\((\d+)\)')
-        bindings_a = set((m.group(1), m.group(2)) for m in WGSL_BINDING.finditer(globals_a))
-
-        def bump_binding(m):
-            g, b = m.group(1), m.group(2)
-            if (g, b) in bindings_a:
-                return f"@group({g}) @binding({int(b) + 100})"
-            return m.group(0)
-
-        globals_b = WGSL_BINDING.sub(bump_binding, globals_b)
-
-        # 4d. Handle WGSL module-level directives from B.
-        # - `diagnostic`: remove from B (A's version is used; duplicates illegal)
-        # - `requires`: remove from B (same reason)
-        # - `enable`: keep unique ones from B (different extensions may be needed)
-        WGSL_DIAG_REQ = re.compile(
-            r'^\s*(?:diagnostic\s*\([^)]*\)|requires\s+[^;]+)\s*;\s*\n?',
-            re.MULTILINE
-        )
-        WGSL_ENABLE = re.compile(
-            r'^\s*(enable\s+[^;]+;)\s*\n?',
-            re.MULTILINE
-        )
-        # Collect enable directives already in A
-        enables_a = set(m.group(1).strip() for m in WGSL_ENABLE.finditer(globals_a))
-        # Collect enable directives unique to B (need to be hoisted to module top)
-        enables_b_unique = [
-            m.group(1).strip() for m in WGSL_ENABLE.finditer(globals_b)
-            if m.group(1).strip() not in enables_a
-        ]
-        # Remove diagnostic/requires from B — replace with newline to avoid text merging
-        globals_b = WGSL_DIAG_REQ.sub("\n", globals_b)
-        # Remove all enable from B (unique ones will be hoisted in assembly step)
-        globals_b = WGSL_ENABLE.sub("", globals_b)
-
-        # 5. Build bridge: pick a const from A and inject into B
-        consts_a = wgsl_extract_consts(globals_a)
-        bridge_code = ""
-        if consts_a:
-            picked = random.choice(consts_a)
-            bridge_name = "ffl_bridge_" + str(random.randrange(10**6))
-            bridge_code = "const " + bridge_name + ": " + picked["type"] + " = " + picked["value"] + ";\n"
-
-        # 6. Assemble
-        # WGSL requires: enable/diagnostic/requires MUST come before any declarations.
-        # Order: comment → B's unique enables (hoisted) → globals_a → globals_b → bridge → functions
-        parts = []
-        parts.append("// FFL Fused: " + parent_a.id + " + " + parent_b.id)
-        parts.append("")
-        # Hoist B's unique enable directives to top (before any declarations)
-        if enables_b_unique:
-            parts.append("// === Extra Enables (from B) ===")
-            parts.append("\n".join(enables_b_unique))
-            parts.append("")
-        parts.append("// === Globals A ===")
-        parts.append(globals_a.strip())
-        parts.append("")
-        parts.append("// === Globals B ===")
-        parts.append(globals_b.strip())
-        parts.append("")
-        if bridge_code:
-            parts.append("// === Bridge ===")
-            parts.append(bridge_code)
-        parts.append("// === Functions A ===")
-        for f in funcs_a:
-            parts.append(f["text"])
-            parts.append("")
-        parts.append("// === Functions B ===")
-        for f in funcs_b:
-            parts.append(f["text"])
-            parts.append("")
-
-        final_content = "\n".join(parts)
-
-        return Seed(
-            content=final_content,
-            metadata={
-                "parents": [parent_a.id, parent_b.id],
-                "type": "wgsl",
-                "description": "Fused " + parent_a.id + " + " + parent_b.id
-            }
-        )
-
-
-class LeanFusionStrategy(FusionStrategy):
-    """
-    Lean 4 Specific Fusion Strategy.
-    1. Extracts and deduplicates 'import' statements from both parents.
-    2. Renames top-level declarations in B that collide with A (appends uid suffix).
-    3. Concatenates both bodies under section comments.
-    4. Injects phase-directed bug primitives targeting the Lean 4 elaborator:
-       universe polymorphism, type class synthesis, inductive types, tactics,
-       dependent types, mutual recursion, monad do-notation, and #eval stress.
-    """
-
-    # Built-in names never renamed during collision resolution
-    _LEAN_KW = frozenset({
-        'def', 'theorem', 'lemma', 'structure', 'class', 'instance',
-        'inductive', 'abbrev', 'noncomputable', 'private', 'protected',
-        'namespace', 'section', 'end', 'open', 'variable', 'universe',
-        'import', 'export', 'macro', 'elab', 'syntax', 'notation',
-        'if', 'then', 'else', 'match', 'with', 'fun', 'let', 'in',
-        'have', 'show', 'from', 'by', 'do', 'return', 'pure', 'bind',
-        'where', 'deriving', 'extends', 'mut', 'for',
-        'Nat', 'Int', 'Float', 'Bool', 'String', 'List', 'Array',
-        'Option', 'Result', 'IO', 'Prop', 'Type', 'Sort', 'True', 'False',
-        'And', 'Or', 'Not', 'Iff', 'Eq', 'Ne', 'HEq',
-        'true', 'false', 'none', 'some', 'rfl',
-        'id', 'Function', 'Fin', 'Char', 'UInt8', 'UInt16', 'UInt32', 'UInt64',
-    })
-
-    # Matches top-level named declarations
-    _TOPLEVEL_RE = re.compile(
-        r'^[ \t]*(?:(?:private|protected|noncomputable|partial)\s+)*'
-        r'(?:def|theorem|lemma|structure|class|inductive|abbrev|instance)\s+'
-        r'([A-Za-z_]\w*)',
-        re.MULTILINE,
-    )
-
-    def __init__(self, project_root="projects/lean"):
-        self.project_root = project_root
-        self.mut = LeanMutator()
-
-    def _process_seed(self, code: str):
-        """
-        Split a Lean 4 file into (imports: set[str], body: str).
-
-        All 'import <Module.Path>' lines are extracted regardless of their
-        position in the file (lean4 test files sometimes place them mid-file
-        as negative test cases, and Lean requires imports to be first).
-        Trailing/leading blank lines are stripped from the returned body.
-        """
-        imports: set = set()
-        body_lines = []
-        for line in code.splitlines():
-            # Match all Lean 4 import variants:
-            #   import Foo.Bar
-            #   public import Foo.Bar   (re-export, package builds only)
-            #   meta import Foo.Bar     (meta-level import, package builds only)
-            # 'public'/'meta' modifiers are stripped — standalone lean files
-            # don't support package-level import modifiers.
-            m = re.match(r'^\s*(?:public\s+|meta\s+)?import\s+([\w][\w.]*)\s*$', line)
-            if m:
-                imports.add(m.group(1))
-            else:
-                body_lines.append(line)
-        return imports, "\n".join(body_lines).strip()
-
-    def _rename_collisions(self, body_a: str, body_b: str, uid_b: str) -> str:
-        """
-        Find top-level identifiers declared in both body_a and body_b,
-        and rename the colliding ones in body_b by appending a uid suffix.
-        Prevents 'already declared' elaboration errors.
-        """
-        names_a = {m.group(1) for m in self._TOPLEVEL_RE.finditer(body_a)}
-        collisions = (
-            {m.group(1) for m in self._TOPLEVEL_RE.finditer(body_b)}
-            & names_a
-            - self._LEAN_KW
-        )
-        if not collisions:
-            return body_b
-        uid_safe = re.sub(r'[^a-zA-Z0-9]', '_', uid_b)
-        for name in sorted(collisions, key=len, reverse=True):
-            body_b = re.sub(r'\b' + re.escape(name) + r'\b', f"{name}_b{uid_safe}", body_b)
-        return body_b
-
-    def _bug_primitives(self) -> str:
-        """
-        Phase-directed bug primitives targeting distinct Lean 4 elaboration phases.
-        All names are prefixed _ffl_ to avoid clashing with seed declarations.
-        """
-        # P1: Universe polymorphism — stresses universe unification and level inference
-        p1 = '''\
--- P1: Universe polymorphism
-universe _ffl_u _ffl_v
-def _ffl_p1Id.{_ffl_u} {α : Sort _ffl_u} (a : α) : α := a
-def _ffl_p1Comp.{_ffl_u _ffl_v _ffl_w}
-    {α : Sort _ffl_u} {β : Sort _ffl_v} {γ : Sort _ffl_w}
-    (f : β → γ) (g : α → β) : α → γ := fun a => f (g a)
-theorem _ffl_p1IdIdem.{_ffl_u} {α : Sort _ffl_u} (a : α) :
-    _ffl_p1Id (_ffl_p1Id a) = a := rfl'''
-
-        # P2: Type class synthesis — stresses instance search and unification
-        p2 = '''\
--- P2: Type class synthesis
-class _ffl_p2Combine (α : Type*) where
-  empty  : α
-  merge  : α → α → α
-instance : _ffl_p2Combine Nat  where empty := 0; merge a b := a + b
-instance : _ffl_p2Combine Int  where empty := 0; merge a b := a + b
-instance : _ffl_p2Combine Bool where empty := false; merge a b := a || b
-def _ffl_p2Use [_ffl_p2Combine α] (x y : α) : α := _ffl_p2Combine.merge x y
-#eval _ffl_p2Use (3 : Nat) 5'''
-
-        # P3: Inductive types with structural recursion — stresses WF checker + pattern match
-        p3 = '''\
--- P3: Inductive types & structural recursion
-inductive _ffl_p3Tree (α : Type*) where
-  | leaf : _ffl_p3Tree α
-  | node : _ffl_p3Tree α → α → _ffl_p3Tree α → _ffl_p3Tree α
-def _ffl_p3Size {α : Type*} : _ffl_p3Tree α → Nat
-  | .leaf       => 0
-  | .node l _ r => 1 + _ffl_p3Size l + _ffl_p3Size r
-def _ffl_p3Mirror {α : Type*} : _ffl_p3Tree α → _ffl_p3Tree α
-  | .leaf       => .leaf
-  | .node l v r => .node (_ffl_p3Mirror r) v (_ffl_p3Mirror l)
-theorem _ffl_p3MirrorSize {α : Type*} (t : _ffl_p3Tree α) :
-    _ffl_p3Size (_ffl_p3Mirror t) = _ffl_p3Size t := by
-  induction t with
-  | leaf => rfl
-  | node l v r ihl ihr =>
-      simp [_ffl_p3Size, _ffl_p3Mirror, ihl, ihr, Nat.add_comm]'''
-
-        # P4: Tactic elaboration — stresses omega, ring, decide, simp, cases
-        p4 = '''\
--- P4: Tactic elaboration
-theorem _ffl_p4NatAdd (n : Nat) : n + 0 = n          := by omega
-theorem _ffl_p4IntComm (n m : Int) : n + m = m + n   := by ring
-theorem _ffl_p4BoolAnd (b : Bool) : (b && true) = b  := by cases b <;> rfl
-theorem _ffl_p4Decide  : (2 : Nat) + 2 = 4           := by decide
-theorem _ffl_p4NatMul  (n : Nat) : n * 0 = 0         := by omega'''
-
-        # P5: Dependent types with Fin / Subtype — stresses definitional equality
-        p5 = '''\
--- P5: Dependent types (Fin, Subtype)
-def _ffl_p5Head {n : Nat} (f : Fin (n + 1) → Nat) : Nat :=
-  f ⟨0, Nat.zero_lt_succ n⟩
-def _ffl_p5Sum (n : Nat) (f : Fin n → Nat) : Nat :=
-  (List.finRange n).foldl (fun acc i => acc + f i) 0
-theorem _ffl_p5FinVal {n : Nat} (h : n < 10) :
-    (⟨n, h⟩ : Fin 10).val = n := rfl'''
-
-        # P6: Mutual recursion — stresses the mutual block elaborator
-        p6 = '''\
--- P6: Mutual structural recursion
-mutual
-  def _ffl_p6Even : Nat → Bool
-    | 0     => true
-    | n + 1 => _ffl_p6Odd n
-  def _ffl_p6Odd : Nat → Bool
-    | 0     => false
-    | n + 1 => _ffl_p6Even n
-end
-theorem _ffl_p6EvenZero : _ffl_p6Even 0 = true  := rfl
-theorem _ffl_p6OddZero  : _ffl_p6Odd  0 = false := rfl'''
-
-        # P7: Monad / do-notation — stresses bind/pure desugaring and type inference
-        p7 = '''\
--- P7: Monad / do-notation
-def _ffl_p7SafeDiv (a b : Int) : Option Int :=
-  if b = 0 then none else some (a / b)
-def _ffl_p7Chain (x y z : Int) : Option Int := do
-  let a ← _ffl_p7SafeDiv x y
-  let b ← _ffl_p7SafeDiv a z
-  pure (b + 1)
-#eval _ffl_p7Chain 100 5 2    -- some 11
-#eval _ffl_p7Chain 100 0 2    -- none'''
-
-        # P8: #eval computation — stresses kernel reduction and IO monad
-        p8 = '''\
--- P8: #eval computation stress
-#eval (List.range 16).map (· * ·)
-#eval (List.range 10).foldl (· + ·) 0
-#eval "FFL".toList.map Char.toNat
-#eval Nat.gcd 1071 462'''
-
-        safe_phases = [p1, p2, p3, p4, p5, p6, p7, p8]
-        selected = random.sample(safe_phases, k=random.choice([2, 3]))
-        return "\n\n".join(selected)
-
-    def fuse(self, parent_a: Seed, parent_b: Seed) -> Seed:
-        code_a = parent_a.content
-        code_b = parent_b.content
-
-        if self.mut:
-            code_a = self.mut.mutate(code_a)
-            code_b = self.mut.mutate(code_b)
-
-        imports_a, body_a = self._process_seed(code_a)
-        imports_b, body_b = self._process_seed(code_b)
-
-        # Rename colliding top-level names in B
-        body_b = self._rename_collisions(body_a, body_b, parent_b.id)
-
-        # Merge imports (dedup, sorted).
-        # Lean 4 requires ALL import lines to appear before any other content.
-        all_imports = sorted(imports_a | imports_b)
-        import_block = "\n".join(f"import {i}" for i in all_imports)
-
-        bug_prims = self._bug_primitives()
-
-        # Build sections; skip empty import block so we don't emit a blank
-        # first line (lean parser is sensitive to leading whitespace/newlines).
-        sections = []
-        if import_block:
-            sections.append(import_block)
-        sections.append(f"-- === Seed A: {parent_a.id} ===\n{body_a}")
-        sections.append(f"-- === Seed B: {parent_b.id} ===\n{body_b}")
-        sections.append(f"-- === FFL Bug Primitives ===\n{bug_prims}")
-        final_content = "\n\n".join(sections)
-
-        return Seed(
-            content=final_content,
-            metadata={
-                "parents": [parent_a.id, parent_b.id],
-                "type": "lean",
-                "description": f"Fused {parent_a.id} + {parent_b.id}",
-            },
-        )
-
-
 class HaskellFusionStrategy(FusionStrategy):
     """
     Haskell-Specific Fusion Strategy.
 
-    Supports two fusion modes, selected via `self.dataflow_fusion` /
-    `self.state_fusion` (mirroring PHP's stmt_fusion/dataflow_fusion split):
+    `self.dataflow_fusion` is the only mode `fuse()`/`fuse_bidirectional()`
+    pick (dataflow fusion, below). A second, concurrent-racing mode
+    ('state_ab'/'state_ba') is also implemented in `_build_fused_test()`
+    but has no caller anymore — kept for reference/reuse, not currently
+    wired to any CLI flag or entry point. See HaskellStateFusionStrategy
+    below for the actual `--state-fusion` strategy, which is a different
+    mechanism entirely: it grafts a donor's continuation into a profiled
+    state-of-interest point rather than racing two whole programs
+    concurrently.
 
     - Dataflow fusion ('df_ab'/'df_ba'): a value harvested from the source
       seed is written into a shared top-level CAF (an `unsafePerformIO`'d
@@ -4503,12 +4308,11 @@ class HaskellFusionStrategy(FusionStrategy):
       almost any Num context. Exercises GHC's constant folding, CAF
       sharing, and unsafePerformIO duplication-under-optimization paths.
 
-    - State fusion ('state_ab'/'state_ba'): builds a harness where both
-      seeds' entry actions would run *concurrently* via forkIO, racing on
-      one shared top-level IORef/MVar/TVar cell (kind picked from
-      whichever stateful construct, if any, the seeds themselves already
-      use). This is the Haskell analogue of PHP/CPython's dataflow
-      bridging, adapted for an effectful, concurrent setting.
+    - Concurrent-racing mode ('state_ab'/'state_ba', currently unreachable):
+      builds a harness where both seeds' entry actions would run
+      *concurrently* via forkIO, racing on one shared top-level
+      IORef/MVar/TVar cell (kind picked from whichever stateful
+      construct, if any, the seeds themselves already use).
       NOTE: projects/haskell/driver.py is compile-only (`ghc -fno-code`,
       never links or runs the program), so today this harness is only
       ever type-checked — it exercises GHC's handling of concurrent-
@@ -4854,319 +4658,207 @@ class HaskellFusionStrategy(FusionStrategy):
             self._build_fused_test(parent_a, parent_b, 'df_ba'),
         ]
 
-    def fuse_all(self, parent_a: Seed, parent_b: Seed) -> List[Seed]:
-        """Produce all four fusion variants (dataflow + state, both directions)."""
+
+class HaskellStateFusionStrategy(HaskellFusionStrategy):
+    """
+    State fusion for Haskell using core/state_analysis.py's profiled
+    state-of-interest points (`hClose`, `fromIntegral`, a `catch`/`throw`
+    boundary), distinct from HaskellFusionStrategy's own 'state_ab'/
+    'state_ba' modes (a *concurrent* forkIO race on a shared cell — see
+    that class's docstring). This strategy instead grafts the donor's
+    continuation directly into the host's body as text, at the host's
+    state-of-interest point, then runs the fused single action —
+    structurally closer to how the other languages' state fusion works.
+
+    CAVEAT: this is the least-verified of the state-fusion strategies —
+    no local `ghc` was available to check the grafted output against
+    Haskell's indentation-sensitive layout rule (unlike Clang, which was
+    checked against real g++). It's built on the same reindent-to-host-
+    column mechanism that's structurally sound for Python's layout rule,
+    but Haskell's layout algorithm has more edge cases (e.g. `where`
+    clauses, multi-equation function definitions) that a donor
+    continuation could still trip. Also, projects/haskell/driver.py is
+    compile-only (`ghc -fno-code`), so even a successful run here only
+    exercises the type-checker, not actual execution.
+    """
+
+    def _build_state_fused(self, host: Seed, donor: Seed, direction: str) -> Seed:
+        from .state_analysis import pick_state_point, graft_continuation, StatePoint
+
+        host_code, donor_code = host.content, donor.content
+        if self.mut:
+            host_code = self.mut.mutate(host_code)
+            donor_code = self.mut.mutate(donor_code)
+
+        uid_host = re.sub(r'[^a-zA-Z0-9]', '_', str(host.id))
+        uid_donor = re.sub(r'[^a-zA-Z0-9]', '_', str(donor.id))
+
+        proc_host = self._process_seed(host_code, uid_host)
+        proc_donor = self._process_seed(donor_code, uid_donor)
+
+        body_host = proc_host['body']
+        body_donor = self._rename_collisions(proc_host['toplevel_names'], proc_donor['body'],
+                                              proc_donor['toplevel_names'], uid_donor)
+
+        entry_host = self._build_entry_action(proc_host['main_name'], proc_host['had_main'],
+                                               host.metadata.get('nullary_bindings', []))
+
+        host_point = pick_state_point(body_host, "haskell", self.project_root,
+                                       cached=(host.metadata or {}).get("states_of_interest"))
+        donor_point = pick_state_point(body_donor, "haskell", self.project_root,
+                                        cached=(donor.metadata or {}).get("states_of_interest"))
+        if host_point is None:
+            lines = body_host.splitlines()
+            host_point = StatePoint(max(len(lines) - 1, 0), "fallback", "", "")
+
+        fused_body = graft_continuation(body_host, body_donor, host_point, donor_point)
+
+        pragmas = sorted(set(proc_host['pragmas']) | set(proc_donor['pragmas']))
+        seed_imports = sorted(set(proc_host['imports']) | set(proc_donor['imports']))
+        base_imports = ["import Control.Exception (SomeException, evaluate, try)"]
+        all_imports = sorted(set(base_imports) | set(seed_imports))
+
+        main_body = (
+            "main :: IO ()\n"
+            "main = do\n"
+            f"  r <- (try ({proc_host['main_name']}) :: IO (Either SomeException ()))\n"
+            "  case r of\n"
+            "    Left e -> putStrLn (\"error: \" ++ show (e :: SomeException))\n"
+            "    Right _ -> return ()\n"
+        )
+
+        sections = ["module Main where"]
+        if pragmas:
+            sections.insert(0, "\n".join(pragmas))
+        sections.append("\n".join(all_imports))
+        sections.append(f"-- === State-fused: host {host.id} <- donor {donor.id} ({host_point.category}) ===\n{fused_body}")
+        if entry_host:
+            sections.append(entry_host)
+        sections.append(main_body)
+
+        final_content = "\n\n".join(s for s in sections if s.strip())
+
+        return Seed(content=final_content, metadata={
+            "parents": [host.id, donor.id],
+            "type": "haskell",
+            "mode": f"state_{host_point.category}_{direction}",
+            "description": f"State-fused {host.id} <- {donor.id} ({direction})",
+        })
+
+    def fuse(self, parent_a: Seed, parent_b: Seed) -> Seed:
+        return self._build_state_fused(parent_a, parent_b, "ab")
+
+    def fuse_bidirectional(self, parent_a: Seed, parent_b: Seed) -> List[Seed]:
         return [
-            self._build_fused_test(parent_a, parent_b, 'df_ab'),
-            self._build_fused_test(parent_a, parent_b, 'df_ba'),
-            self._build_fused_test(parent_a, parent_b, 'state_ab'),
-            self._build_fused_test(parent_a, parent_b, 'state_ba'),
+            self._build_state_fused(parent_a, parent_b, "ab"),
+            self._build_state_fused(parent_b, parent_a, "ba"),
         ]
 
 
-class V8FusionStrategy(FusionStrategy):
+class HaskellDeclarationFusionStrategy(HaskellFusionStrategy):
     """
-    V8 / JavaScript Fusion Strategy.
-    1. Wraps each parent in an IIFE so their top-level variables don't collide.
-    2. Renames colliding top-level function declarations in B.
-    3. Injects phase-directed bug primitives that target V8's JIT tiers
-       (Ignition, Maglev, Turbofan), GC, typed arrays, Proxy, and Wasm.
+    Declaration fusion for Haskell: injects a donor-declared typeclass as
+    an extra superclass constraint on a host typeclass
+    (`class Foo a where` -> `class DonorClass a => Foo a where`) — the
+    Haskell analogue of Rust's supertrait injection. GHC's instance
+    resolution and superclass-satisfaction checking is a purely static,
+    declare-time process (no call needed): a class with an unsatisfiable
+    or self-referential superclass context fails to even be accepted,
+    independent of whether anything ever uses it.
     """
 
-    _JS_KW = frozenset({
-        'break', 'case', 'catch', 'class', 'const', 'continue', 'debugger',
-        'default', 'delete', 'do', 'else', 'export', 'extends', 'false',
-        'finally', 'for', 'function', 'if', 'import', 'in', 'instanceof',
-        'let', 'new', 'null', 'return', 'static', 'super', 'switch', 'this',
-        'throw', 'true', 'try', 'typeof', 'undefined', 'var', 'void', 'while',
-        'with', 'yield', 'async', 'await', 'of', 'from', 'get', 'set',
-        # Global objects
-        'Object', 'Array', 'Function', 'Number', 'String', 'Boolean',
-        'Symbol', 'BigInt', 'Math', 'Date', 'RegExp', 'Error', 'Map', 'Set',
-        'WeakMap', 'WeakSet', 'Promise', 'Proxy', 'Reflect', 'JSON',
-        'ArrayBuffer', 'DataView', 'Int8Array', 'Uint8Array', 'Uint8ClampedArray',
-        'Int16Array', 'Uint16Array', 'Int32Array', 'Uint32Array',
-        'Float32Array', 'Float64Array', 'BigInt64Array', 'BigUint64Array',
-        'WebAssembly', 'console', 'globalThis', 'Infinity', 'NaN',
-        # d8 helpers
-        'print', 'gc', 'readline', 'load', 'quit', 'version',
-    })
-
-    _FUNC_DECL_RE = re.compile(
-        r'^(?:async\s+)?function\s*\*?\s*([a-zA-Z_$][a-zA-Z0-9_$]*)\s*\(',
-        re.MULTILINE,
-    )
-    _CLASS_DECL_RE = re.compile(
-        r'^class\s+([a-zA-Z_$][a-zA-Z0-9_$]*)',
+    _HS_CLASS_HEADER_RE = re.compile(
+        r'^(?P<indent>[ \t]*)class\s+'
+        r'(?P<ctx>\([^)]*\)\s*=>\s*)?'
+        r'(?P<name>[A-Za-z_]\w*)\s+(?P<tyvar>[a-z]\w*)\b'
+        r'[^\n]*?\bwhere\b',
         re.MULTILINE,
     )
 
-    def __init__(self, project_root="projects/v8"):
-        self.project_root = project_root
-        self.mut = JSMutator()
+    def _inject_superclass(self, code: str, donor_class_name: str):
+        matches = list(self._HS_CLASS_HEADER_RE.finditer(code))
+        if not matches:
+            return code, False
+        m = random.choice(matches)
+        tyvar = m.group('tyvar')
+        if m.group('ctx'):
+            ctx = m.group('ctx')
+            close_paren = ctx.rfind(')')
+            if close_paren == -1:
+                return code, False
+            new_ctx = ctx[:close_paren] + f", {donor_class_name} {tyvar}" + ctx[close_paren:]
+            new_code = code[:m.start('ctx')] + new_ctx + code[m.end('ctx'):]
+        else:
+            insert_pos = m.start('name')
+            new_code = code[:insert_pos] + f"{donor_class_name} {tyvar} => " + code[insert_pos:]
+        return new_code, True
 
-    def _top_level_names(self, code: str) -> set:
-        names = set()
-        for m in self._FUNC_DECL_RE.finditer(code):
-            names.add(m.group(1))
-        for m in self._CLASS_DECL_RE.finditer(code):
-            names.add(m.group(1))
-        return names - self._JS_KW
-
-    def _rename_collisions(self, body_a: str, body_b: str, uid_b: str) -> str:
-        names_a = self._top_level_names(body_a)
-        collisions = self._top_level_names(body_b) & names_a
-        if not collisions:
-            return body_b
-        uid_safe = re.sub(r'[^a-zA-Z0-9]', '_', uid_b)
-        for name in sorted(collisions, key=len, reverse=True):
-            body_b = re.sub(r'\b' + re.escape(name) + r'\b', f"{name}_b{uid_safe}", body_b)
-        return body_b
-
-    def _wrap_iife(self, code: str, label: str) -> str:
-        return f"// === {label} ===\n(function() {{\n{code}\n}})();"
-
-    def _bug_primitives(self) -> str:
-        # P1: Typed array boundary — stresses bounds-check elimination in Turbofan
-        p1 = '''\
-// P1: Typed array boundary stress
-(function _ffl_p1() {
-  const _ffl_buf = new ArrayBuffer(16);
-  const _ffl_i32 = new Int32Array(_ffl_buf);
-  const _ffl_f64 = new Float64Array(_ffl_buf);
-  _ffl_i32[0] = 0x7fffffff;
-  _ffl_i32[1] = -1;
-  _ffl_f64[0] = Infinity;
-  _ffl_f64[1] = -0;
-  for (let _ffl_i = 0; _ffl_i < 4; _ffl_i++) {
-    _ffl_i32[_ffl_i] = _ffl_i32[_ffl_i] | 0;
-  }
-})();'''
-
-        # P2: Prototype chain manipulation — stresses IC and map transitions
-        p2 = '''\
-// P2: Prototype chain / hidden-class stress
-(function _ffl_p2() {
-  function _ffl_C() { this.x = 1; }
-  _ffl_C.prototype.m = function() { return this.x; };
-  const _ffl_o = new _ffl_C();
-  Object.defineProperty(_ffl_o, 'x', { value: 42, writable: false });
-  for (let _ffl_i = 0; _ffl_i < 100; _ffl_i++) {
-    _ffl_o.y = _ffl_i;  // polymorphic property addition
-  }
-  delete _ffl_o.y;
-})();'''
-
-        # P3: Deoptimization — force OSR + deopt cycle
-        p3 = '''\
-// P3: Deoptimization (OSR + type feedback pollution)
-(function _ffl_p3() {
-  function _ffl_add(a, b) { return a + b; }
-  // Warm up with ints
-  for (let _ffl_i = 0; _ffl_i < 10000; _ffl_i++) _ffl_add(_ffl_i, 1);
-  // Deopt with string
-  _ffl_add("deopt", 0);
-  // Warm up with floats
-  for (let _ffl_i = 0; _ffl_i < 10000; _ffl_i++) _ffl_add(_ffl_i * 0.5, 1.5);
-})();'''
-
-        # P4: Proxy traps — stresses IC and megamorphic lookups
-        p4 = '''\
-// P4: Proxy traps
-(function _ffl_p4() {
-  const _ffl_target = { x: 1, y: 2 };
-  const _ffl_proxy = new Proxy(_ffl_target, {
-    get(t, k) { return k in t ? t[k] * 2 : undefined; },
-    set(t, k, v) { t[k] = v + 1; return true; },
-    has(t, k) { return k in t; },
-  });
-  _ffl_proxy.x;
-  _ffl_proxy.z = 10;
-  'x' in _ffl_proxy;
-})();'''
-
-        # P5: Generator / async stress — stresses bytecode resume points
-        p5 = '''\
-// P5: Generator + async stress
-(async function _ffl_p5() {
-  function* _ffl_gen(n) {
-    for (let _ffl_i = 0; _ffl_i < n; _ffl_i++) yield _ffl_i * _ffl_i;
-  }
-  for (const _ffl_v of _ffl_gen(8)) { void _ffl_v; }
-  const _ffl_p = await Promise.resolve(42);
-  void _ffl_p;
-})().catch(() => {});'''
-
-        # P6: Map / Set operations — stresses hash table internals
-        p6 = '''\
-// P6: Map / Set hash table stress
-(function _ffl_p6() {
-  const _ffl_m = new Map();
-  const _ffl_s = new Set();
-  for (let _ffl_i = 0; _ffl_i < 64; _ffl_i++) {
-    _ffl_m.set(_ffl_i, _ffl_i * _ffl_i);
-    _ffl_s.add(_ffl_i % 7);
-  }
-  _ffl_m.delete(0);
-  _ffl_m.forEach((v, k) => { void (v + k); });
-})();'''
-
-        phases = [p1, p2, p3, p4, p5, p6]
-        selected = random.sample(phases, k=random.choice([2, 3]))
-        return "\n\n".join(selected)
-
-    def fuse(self, parent_a: Seed, parent_b: Seed) -> Seed:
-        code_a = parent_a.content
-        code_b = parent_b.content
-
+    def _build_declaration_fused_test(self, host: Seed, donor: Seed, direction: str) -> Seed:
+        host_code, donor_code = host.content, donor.content
         if self.mut:
-            code_a = self.mut.mutate(code_a)
-            code_b = self.mut.mutate(code_b)
+            host_code = self.mut.mutate(host_code)
+            donor_code = self.mut.mutate(donor_code)
 
-        # Rename top-level collisions in B to avoid redeclaration errors
-        code_b = self._rename_collisions(code_a, code_b, parent_b.id)
+        uid_host = re.sub(r'[^a-zA-Z0-9]', '_', str(host.id))
+        uid_donor = re.sub(r'[^a-zA-Z0-9]', '_', str(donor.id))
 
-        # Wrap each parent in an IIFE for variable isolation
-        block_a = self._wrap_iife(code_a, f"Seed A: {parent_a.id}")
-        block_b = self._wrap_iife(code_b, f"Seed B: {parent_b.id}")
+        proc_host = self._process_seed(host_code, uid_host)
+        proc_donor = self._process_seed(donor_code, uid_donor)
 
-        bug_prims = self._bug_primitives()
-        bug_block = f"// === FFL Bug Primitives ===\n{bug_prims}"
+        body_donor = self._rename_collisions(proc_host['toplevel_names'], proc_donor['body'],
+                                              proc_donor['toplevel_names'], uid_donor)
+        body_host = proc_host['body']
 
-        final_content = "\n\n".join([block_a, block_b, bug_block])
+        donor_class_names = [m.group('name') for m in self._HS_CLASS_HEADER_RE.finditer(body_donor)]
+        fused_host, applied = body_host, False
+        if donor_class_names:
+            donor_name = random.choice(donor_class_names)
+            fused_host, applied = self._inject_superclass(body_host, donor_name)
 
-        return Seed(
-            content=final_content,
-            metadata={
-                "parents": [parent_a.id, parent_b.id],
-                "type": "javascript",
-                "description": f"Fused {parent_a.id} + {parent_b.id}",
-            },
+        entry_host = self._build_entry_action(proc_host['main_name'], proc_host['had_main'],
+                                               host.metadata.get('nullary_bindings', []))
+
+        pragmas = sorted(set(proc_host['pragmas']) | set(proc_donor['pragmas']))
+        seed_imports = sorted(set(proc_host['imports']) | set(proc_donor['imports']))
+        base_imports = ["import Control.Exception (SomeException, evaluate, try)"]
+        all_imports = sorted(set(base_imports) | set(seed_imports))
+
+        main_body = (
+            "main :: IO ()\n"
+            "main = do\n"
+            f"  r <- (try ({proc_host['main_name']}) :: IO (Either SomeException ()))\n"
+            "  case r of\n"
+            "    Left e -> putStrLn (\"error: \" ++ show (e :: SomeException))\n"
+            "    Right _ -> return ()\n"
         )
 
+        sections = ["module Main where"]
+        if pragmas:
+            sections.insert(0, "\n".join(pragmas))
+        sections.append("\n".join(all_imports))
+        sections.append(f"-- === Donor typeclasses: {donor.id} ===\n{body_donor}")
+        sections.append(f"-- === Declaration-fused host: {host.id} ===\n{fused_host}")
+        if entry_host:
+            sections.append(entry_host)
+        sections.append(main_body)
 
-# ==========================================
-# Cangjie Fusion Strategy
-# ==========================================
+        final_content = "\n\n".join(s for s in sections if s.strip())
 
-class CangjieFusionStrategy(FusionStrategy):
-    """
-    Cangjie-specific fusion strategy.
-    1. Hoists and deduplicates 'import' statements from both parents.
-    2. Renames top-level func/class/struct/enum declarations in B that
-       collide with A (appends a uid suffix).
-    3. Renames 'main' in both parents to unique names and emits a new
-       combined main() that calls them both.
-    4. Injects a simple bridge variable between the two bodies.
-    """
-
-    _IMPORT_RE = re.compile(r'^\s*import\s+([\w.]+)', re.MULTILINE)
-
-    # Matches top-level named declarations
-    _TOPLEVEL_RE = re.compile(
-        r'^[ \t]*(?:(?:public|private|protected|open|abstract|override)\s+)*'
-        r'(?:func|class|struct|enum|interface|extend)\s+'
-        r'([A-Za-z_]\w*)',
-        re.MULTILINE,
-    )
-
-    _CJ_KW = frozenset({
-        'main', 'func', 'class', 'struct', 'enum', 'interface', 'extend',
-        'let', 'var', 'if', 'else', 'for', 'while', 'do', 'match',
-        'return', 'break', 'continue', 'import', 'package',
-        'true', 'false', 'this', 'super', 'init', 'new',
-        'Int8', 'Int16', 'Int32', 'Int64', 'UInt8', 'UInt16', 'UInt32', 'UInt64',
-        'Float32', 'Float64', 'Bool', 'String', 'Char', 'Unit', 'Nothing',
-        'Array', 'ArrayList', 'HashMap', 'Option', 'Some', 'None',
-        'println', 'print',
-    })
-
-    def __init__(self, project_root="projects/cangjie"):
-        self.project_root = project_root
-        self.mut = CangjeMutator()
-
-    def _process_seed(self, code: str, uid: str):
-        """Extract imports and body; rename main() → main_<uid>() if present."""
-        imports: set = set()
-        body_lines = []
-        for line in code.splitlines():
-            m = self._IMPORT_RE.match(line)
-            if m:
-                imports.add(m.group(1))
-            else:
-                body_lines.append(line)
-        body = "\n".join(body_lines).strip()
-
-        main_name = None
-        # Match bare `main()` (entry point, no `func` keyword) at top level
-        main_re = re.compile(r'^([ \t]*)main\s*\(\s*\)', re.MULTILINE)
-        if main_re.search(body):
-            new_name = f"main_{uid}"
-            # Rename and add `func` so it becomes a regular callable function
-            body = main_re.sub(lambda m: f"{m.group(1)}func {new_name}()", body, count=1)
-            main_name = new_name
-
-        return imports, body, main_name
-
-    def _rename_collisions(self, body_a: str, body_b: str, uid_b: str) -> str:
-        names_a = {m.group(1) for m in self._TOPLEVEL_RE.finditer(body_a)}
-        collisions = (
-            {m.group(1) for m in self._TOPLEVEL_RE.finditer(body_b)}
-            & names_a
-            - self._CJ_KW
-        )
-        if not collisions:
-            return body_b
-        uid_safe = re.sub(r'[^a-zA-Z0-9]', '_', uid_b)
-        for name in sorted(collisions, key=len, reverse=True):
-            # Use a negative lookbehind for '.' so we don't rename inside
-            # qualified names like pkg.Name or extend pkg.Name { ... }
-            pattern = r'(?<!\.)\b' + re.escape(name) + r'\b'
-            body_b = re.sub(pattern, f"{name}_b{uid_safe}", body_b)
-        return body_b
+        return Seed(content=final_content, metadata={
+            "parents": [host.id, donor.id],
+            "type": "haskell",
+            "mode": f"decl_{'superclass' if applied else 'none'}_{direction}",
+            "description": f"Declaration-fused {host.id} <- {donor.id} ({direction})",
+        })
 
     def fuse(self, parent_a: Seed, parent_b: Seed) -> Seed:
-        uid_a = re.sub(r'[^a-zA-Z0-9]', '_', parent_a.id)
-        uid_b = re.sub(r'[^a-zA-Z0-9]', '_', parent_b.id)
+        return self._build_declaration_fused_test(parent_a, parent_b, "ab")
 
-        imports_a, body_a, main_a = self._process_seed(parent_a.content, uid_a)
-        imports_b, body_b, main_b = self._process_seed(parent_b.content, uid_b)
-
-        body_b = self._rename_collisions(body_a, body_b, uid_b)
-
-        all_imports = sorted(imports_a | imports_b)
-        import_block = "\n".join(f"import {i}" for i in all_imports)
-
-        # Build combined main() — no bridge: local vars inside main_xxx() are
-        # not in scope here, so referencing them would cause undeclared-identifier errors.
-        main_body_lines = ["main() {"]
-        if main_a:
-            main_body_lines.append(f"    {main_a}()")
-        if main_b:
-            main_body_lines.append(f"    {main_b}()")
-        main_body_lines.append("}")
-        new_main = "\n".join(main_body_lines)
-
-        parts = []
-        if import_block:
-            parts.append(import_block)
-        parts.append(f"// Seed A: {parent_a.id}\n{body_a}")
-        parts.append(f"// Seed B: {parent_b.id}\n{body_b}")
-        parts.append(new_main)
-        final_content = "\n\n".join(parts)
-
-        # Apply Cangjie-aware mutations to the fused result (50 % chance)
-        if random.random() < 0.5:
-            final_content = self.mut.mutate(final_content)
-
-        return Seed(
-            content=final_content,
-            metadata={
-                "parents": [parent_a.id, parent_b.id],
-                "type":    "cangjie",
-                "description": f"Fused {parent_a.id} + {parent_b.id}",
-            },
-        )
+    def fuse_bidirectional(self, parent_a: Seed, parent_b: Seed) -> List[Seed]:
+        return [
+            self._build_declaration_fused_test(parent_a, parent_b, "ab"),
+            self._build_declaration_fused_test(parent_b, parent_a, "ba"),
+        ]
 
 
 # ==========================================
@@ -5755,13 +5447,293 @@ class ClangFusionStrategy(GenericDataflowStrategy):
             self._build_fused_test(parent_a, parent_b, 'df_ba'),
         ]
 
-    def fuse_all(self, parent_a: Seed, parent_b: Seed) -> List[Seed]:
-        """Produce all four fusion variants for one pair."""
+
+# ==========================================
+# Clang Declaration Fusion Strategy
+# ==========================================
+
+class ClangDeclarationFusionStrategy(ClangFusionStrategy):
+    """
+    Declaration fusion for C/C++: confuses *declarations* rather than
+    *dataflow*. Unlike ClangFusionStrategy's dataflow/statement modes,
+    which need a runtime value from one seed to actually reach and trigger
+    a bug in the other, these bugs are triggered simply by declaring or
+    instantiating the fused definition — no execution required, which
+    makes this the more effective lever on clang's frontend/sema (name
+    resolution, overload/template instantiation, class layout) where
+    dataflow fusion offers comparatively little.
+
+    Three primitives, mirroring the paper's "extensible declaration
+    expressions" for C++ (base class lists, template parameters):
+
+    - base_class:    make a class/struct in the host seed additionally
+                      inherit from a class/struct declared in the donor
+                      seed (`class Foo : public Bar { ... }` ->
+                      `class Foo : public Bar, public <donor> { ... }`).
+    - template_param: add a defaulted template parameter to a template
+                      class/struct in the host, defaulting to a type
+                      declared in the donor seed.
+    - item_nest:      nest a whole struct/class/enum declaration from the
+                      donor seed inside a namespace/class/function body
+                      found in the host (same core primitive as Rust's
+                      RustStructFusionStrategy, adapted to C++ syntax).
+
+    Reuses ClangFusionStrategy's literal-aware statement splitter
+    (_split_statements) and name-conflict resolution rather than
+    reimplementing a C++ parser.
+    """
+
+    _CLASS_HEADER_RE = re.compile(
+        r'(?P<template>template\s*<[^>]*>\s*)?'
+        r'\b(?P<kind>class|struct)\s+(?P<name>[A-Za-z_]\w*)'
+        r'(?P<bases>\s*:\s*[^{;]+)?'
+        r'\s*\{'
+    )
+
+    def __init__(self, project_root="projects/clang"):
+        super().__init__(project_root=project_root)
+
+    # ── Declaration-site discovery ──────────────────────────────────
+
+    def _extract_type_names(self, code: str):
+        """name -> True if declared as a template (so any reference to it as
+        a base class or default-template-argument needs `<...>` args)."""
+        names: Dict[str, bool] = {}
+        for m in self._CLASS_HEADER_RE.finditer(code):
+            name = m.group('name')
+            if name in self._C_KEYWORDS or name in self._C_CONTROL_KW:
+                continue
+            names[name] = names.get(name, False) or bool(m.group('template'))
+        for name in self._C_TYPE_DEF_RE.findall(code):
+            if name in self._C_KEYWORDS or name in self._C_CONTROL_KW:
+                continue
+            names.setdefault(name, False)
+        return names
+
+    @staticmethod
+    def _donor_type_ref(name: str, is_template: bool) -> str:
+        # A template needs args to be used as a base class or a type
+        # argument (`Container` alone isn't a type, `Container<int>` is) —
+        # otherwise every fusion that happens to pick a template donor
+        # would deterministically fail with the same boring diagnostic.
+        return f"{name}<int>" if is_template else name
+
+    def _donor_type_items(self, code: str):
+        """Top-level struct/class/enum declaration units from `code`,
+        suitable for nesting whole into another seed's container."""
+        items = []
+        for stmt in self._split_statements(code):
+            head = stmt.lstrip()[:200]
+            if re.match(r'(?:template\s*<[^>]*>\s*)?\b(?:struct|class|enum)\b', head):
+                # _split_statements emits the closing '}' of a struct/class/
+                # enum as the end of the unit but treats the mandatory
+                # trailing ';' as its own separate (bare) statement — so a
+                # unit lifted out on its own is missing it. Always ensured
+                # here since nesting/nesting-adjacent code takes each item
+                # out of that surrounding statement-list context.
+                fixed = stmt if stmt.rstrip().endswith(';') else stmt.rstrip() + ';'
+                items.append(fixed)
+        return items
+
+    # ── Primitive 1: base class list injection ──────────────────────
+
+    def _inject_base_class(self, stmt: str, donor_name: str):
+        matches = list(self._CLASS_HEADER_RE.finditer(stmt))
+        if not matches:
+            return stmt, False
+        m = random.choice(matches)
+        brace_pos = m.end() - 1  # index of the matched '{'
+        if m.group('bases'):
+            new_stmt = stmt[:brace_pos].rstrip() + f", public {donor_name} " + stmt[brace_pos:]
+        else:
+            new_stmt = stmt[:brace_pos].rstrip() + f" : public {donor_name} " + stmt[brace_pos:]
+        return new_stmt, True
+
+    # ── Primitive 2: template parameter injection ────────────────────
+
+    def _inject_template_param(self, stmt: str, donor_name: str):
+        matches = [m for m in self._CLASS_HEADER_RE.finditer(stmt) if m.group('template')]
+        if not matches:
+            return stmt, False
+        m = random.choice(matches)
+        tmpl = m.group('template')
+        close_rel = tmpl.rfind('>')
+        if close_rel == -1:
+            return stmt, False
+        insert_at = m.start('template') + close_rel
+        new_param = f", typename _FflDeclT = {donor_name}"
+        new_stmt = stmt[:insert_at] + new_param + stmt[insert_at:]
+        return new_stmt, True
+
+    # ── Primitive 3: item nesting ─────────────────────────────────────
+
+    def _nest_declaration(self, host_stmts: List[str], donor_item: str):
+        candidates = []
+        for idx, s in enumerate(host_stmts):
+            if self._C_BLOCK_HEAD_RE.match(s) and '{' in s:
+                span = self._find_outermost_brace_body(s)
+                if span:
+                    candidates.append((idx, span))
+        if not candidates:
+            return host_stmts, False
+        idx, (body_start, body_end) = random.choice(candidates)
+        target = host_stmts[idx]
+        new_stmt = target[:body_end] + "\n" + donor_item + "\n" + target[body_end:]
+        result = list(host_stmts)
+        result[idx] = new_stmt
+        return result, True
+
+    # ── Entry points ───────────────────────────────────────────────
+
+    def _build_declaration_fused_test(self, host: Seed, donor: Seed, direction: str) -> Seed:
+        host_code = host.content
+        donor_code = donor.content
+        if self.mutation:
+            host_code = self.mut.mutate(host_code)
+            donor_code = self.mut.mutate(donor_code)
+
+        donor_code = self._resolve_name_conflicts(host_code, donor_code)
+
+        donor_types = self._extract_type_names(donor_code)
+        host_stmts = self._split_statements(host_code)
+
+        technique = random.choice(['base_class', 'template_param', 'item_nest'])
+        applied = False
+
+        if technique in ('base_class', 'template_param') and donor_types:
+            donor_name, is_tmpl = random.choice(list(donor_types.items()))
+            donor_ref = self._donor_type_ref(donor_name, is_tmpl)
+            targets = list(range(len(host_stmts)))
+            random.shuffle(targets)
+            for idx in targets:
+                if technique == 'base_class':
+                    new_stmt, ok = self._inject_base_class(host_stmts[idx], donor_ref)
+                else:
+                    new_stmt, ok = self._inject_template_param(host_stmts[idx], donor_ref)
+                if ok:
+                    host_stmts[idx] = new_stmt
+                    applied = True
+                    break
+
+        if not applied:
+            donor_items = self._donor_type_items(donor_code)
+            if donor_items:
+                donor_item = random.choice(donor_items)
+                host_stmts, applied = self._nest_declaration(host_stmts, donor_item)
+                technique = 'item_nest'
+
+        fused_host = '\n'.join(host_stmts)
+        # Donor code goes FIRST: a base-class or default-template-argument
+        # reference to a type needs that type already declared earlier in
+        # the translation unit, same as any ordinary C++ forward-reference
+        # rule. (For item_nest this duplicates the donor's declaration at
+        # top level in addition to the nested copy — harmless, just extra
+        # surface for redeclaration/ODR diagnostics.)
+        fused = f"{donor_code}\n{fused_host}"
+
+        cxx_exts = ('.cpp', '.cc', '.cxx', '.mm')
+        meta_a, meta_b = host.metadata, donor.metadata
+        ext = meta_a.get('extension', '.cpp')
+        seed_type = meta_a.get('type', 'cpp')
+        if meta_b.get('extension') in cxx_exts:
+            ext = meta_b.get('extension')
+            seed_type = meta_b.get('type', 'cpp')
+        if ext not in cxx_exts:
+            # Base-class/template injection is C++-only syntax
+            ext, seed_type = '.cpp', 'cpp'
+
+        return Seed(content=fused, metadata={
+            "parents": [host.id, donor.id],
+            "type": seed_type,
+            "extension": ext,
+            "mode": f"decl_{technique}_{direction}",
+            "description": f"Declaration-fused {host.id} <- {donor.id} ({technique}, {direction})",
+        })
+
+    def fuse(self, parent_a: Seed, parent_b: Seed) -> Seed:
+        return self._build_declaration_fused_test(parent_a, parent_b, 'ab')
+
+    def fuse_bidirectional(self, parent_a: Seed, parent_b: Seed) -> List[Seed]:
+        """A hosts a declaration referring into B, and vice versa."""
         return [
-            self._build_fused_test(parent_a, parent_b, 'stmt_ab'),
-            self._build_fused_test(parent_a, parent_b, 'stmt_ba'),
-            self._build_fused_test(parent_a, parent_b, 'df_ab'),
-            self._build_fused_test(parent_a, parent_b, 'df_ba'),
+            self._build_declaration_fused_test(parent_a, parent_b, 'ab'),
+            self._build_declaration_fused_test(parent_b, parent_a, 'ba'),
+        ]
+
+
+class ClangStateFusionStrategy(ClangFusionStrategy):
+    """
+    State fusion for C/C++ (core/state_analysis.py): grafts one seed's
+    continuation into the other's state at a profiled state of interest
+    (`free()`/destructor call, an explicit cast, a try/catch boundary)
+    instead of bridging a single value or interleaving whole statements by
+    dependency graph. Complements ClangFusionStrategy's existing modes.
+    """
+
+    _INCLUDE_RE = re.compile(r'^[ \t]*#[ \t]*(?:include|import)\b.*$', re.MULTILINE)
+
+    @classmethod
+    def _extract_includes_and_body(cls, code: str):
+        includes = cls._INCLUDE_RE.findall(code)
+        body = cls._INCLUDE_RE.sub('', code)
+        return body, includes
+
+    def _build_state_fused(self, host: Seed, donor: Seed, direction: str) -> Seed:
+        from .state_analysis import pick_state_point, graft_continuation, StatePoint, truncate_to_balanced
+
+        host_code, donor_code = host.content, donor.content
+        if self.mutation:
+            host_code = self.mut.mutate(host_code)
+            donor_code = self.mut.mutate(donor_code)
+        donor_code = self._resolve_name_conflicts(host_code, donor_code)
+
+        # #include lines must be hoisted out of the graft: they're part of
+        # the donor's preamble (before its state point), so a naive graft
+        # would silently drop them and the continuation's identifiers would
+        # fail to resolve.
+        host_body, host_includes = self._extract_includes_and_body(host_code)
+        donor_body, donor_includes = self._extract_includes_and_body(donor_code)
+        all_includes = sorted(set(i.strip() for i in host_includes) | set(i.strip() for i in donor_includes))
+
+        host_point = pick_state_point(host_body, "clang", self.project_root,
+                                       cached=(host.metadata or {}).get("states_of_interest"))
+        donor_point = pick_state_point(donor_body, "clang", self.project_root,
+                                        cached=(donor.metadata or {}).get("states_of_interest"))
+        if host_point is None:
+            lines = host_body.splitlines()
+            host_point = StatePoint(max(len(lines) - 1, 0), "fallback", "", "")
+
+        donor_lines = donor_body.splitlines()
+        start_idx = (donor_point.line_idx + 1) if donor_point else 0
+        end_idx = truncate_to_balanced(donor_body, start_idx, "clang")
+        truncated_donor = "\n".join(donor_lines[:end_idx])
+
+        fused_body = graft_continuation(host_body, truncated_donor, host_point, donor_point)
+        fused = "\n".join(all_includes) + "\n" + fused_body
+
+        cxx_exts = ('.cpp', '.cc', '.cxx', '.mm')
+        meta_a, meta_b = host.metadata, donor.metadata
+        ext = meta_a.get('extension', '.c')
+        seed_type = meta_a.get('type', 'c')
+        if meta_b.get('extension') in cxx_exts:
+            ext = meta_b.get('extension')
+            seed_type = meta_b.get('type', 'cpp')
+
+        return Seed(content=fused, metadata={
+            "parents": [host.id, donor.id],
+            "type": seed_type,
+            "extension": ext,
+            "mode": f"state_{host_point.category}_{direction}",
+            "description": f"State-fused {host.id} <- {donor.id} ({direction})",
+        })
+
+    def fuse(self, parent_a: Seed, parent_b: Seed) -> Seed:
+        return self._build_state_fused(parent_a, parent_b, "ab")
+
+    def fuse_bidirectional(self, parent_a: Seed, parent_b: Seed) -> List[Seed]:
+        return [
+            self._build_state_fused(parent_a, parent_b, "ab"),
+            self._build_state_fused(parent_b, parent_a, "ba"),
         ]
 
 
@@ -6477,13 +6449,137 @@ class FlangFusionStrategy(GenericDataflowStrategy):
             self._build_fused_test(parent_a, parent_b, 'df_ba'),
         ]
 
-    def fuse_all(self, parent_a: Seed, parent_b: Seed) -> List[Seed]:
-        """Produce all four fusion variants for one pair."""
+
+class FlangStateFusionStrategy(FlangFusionStrategy):
+    """
+    State fusion for Fortran (core/state_analysis.py): grafts one seed's
+    continuation into the other's state at a profiled state of interest
+    (CLOSE/DEALLOCATE, an INT/REAL/DBLE conversion, an ERROR STOP/STAT=
+    boundary). Fortran has no brace delimiters, so the continuation is
+    truncated at the next program-unit boundary (bare END, or a fresh
+    PROGRAM/SUBROUTINE/FUNCTION header) using the same keyword-based
+    classifier _split_statements already uses, instead of
+    core/state_analysis.py's generic brace-balance truncation.
+    """
+
+    def _truncate_before_unit_boundary(self, lines: List[str], start_idx: int) -> int:
+        depth = 0
+        for i in range(start_idx, len(lines)):
+            code_part = self._strip_comment(lines[i]).strip()
+            kind = self._classify(code_part)
+            if depth == 0 and kind in ('unit_close', 'unit_open'):
+                return i
+            if kind == 'inner_open':
+                depth += 1
+            elif kind == 'inner_close':
+                depth = max(depth - 1, 0)
+        return len(lines)
+
+    def _build_state_fused(self, host: Seed, donor: Seed, direction: str) -> Seed:
+        from .state_analysis import pick_state_point, graft_continuation, StatePoint
+
+        host_code, donor_code = host.content, donor.content
+        if self.mutation:
+            host_code = self.mut.mutate(host_code)
+            donor_code = self.mut.mutate(donor_code)
+        donor_code = self._resolve_name_conflicts(host_code, donor_code)
+
+        host_point = pick_state_point(host_code, "flang", self.project_root,
+                                       cached=(host.metadata or {}).get("states_of_interest"))
+        donor_point = pick_state_point(donor_code, "flang", self.project_root,
+                                        cached=(donor.metadata or {}).get("states_of_interest"))
+        if host_point is None:
+            lines = host_code.splitlines()
+            host_point = StatePoint(max(len(lines) - 1, 0), "fallback", "", "")
+
+        donor_lines = donor_code.splitlines()
+        start_idx = (donor_point.line_idx + 1) if donor_point else 0
+        end_idx = self._truncate_before_unit_boundary(donor_lines, start_idx)
+        truncated_donor = "\n".join(donor_lines[:end_idx])
+
+        fused = graft_continuation(host_code, truncated_donor, host_point, donor_point)
+
+        ext = host.metadata.get('extension', '.f90')
+        seed_type = host.metadata.get('type', 'fortran')
+
+        return Seed(content=fused, metadata={
+            "parents": [host.id, donor.id],
+            "type": seed_type,
+            "extension": ext,
+            "mode": f"state_{host_point.category}_{direction}",
+            "description": f"State-fused {host.id} <- {donor.id} ({direction})",
+        })
+
+    def fuse(self, parent_a: Seed, parent_b: Seed) -> Seed:
+        return self._build_state_fused(parent_a, parent_b, "ab")
+
+    def fuse_bidirectional(self, parent_a: Seed, parent_b: Seed) -> List[Seed]:
         return [
-            self._build_fused_test(parent_a, parent_b, 'stmt_ab'),
-            self._build_fused_test(parent_a, parent_b, 'stmt_ba'),
-            self._build_fused_test(parent_a, parent_b, 'df_ab'),
-            self._build_fused_test(parent_a, parent_b, 'df_ba'),
+            self._build_state_fused(parent_a, parent_b, "ab"),
+            self._build_state_fused(parent_b, parent_a, "ba"),
+        ]
+
+
+class FlangDeclarationFusionStrategy(FlangFusionStrategy):
+    """
+    Declaration fusion for Fortran: injects `EXTENDS(DonorType)` into a
+    host derived-type declaration (`TYPE :: Foo` -> `TYPE, EXTENDS(Bar) ::
+    Foo`) — Fortran 2003+ type extension, the closest analogue to a
+    base-class list. An EXTENDS naming a type that isn't visible, or that
+    creates a component/binding conflict, is rejected purely from the
+    TYPE declaration itself; no procedure needs to be called.
+    """
+
+    _FORTRAN_TYPE_HEADER_RE = re.compile(
+        r'(?im)^(?P<indent>[ \t]*)(?P<kw>type)(?P<attrs>\s*,\s*[^:]+)?\s*::\s*(?P<name>[A-Za-z_]\w*)'
+    )
+
+    def _inject_extends(self, code: str, donor_name: str):
+        matches = list(self._FORTRAN_TYPE_HEADER_RE.finditer(code))
+        if not matches:
+            return code, False
+        m = random.choice(matches)
+        if m.group('attrs'):
+            if re.search(r'(?i)extends\s*\(', m.group('attrs')):
+                return code, False  # Fortran derived types support single inheritance only
+            new_code = code[:m.end('attrs')] + f", extends({donor_name})" + code[m.end('attrs'):]
+        else:
+            new_code = code[:m.end('kw')] + f", extends({donor_name})" + code[m.end('kw'):]
+        return new_code, True
+
+    def _build_declaration_fused_test(self, host: Seed, donor: Seed, direction: str) -> Seed:
+        host_code, donor_code = host.content, donor.content
+        if self.mutation:
+            host_code = self.mut.mutate(host_code)
+            donor_code = self.mut.mutate(donor_code)
+        donor_code = self._resolve_name_conflicts(host_code, donor_code)
+
+        donor_names = [m.group('name') for m in self._FORTRAN_TYPE_HEADER_RE.finditer(donor_code)]
+        fused_host, applied = host_code, False
+        if donor_names:
+            donor_name = random.choice(donor_names)
+            fused_host, applied = self._inject_extends(host_code, donor_name)
+
+        fused = f"{donor_code}\n{fused_host}"
+
+        ext = host.metadata.get('extension', '.f90')
+        seed_type = host.metadata.get('type', 'fortran')
+
+        return Seed(content=fused, metadata={
+            "parents": [host.id, donor.id],
+            "type": seed_type,
+            "extension": ext,
+            "mode": f"decl_{'extends' if applied else 'none'}_{direction}",
+            "description": f"Declaration-fused {host.id} <- {donor.id} ({direction})",
+        })
+
+    def fuse(self, parent_a: Seed, parent_b: Seed) -> Seed:
+        return self._build_declaration_fused_test(parent_a, parent_b, "ab")
+
+    def fuse_bidirectional(self, parent_a: Seed, parent_b: Seed) -> List[Seed]:
+        return [
+            self._build_declaration_fused_test(parent_a, parent_b, "ab"),
+            self._build_declaration_fused_test(parent_b, parent_a, "ba"),
         ]
 
 
@@ -6491,112 +6587,115 @@ class FlangFusionStrategy(GenericDataflowStrategy):
 # Strategy Factory (Updated)
 # ==========================================
 
-def get_strategies(project_name=None, stmt_fusion=False, dataflow_fusion=False, all_fusion=False,
-                    struct_fusion=False, state_fusion=False):
-    # Default: if neither flag given, enable dataflow fusion only
-    if not stmt_fusion and not dataflow_fusion and not all_fusion and not state_fusion:
+def get_strategies(project_name=None, dataflow_fusion=False,
+                    struct_fusion=False, declaration_fusion=False, state_fusion=False):
+    """
+    Build the pool of fusion strategies for `project_name`. Each of
+    dataflow_fusion/state_fusion/declaration_fusion independently adds its
+    matching strategy (where the project has one) to the pool — the
+    orchestrator picks one at random per iteration (core/orchestrator.py's
+    process_iteration). Pass any combination to run several techniques
+    side by side; pass none to get the default (dataflow fusion only).
+    """
+    # Default: if no technique is explicitly requested, enable dataflow fusion.
+    if not dataflow_fusion and not declaration_fusion and not state_fusion and not struct_fusion:
         dataflow_fusion = True
 
     strategies = []
 
     if project_name == "haskell":
         if os.path.exists("projects/haskell"):
-            s = HaskellFusionStrategy(project_root="projects/haskell")
-            s.dataflow_fusion = dataflow_fusion
-            s.state_fusion = state_fusion
-            s.all_fusion = all_fusion
-            strategies.append(s)
-        return strategies
-
-    if project_name == "cangjie":
-        if os.path.exists("projects/cangjie"):
-            strategies.append(CangjieFusionStrategy(project_root="projects/cangjie"))
+            if dataflow_fusion:
+                strategies.append(HaskellFusionStrategy(project_root="projects/haskell"))
+            if declaration_fusion:
+                strategies.append(HaskellDeclarationFusionStrategy(project_root="projects/haskell"))
+            if state_fusion:
+                strategies.append(HaskellStateFusionStrategy(project_root="projects/haskell"))
         return strategies
 
     if project_name == "php":
         if os.path.exists("projects/php"):
-            s = PHPFusionStrategy(project_root="projects/php")
-            s.stmt_fusion = stmt_fusion
-            s.dataflow_fusion = dataflow_fusion
-            s.all_fusion = all_fusion
-            strategies.append(s)
+            if dataflow_fusion:
+                strategies.append(PHPFusionStrategy(project_root="projects/php"))
+            if declaration_fusion:
+                strategies.append(PHPDeclarationFusionStrategy(project_root="projects/php"))
+            if state_fusion:
+                strategies.append(PHPStateFusionStrategy(project_root="projects/php"))
         return strategies
 
     if project_name == "clang":
         if os.path.exists("projects/clang"):
-            s = ClangFusionStrategy(project_root="projects/clang")
-            s.stmt_fusion = stmt_fusion
-            s.dataflow_fusion = dataflow_fusion
-            s.all_fusion = all_fusion
-            strategies.append(s)
+            if dataflow_fusion:
+                strategies.append(ClangFusionStrategy(project_root="projects/clang"))
+            if declaration_fusion:
+                strategies.append(ClangDeclarationFusionStrategy(project_root="projects/clang"))
+            if state_fusion:
+                strategies.append(ClangStateFusionStrategy(project_root="projects/clang"))
         return strategies
 
     if project_name == "flang":
         if os.path.exists("projects/flang"):
-            s = FlangFusionStrategy(project_root="projects/flang")
-            s.stmt_fusion = stmt_fusion
-            s.dataflow_fusion = dataflow_fusion
-            s.all_fusion = all_fusion
-            strategies.append(s)
+            if dataflow_fusion:
+                strategies.append(FlangFusionStrategy(project_root="projects/flang"))
+            if declaration_fusion:
+                strategies.append(FlangDeclarationFusionStrategy(project_root="projects/flang"))
+            if state_fusion:
+                strategies.append(FlangStateFusionStrategy(project_root="projects/flang"))
         return strategies
 
     if project_name == "cpython":
         if os.path.exists("projects/cpython"):
-            strategies.append(CPythonFusionStrategy(project_root="projects/cpython"))
+            if dataflow_fusion:
+                strategies.append(CPythonFusionStrategy(project_root="projects/cpython"))
+            if declaration_fusion:
+                strategies.append(CPythonDeclarationFusionStrategy(project_root="projects/cpython"))
+            if state_fusion:
+                strategies.append(CPythonStateFusionStrategy(project_root="projects/cpython"))
         return strategies
 
     if project_name == "mlir":
         if os.path.exists("projects/mlir"):
-            strategies.append(MLIRFusionStrategy(project_root="projects/mlir"))
+            if dataflow_fusion:
+                strategies.append(MLIRFusionStrategy(project_root="projects/mlir"))
+            if declaration_fusion:
+                strategies.append(MLIRDeclarationFusionStrategy(project_root="projects/mlir"))
+            if state_fusion:
+                strategies.append(MLIRStateFusionStrategy(project_root="projects/mlir"))
         return strategies
 
     if project_name == "rust":
         if os.path.exists("projects/rust"):
-            if struct_fusion:
-                strategies.append(RustStructFusionStrategy(project_root="projects/rust"))
-            else:
+            if dataflow_fusion:
                 strategies.append(RustFusionStrategy(project_root="projects/rust"))
-        return strategies
-
-    if project_name == "go":
-        if os.path.exists("projects/go"):
-            strategies.append(GoFusionStrategy(project_root="projects/go"))
-        return strategies
-
-    if project_name == "naga":
-        if os.path.exists("projects/naga"):
-            strategies.append(WGSLFusionStrategy(project_root="projects/naga"))
-        return strategies
-    
-    if project_name == "wgslc":
-        if os.path.exists("projects/wgslc"):
-            strategies.append(WGSLFusionStrategy(project_root="projects/wgslc"))
-        return strategies
-
-    if project_name == "lean":
-        if os.path.exists("projects/lean"):
-            strategies.append(LeanFusionStrategy(project_root="projects/lean"))
-        return strategies
-
-    if project_name == "v8":
-        if os.path.exists("projects/v8"):
-            strategies.append(V8FusionStrategy(project_root="projects/v8"))
+            # --struct-fusion is Rust's original name for this project's
+            # declaration-fusion strategy; --declaration-fusion is accepted
+            # as an alias so the flag name is consistent across projects.
+            if struct_fusion or declaration_fusion:
+                strategies.append(RustStructFusionStrategy(project_root="projects/rust"))
         return strategies
 
     if project_name == "swift":
         if os.path.exists("projects/swift"):
-            strategies.append(SwiftFusionStrategy(project_root="projects/swift"))
+            if dataflow_fusion:
+                strategies.append(SwiftFusionStrategy(project_root="projects/swift"))
+            if declaration_fusion:
+                strategies.append(SwiftDeclarationFusionStrategy(project_root="projects/swift"))
+            if state_fusion:
+                strategies.append(SwiftStateFusionStrategy(project_root="projects/swift"))
         return strategies
 
-    # Fallback / Legacy behavior (Load all found)
-    if os.path.exists("projects/php"):
-        strategies.append(PHPFusionStrategy(project_root="projects/php"))
-    if os.path.exists("projects/cpython"):
-        strategies.append(CPythonFusionStrategy(project_root="projects/cpython"))
-    if os.path.exists("projects/mlir"):
-        strategies.append(MLIRFusionStrategy(project_root="projects/mlir"))
-    if os.path.exists("projects/rust"):
-        strategies.append(RustFusionStrategy(project_root="projects/rust"))
-    if os.path.exists("projects/go"):
-        strategies.append(GoFusionStrategy(project_root="projects/go"))
+    # Fallback / Legacy behavior — only for the "no project specified" case;
+    # an unrecognized (or removed) project_name falls through to here too if
+    # we don't guard it, and would otherwise silently get an arbitrary mix
+    # of other languages' strategies instead of the empty pool the caller
+    # should see (main.py fails fast on an empty pool).
+    if project_name is None:
+        if os.path.exists("projects/php"):
+            strategies.append(PHPFusionStrategy(project_root="projects/php"))
+        if os.path.exists("projects/cpython"):
+            strategies.append(CPythonFusionStrategy(project_root="projects/cpython"))
+        if os.path.exists("projects/mlir"):
+            strategies.append(MLIRFusionStrategy(project_root="projects/mlir"))
+        if os.path.exists("projects/rust"):
+            strategies.append(RustFusionStrategy(project_root="projects/rust"))
     return strategies

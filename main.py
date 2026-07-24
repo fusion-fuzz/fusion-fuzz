@@ -62,28 +62,48 @@ if __name__ == "__main__":
     parser.add_argument("--gcov", action="store_true", default=False,
                         help="After fuzzing, collect and print gcov line coverage information")
     parser.add_argument("--dataflow-fusion", action="store_true", default=False,
-                        help="Enable dataflow fusion (bridge variable linking). "
-                             "Each fusion randomly picks A->B or B->A direction.")
-    parser.add_argument("--all-fusion", action="store_true", default=False,
-                        help="Generate all 4 fusion variants per pair (stmt A→B, stmt B→A, "
-                             "dataflow A+B, dataflow B+A). Each pair counts as one iteration.")
+                        help="Enable dataflow fusion: bridge variable linking via def-use graph. "
+                             "Each fusion randomly picks A->B or B->A direction. Combinable with "
+                             "--state-fusion/--declaration-fusion — every technique you enable is "
+                             "added to the same pool and one is picked at random per iteration. "
+                             "If none of --dataflow-fusion/--state-fusion/--declaration-fusion are "
+                             "given, dataflow fusion is enabled by default.")
     parser.add_argument("--struct-fusion", action="store_true", default=False,
                         help="[rust only] Item-level fusion: nest struct/enum/trait/impl/fn "
                              "definitions from one seed inside a container (mod/fn body) found "
                              "in the other, plus supertrait injection, impl grafting, and "
-                             "generic bound injection. Does not use statement/dataflow fusion.")
+                             "generic bound injection. Does not use statement/dataflow fusion. "
+                             "Alias of --declaration-fusion for rust.")
     parser.add_argument("--state-fusion", action="store_true", default=False,
-                        help="Enable the alternate (non-dataflow) fusion mode, meaning differs "
-                             "by project. [php/clang/flang] Statement fusion: dependency-graph "
-                             "interleave of one seed's statements into the other. [haskell] "
-                             "Effectful state fusion: builds a harness where both seeds' entry "
-                             "actions would run concurrently via forkIO, racing on one shared "
-                             "top-level IORef/MVar/TVar cell. Note: the haskell driver is "
-                             "compile-only (ghc -fno-code, never links/runs), so this currently "
-                             "only exercises GHC's handling of concurrent-looking code, not "
-                             "actual runtime races. Each fusion randomly picks A->B or B->A "
-                             "direction. Without this flag, php/clang/flang/haskell all default "
-                             "to dataflow fusion (bridging a value through a shared variable/CAF).")
+                        help="[php/cpython/clang/flang/swift/haskell/mlir] Enable the state-of-"
+                             "interest-driven fusion strategy (core/state_analysis.py): profiles "
+                             "each seed for program points near a resource release, type "
+                             "conversion, or exception boundary, then grafts one seed's "
+                             "continuation into the other's state at one such point instead of "
+                             "only bridging a single value. Combinable with --dataflow-fusion/"
+                             "--declaration-fusion — every technique you enable is added to the "
+                             "same pool and one is picked at random per iteration. "
+                             "[haskell/mlir] least/moderately verified — no local ghc/mlir-opt "
+                             "toolchain to compile-check against in this repo's dev environment; "
+                             "clang/cpython were checked against g++ and ast.parse respectively.")
+    parser.add_argument("--declaration-fusion", action="store_true", default=False,
+                        help="Enable declaration fusion: confuse declarations rather than "
+                             "dataflow by making an extensible declaration expression in one seed "
+                             "(base class list, template parameter, generic/trait/superclass "
+                             "bound, operand type constraint) refer to a declaration in the other "
+                             "seed. Triggers on declare/compile alone, no runtime dataflow needed. "
+                             "Combinable with --dataflow-fusion/--state-fusion — every technique "
+                             "you enable is added to the same pool and one is picked at random per "
+                             "iteration. "
+                             "[rust] alias of --struct-fusion (item nesting, supertrait/impl/"
+                             "bound injection). [clang] base class + template param injection, "
+                             "item nesting. [php] implements/extends + trait-use injection. "
+                             "[swift] protocol conformance injection. [cpython] extra base-class "
+                             "injection (MRO/metaclass conflicts at class-statement time). "
+                             "[haskell] typeclass superclass constraint injection. [flang] "
+                             "derived-type EXTENDS() injection. [mlir] function-signature operand/"
+                             "result type swap (verified structurally only, no compiler in this "
+                             "repo's dev environment for haskell/flang/swift/mlir/php).")
     parser.add_argument("--corpus-size", type=int, default=None, metavar="N",
                         help="Sample N seeds from the loaded corpus for fusion "
                              "instead of using all seed programs")
@@ -122,11 +142,6 @@ if __name__ == "__main__":
             config["execution"] = {}
         config["execution"]["concurrency"] = args.concurrency
         logger.info(f"Overriding execution concurrency to {args.concurrency}")
-
-    # 2. Connect to Database
-    # from core.database import SeedStorage
-    # db_path = f"output/{args.project}.db"
-    # storage = SeedStorage(db_path)
 
     # === BUG CORPUS MODE ===
     # Maps project name to canonical language key stored in corpus translations JSON
@@ -364,6 +379,7 @@ if __name__ == "__main__":
     #    Only runs when --dry-run is passed; otherwise all loaded seeds are used.
     _max_workers = config.get("execution", {}).get("concurrency", 4)
 
+    _baseline_valid_rate = None
     if args.dry_run:
         from core.driver import get_driver
         from core.dryrun import run_dryrun_with_metadata
@@ -381,21 +397,43 @@ if __name__ == "__main__":
             force          = args.setup,
         )
         logger.info(f"Using {len(_valid_corpus)}/{len(initial_corpus)} valid seeds for fuzzing.")
+        if initial_corpus:
+            # Baseline for the validity-gap metric: how many *original*,
+            # unfused seeds this target already accepts on their own. Fusion's
+            # valid-rate is later compared against this to gauge how much of
+            # the invalidity is coming from the fusion mapping itself rather
+            # than the language's inherent rejection rate.
+            _baseline_valid_rate = 100.0 * len(_valid_corpus) / len(initial_corpus)
+            logger.info(f"Baseline (unfused) valid rate: {_baseline_valid_rate:.1f}%")
     else:
         _valid_corpus = initial_corpus
         logger.info(f"Using all {len(_valid_corpus)} seeds for fuzzing (pass --dry-run to filter).")
 
     # 6. Initialize & Run Orchestrator
+    _strategies = get_strategies(args.project,
+                                 dataflow_fusion=args.dataflow_fusion,
+                                 struct_fusion=args.struct_fusion,
+                                 declaration_fusion=args.declaration_fusion,
+                                 state_fusion=args.state_fusion)
+    if not _strategies:
+        requested = [name for flag, name in [
+            (args.dataflow_fusion, "--dataflow-fusion"),
+            (args.declaration_fusion, "--declaration-fusion"),
+            (args.state_fusion, "--state-fusion"),
+            (args.struct_fusion, "--struct-fusion"),
+        ] if flag]
+        logger.error(
+            f"No fusion strategy available for --project {args.project} with "
+            f"{' '.join(requested) or '(default)'} — this project doesn't support "
+            "the requested technique(s). See --help for which flags each project supports."
+        )
+        sys.exit(1)
+
     fuzzer = FusionFuzzLoop(
         config=config,
-        strategies=get_strategies(args.project,
-                                  stmt_fusion=args.state_fusion,
-                                  dataflow_fusion=args.dataflow_fusion,
-                                  all_fusion=args.all_fusion,
-                                  struct_fusion=args.struct_fusion,
-                                  state_fusion=args.state_fusion),
+        strategies=_strategies,
         initial_corpus=_valid_corpus,
-        all_fusion=args.all_fusion,
+        baseline_valid_rate=_baseline_valid_rate,
     )
     
     # === GCOV RESET (before fuzzing) ===

@@ -49,23 +49,6 @@ class LLMGenerator:
             elif not HAS_OPENAI_LIB:
                 logger.warning(f"{self.provider} provider selected but 'openai' library not found. Falling back to requests.")
 
-        # Prompt Engineering
-        self.gen_prompt_template = llm_config.get("gen_prompt", (
-            f"Write a sophisticated unit test case for the {self.project_name} project. "
-            "Focus on edge cases, boundary conditions, or complex interactions. "
-            "Output ONLY the raw code (e.g., .phpt format for PHP) without markdown formatting."
-        ))
-
-        self.imp_prompt_template = llm_config.get("imp_prompt", (
-            f"Refactor the following {self.project_name} test case to be more suitable for fuzzing seeds.\n"
-            "1. Remove all comments and docstrings.\n"
-            "2. Flatten nested control flow structures where possible.\n"
-            "3. Shorten variable names to standard conventions (e.g. v1, v2).\n"
-            "4. Keep the logic semantically equivalent.\n"
-            "Output ONLY the raw code without markdown formatting.\n\n"
-            "Code:\n{code}"
-        ))
-
     def _clean_response(self, text):
         """
         Removes Markdown code blocks if present.
@@ -255,37 +238,6 @@ class LLMGenerator:
 
         if raw_text:
             return self._clean_response(raw_text)
-        return None
-
-    def generate(self):
-        """Generates a new seed from scratch."""
-        code = self._call_api(self.gen_prompt_template)
-        if code:
-            return Seed(
-                content=code,
-                metadata={
-                    "type": "llm_generated",
-                    "model": self.model,
-                    "provider": self.provider,
-                    "description": "On-the-fly LLM generation"
-                }
-            )
-        return None
-
-    def improve(self, seed_content):
-        """Improves an existing seed."""
-        prompt = self.imp_prompt_template.replace("{code}", seed_content)
-        code = self._call_api(prompt)
-        if code:
-            return Seed(
-                content=code,
-                metadata={
-                    "type": "llm_improved",
-                    "model": self.model,
-                    "provider": self.provider,
-                    "description": "LLM Refactored Seed"
-                }
-            )
         return None
 
     def refine(self, code: str, lang: str, avoid: list[str], extra_constraints: str = "") -> "Seed | None":

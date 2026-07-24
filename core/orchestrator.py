@@ -17,7 +17,6 @@ from .driver import get_driver, DockerDriver
 from .fusion import Seed
 from .utils import smart_truncate
 from .coverage import PairwiseCoverageMatrix
-# from .llmgen import LLMGenerator
 
 logger = logging.getLogger("FFL.Orchestrator")
 
@@ -53,9 +52,16 @@ def _extract_display_code(content: str, ext: str) -> tuple[str, str]:
     return content, ext.lstrip(".")
 
 class FusionFuzzLoop:
-    def __init__(self, config, strategies, initial_corpus, all_fusion=False):
+    def __init__(self, config, strategies, initial_corpus, baseline_valid_rate=None):
         self.config = config
         self.strategies = strategies
+
+        # Validity-gap metric: % of *original* (unfused) seeds accepted without
+        # error by the target, captured once via --dry-run before fuzzing starts.
+        # Compared against the running fused valid-rate to gauge how much the
+        # state/declaration recognition mapping for this language is losing to
+        # malformed fusions vs. the language's own baseline rejection rate.
+        self.baseline_valid_rate = baseline_valid_rate
         
         # Sanitize corpus: Ensure everything is a Seed object
         self.corpus = []
@@ -80,14 +86,9 @@ class FusionFuzzLoop:
 
         # Initialize the specific driver (e.g., PHPDriver) via factory
         self.driver = get_driver(config)
-        self.all_fusion = all_fusion
         self.iterations = 0
         self.project_name = config.get("project_name", "default_project")
-        
-        # Initialize LLM Generator
-        # self.llm_generator = LLMGenerator(config)
-        # self.llm_rate = config.get("llm", {}).get("rate", 0.05)
-        
+
         # Track unique crash signatures to avoid duplicates
         self.unique_crashes = set()
         self._load_existing_crashes()
@@ -151,34 +152,20 @@ class FusionFuzzLoop:
         Worker function to handle Selection, Fusion, and Execution.
         Executed in a separate thread.
         """
-        child = None
+        parent_a, parent_b = self.select_parents()
 
-        # --- BRANCH A: LLM Generation (Probabilistic) ---
-        # if self.llm_generator.api_key and random.random() < self.llm_rate:
-        #     try:
-        #         child = self.llm_generator.generate()
-        #         if child:
-        #             logger.info("Generated new seed via LLM.")
-        #     except Exception as e:
-        #         logger.warning(f"LLM generation skipped due to error: {e}")
+        if not parent_a or not parent_b:
+            return [(None, None)]
 
-        # --- BRANCH B: Standard Fusion (Default) ---
-
-        if not child:
-            parent_a, parent_b = self.select_parents()
-
-            if not parent_a or not parent_b:
-                return [(None, None)]
-
-            try:
-                strategy = random.choice(self.strategies)
-                if hasattr(strategy, 'fuse_bidirectional'):
-                    children = strategy.fuse_bidirectional(parent_a, parent_b)
-                else:
-                    children = [strategy.fuse(parent_a, parent_b)]
-            except Exception as e:
-                logger.warning(f"Fusion error: {e}")
-                return [(None, None)]
+        try:
+            strategy = random.choice(self.strategies)
+            if hasattr(strategy, 'fuse_bidirectional'):
+                children = strategy.fuse_bidirectional(parent_a, parent_b)
+            else:
+                children = [strategy.fuse(parent_a, parent_b)]
+        except Exception as e:
+            logger.warning(f"Fusion error: {e}")
+            return [(None, None)]
 
         # 3. Execute
         pairs = []
@@ -190,39 +177,6 @@ class FusionFuzzLoop:
                 logger.error(f"Execution driver error: {e}")
                 pairs.append((None, None))
         return pairs
-
-    def process_iteration_all_fusion(self) -> List[Tuple[Optional[Seed], Optional[object]]]:
-        """All-fusion mode: select one pair, produce 4 variants, execute all.
-        Returns a list of (child, result) tuples."""
-        parent_a, parent_b = self.select_parents()
-        if not parent_a or not parent_b:
-            return [(None, None)]
-
-        strategy = random.choice(self.strategies)
-        if not hasattr(strategy, 'fuse_all'):
-            try:
-                child = strategy.fuse(parent_a, parent_b)
-                result = self.driver.execute(child)
-                return [(child, result)]
-            except Exception as e:
-                logger.warning(f"Fusion error: {e}")
-                return [(None, None)]
-
-        try:
-            children = strategy.fuse_all(parent_a, parent_b)
-        except Exception as e:
-            logger.warning(f"All-fusion error: {e}")
-            return [(None, None)]
-
-        results = []
-        for child in children:
-            try:
-                result = self.driver.execute(child)
-                results.append((child, result))
-            except Exception as e:
-                logger.error(f"Execution driver error: {e}")
-                results.append((None, None))
-        return results
 
     def _extract_crash_signature(self, result) -> Optional[str]:
         """
@@ -359,8 +313,6 @@ class FusionFuzzLoop:
         elif "mlir" in self.project_name: ext = ".mlir"
         elif "swift" in self.project_name: ext = ".swift"
         elif "rust" in self.project_name: ext = ".rs"
-        elif "naga" in self.project_name or "wgslc" in self.project_name: ext = ".wgsl"
-        elif "go" in self.project_name: ext = ".go"
         elif "clang" in self.project_name or "gcc" in self.project_name:
             # C/C++/Obj-C are all valid here — a blanket ".c" mislabels C++
             # seeds (test.sh still records the real "clang++ ... -std=c++20"
@@ -687,36 +639,78 @@ class FusionFuzzLoop:
 
         return False
 
+    def _fused_valid_rate(self):
+        """% of fused samples accepted without a syntax/parse error."""
+        if self.sample_count == 0:
+            return 100.0
+        return 100.0 * (1.0 - (self.syntax_error_count / self.sample_count))
+
+    def _validity_gap(self):
+        """
+        Validity gap = baseline_valid_rate - fused_valid_rate.
+
+        A large positive gap means fusion is producing far more invalid
+        programs than the language's own seeds do on their own — a signal
+        that the per-language state-of-interest / declaration-expression
+        mapping needs refinement for this target (see
+        core/state_analysis.py and core/llm_mapping.py). None when no
+        baseline was collected (i.e. fuzzer was run without --dry-run).
+        """
+        if self.baseline_valid_rate is None or self.sample_count == 0:
+            return None
+        return self.baseline_valid_rate - self._fused_valid_rate()
+
+    def _persist_validity_gap(self):
+        """Write current validity-gap stats to output/<project>_validity_gap.json."""
+        gap = self._validity_gap()
+        if self.baseline_valid_rate is None:
+            return
+        try:
+            import json
+            os.makedirs(os.path.join(self.original_cwd, "output"), exist_ok=True)
+            path = os.path.join(self.original_cwd, "output", f"{self.project_name}_validity_gap.json")
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump({
+                    "project": self.project_name,
+                    "baseline_valid_rate": round(self.baseline_valid_rate, 2),
+                    "fused_valid_rate": round(self._fused_valid_rate(), 2),
+                    "validity_gap": round(gap, 2) if gap is not None else None,
+                    "sample_count": self.sample_count,
+                    "updated_at": datetime.datetime.now().isoformat(timespec="seconds"),
+                }, f, indent=2)
+        except Exception as e:
+            logger.debug(f"Could not persist validity gap: {e}")
+
     def _print_status(self):
         """Prints a dynamic status bar to stdout."""
         current_time = time.time()
         # Update UI max 2 times per second
         if current_time - self.last_status_print < 0.5:
             return
-        
+
         self.last_status_print = current_time
         elapsed = current_time - self.start_time
         if elapsed <= 0: elapsed = 1e-9
-        
+
         throughput = self.sample_count / elapsed
 
-        valid_rate = 100.0
-        if self.sample_count > 0:
-            valid_rate = 100.0 * (1.0 - (self.syntax_error_count / self.sample_count))
+        valid_rate = self._fused_valid_rate()
 
         n = len(self.corpus)
         total_pairs = n * (n - 1) // 2
         covered = self.coverage.covered_count()
         cov_pct = (covered / total_pairs * 100.0) if total_pairs > 0 else 100.0
         pairs_per_sec = covered / elapsed
+        gap = self._validity_gap()
+        gap_segment = f" | ValidityGap: {gap:+.1f}pp" if gap is not None else ""
         status = (
             f"\r[ {str(datetime.timedelta(seconds=int(elapsed)))} ] "
             f"Throughput: {throughput:.1f} tests/s | "
             f"Bugs: {len(self.unique_crashes)} | "
-            f"FuseValidRate: {valid_rate:.1f}% | "
+            f"FuseValidRate: {valid_rate:.1f}%{gap_segment} | "
             f"PairCov: {covered}/{total_pairs} ({cov_pct:.1f}%, {pairs_per_sec:.1f} pairs/s)"
         )
-        
+
         # Write carriage return to overwrite line
         sys.stdout.write(status)
         sys.stdout.flush()
@@ -854,7 +848,7 @@ class FusionFuzzLoop:
                 # REPLENISH PHASE
                 # Submit tasks only if not rotating
                 while len(active_futures) < max_workers and should_submit() and not rotate_pending:
-                    f = executor.submit(self.process_iteration_all_fusion if self.all_fusion else self.process_iteration)
+                    f = executor.submit(self.process_iteration)
                     active_futures.add(f)
                     submitted_count += 1
                 
@@ -909,6 +903,10 @@ class FusionFuzzLoop:
                                 # Periodic GC
                                 if self.iterations % 2000 == 0:
                                     gc.collect()
+
+                                # Periodic validity-gap snapshot
+                                if self.iterations % 2000 == 0:
+                                    self._persist_validity_gap()
 
                                 pairs = future.result()
 
@@ -987,6 +985,14 @@ class FusionFuzzLoop:
                     self._sample_log_file.close()
                 except Exception:
                     pass
+            self._persist_validity_gap()
+            gap = self._validity_gap()
+            if gap is not None:
+                logger.info(
+                    f"Validity gap: baseline={self.baseline_valid_rate:.1f}% "
+                    f"fused={self._fused_valid_rate():.1f}% gap={gap:+.1f}pp "
+                    f"(output/{self.project_name}_validity_gap.json)"
+                )
 
         # 3. Cleanup Workspace
         os.chdir(self.original_cwd)

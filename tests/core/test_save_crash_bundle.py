@@ -102,8 +102,6 @@ class TestReproducerFiles(unittest.TestCase):
     def test_rust(self):     self._check("rust",    ".rs")
     def test_mlir(self):     self._check("mlir",    ".mlir")
     def test_swift(self):    self._check("swift",   ".swift")
-    def test_wgsl(self):     self._check("naga",    ".wgsl")
-    def test_go(self):       self._check("go",      ".go")
     def test_fallback_txt(self): self._check("unknown", ".txt")
 
     def test_no_reproduce_file_created(self):
