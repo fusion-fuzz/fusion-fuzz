@@ -6583,6 +6583,34 @@ class FlangDeclarationFusionStrategy(FlangFusionStrategy):
         ]
 
 
+class LFortranFusionStrategy(FlangFusionStrategy):
+    """
+    LFortran fusion strategy. LFortran and flang are both plain Fortran
+    frontends fuzzing off the exact same seed corpus (see
+    projects/lfortran/config.yaml) — FlangFusionStrategy's splitter and
+    dataflow-bridging logic operates purely on Fortran source syntax with
+    no LLVM/flang-specific behavior, so it's reused as-is; only the
+    default project_root differs.
+    """
+
+    def __init__(self, project_root="projects/lfortran"):
+        super().__init__(project_root=project_root)
+
+
+class LFortranStateFusionStrategy(FlangStateFusionStrategy):
+    """State fusion for LFortran — see LFortranFusionStrategy."""
+
+    def __init__(self, project_root="projects/lfortran"):
+        super().__init__(project_root=project_root)
+
+
+class LFortranDeclarationFusionStrategy(FlangDeclarationFusionStrategy):
+    """Declaration fusion for LFortran — see LFortranFusionStrategy."""
+
+    def __init__(self, project_root="projects/lfortran"):
+        super().__init__(project_root=project_root)
+
+
 # ==========================================
 # Strategy Factory (Updated)
 # ==========================================
@@ -6592,14 +6620,24 @@ def get_strategies(project_name=None, dataflow_fusion=False,
     """
     Build the pool of fusion strategies for `project_name`. Each of
     dataflow_fusion/state_fusion/declaration_fusion independently adds its
-    matching strategy (where the project has one) to the pool — the
-    orchestrator picks one at random per iteration (core/orchestrator.py's
-    process_iteration). Pass any combination to run several techniques
-    side by side; pass none to get the default (dataflow fusion only).
+    matching strategy (where the project has one) to the pool.
+    core/orchestrator.py's process_iteration then *combines* techniques
+    from that pool on the same parent pair instead of picking just one:
+    one technique always applies, a second layers on top 50% of the
+    time, and a third layers on top of that 25% of the time. Pass any
+    subset of the flags to restrict the pool (e.g. --dataflow-fusion
+    alone always yields a chain of length 1, same as before); pass none
+    to get the default, which is now every technique the project
+    supports (so combined fusion is on by default) rather than dataflow
+    fusion alone.
     """
-    # Default: if no technique is explicitly requested, enable dataflow fusion.
+    # Default: if no technique is explicitly requested, enable every
+    # technique the project has — process_iteration's chaining is what
+    # actually varies how many of them apply to a given child.
     if not dataflow_fusion and not declaration_fusion and not state_fusion and not struct_fusion:
         dataflow_fusion = True
+        declaration_fusion = True
+        state_fusion = True
 
     strategies = []
 
@@ -6641,6 +6679,16 @@ def get_strategies(project_name=None, dataflow_fusion=False,
                 strategies.append(FlangDeclarationFusionStrategy(project_root="projects/flang"))
             if state_fusion:
                 strategies.append(FlangStateFusionStrategy(project_root="projects/flang"))
+        return strategies
+
+    if project_name == "lfortran":
+        if os.path.exists("projects/lfortran"):
+            if dataflow_fusion:
+                strategies.append(LFortranFusionStrategy(project_root="projects/lfortran"))
+            if declaration_fusion:
+                strategies.append(LFortranDeclarationFusionStrategy(project_root="projects/lfortran"))
+            if state_fusion:
+                strategies.append(LFortranStateFusionStrategy(project_root="projects/lfortran"))
         return strategies
 
     if project_name == "cpython":

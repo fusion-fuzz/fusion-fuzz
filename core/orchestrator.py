@@ -147,10 +147,48 @@ class FusionFuzzLoop:
         """Select two parents from the corpus, preferring unfused pairs."""
         return self.coverage.select_parents(self.corpus)
 
+    # Chain-layering odds for process_iteration's technique combining: the
+    # first technique in the chain always applies; each subsequent slot
+    # applies only with its own probability, and only if the slot before
+    # it was filled (so a third technique never appears without a second).
+    _CHAIN_LAYER_ODDS = [0.5, 0.25]
+
+    def _pick_strategy_chain(self) -> List:
+        """
+        Choose 1-3 distinct strategies from self.strategies to combine on
+        the same parent pair: the first is always used, a second (distinct)
+        strategy layers on top 50% of the time, and — only if a second was
+        picked — a third (distinct) strategy layers on top of that 25% of
+        the time. With a pool of size 1 (e.g. --dataflow-fusion passed
+        alone) this always degenerates to a chain of length 1, matching the
+        old single-strategy behavior.
+        """
+        remaining = list(self.strategies)
+        first = random.choice(remaining)
+        chain = [first]
+        remaining.remove(first)
+
+        for odds in self._CHAIN_LAYER_ODDS:
+            if not remaining or random.random() >= odds:
+                break
+            nxt = random.choice(remaining)
+            chain.append(nxt)
+            remaining.remove(nxt)
+
+        return chain
+
     def process_iteration(self) -> List[Tuple[Optional[Seed], Optional[object]]]:
         """
         Worker function to handle Selection, Fusion, and Execution.
         Executed in a separate thread.
+
+        Fusion combines techniques rather than picking a single one:
+        _pick_strategy_chain layers 1-3 of the pool's strategies onto the
+        same parent pair. Every technique before the last in the chain
+        contributes one single-direction intermediate fuse (host <- donor)
+        that becomes the next technique's host; only the last technique
+        runs bidirectionally (producing both ab/ba children), if it
+        supports that.
         """
         parent_a, parent_b = self.select_parents()
 
@@ -158,11 +196,16 @@ class FusionFuzzLoop:
             return [(None, None)]
 
         try:
-            strategy = random.choice(self.strategies)
-            if hasattr(strategy, 'fuse_bidirectional'):
-                children = strategy.fuse_bidirectional(parent_a, parent_b)
+            chain = self._pick_strategy_chain()
+            host = parent_a
+            for strategy in chain[:-1]:
+                host = strategy.fuse(host, parent_b)
+
+            final_strategy = chain[-1]
+            if hasattr(final_strategy, 'fuse_bidirectional'):
+                children = final_strategy.fuse_bidirectional(host, parent_b)
             else:
-                children = [strategy.fuse(parent_a, parent_b)]
+                children = [final_strategy.fuse(host, parent_b)]
         except Exception as e:
             logger.warning(f"Fusion error: {e}")
             return [(None, None)]
@@ -319,7 +362,7 @@ class FusionFuzzLoop:
             # invocation against a file that no longer exists under that
             # name, so the saved reproducer silently can't be re-run).
             ext = seed.metadata.get("extension") or ".c"
-        elif "flang" in self.project_name:
+        elif "flang" in self.project_name or "fortran" in self.project_name:
             ext = seed.metadata.get("extension") or ".f90"
         elif "haskell" in self.project_name: ext = ".hs"
 
@@ -556,6 +599,18 @@ class FusionFuzzLoop:
                 )
                 subprocess.run(
                     ["pkill", "-9", "-x", "flang-22"],
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+                )
+            except Exception:
+                pass
+
+        # 3d. LFortran Cleanup — same `-x` requirement as flang/clang above:
+        # the orchestrator's own cmdline is `python3 main.py --project
+        # lfortran ...`, so `pkill -f lfortran` would self-kill.
+        if self.project_name == "lfortran":
+            try:
+                subprocess.run(
+                    ["pkill", "-9", "-x", "lfortran"],
                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
                 )
             except Exception:

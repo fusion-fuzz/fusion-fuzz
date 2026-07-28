@@ -75,7 +75,7 @@ if __name__ == "__main__":
                              "generic bound injection. Does not use statement/dataflow fusion. "
                              "Alias of --declaration-fusion for rust.")
     parser.add_argument("--state-fusion", action="store_true", default=False,
-                        help="[php/cpython/clang/flang/swift/haskell/mlir] Enable the state-of-"
+                        help="[php/cpython/clang/flang/lfortran/swift/haskell/mlir] Enable the state-of-"
                              "interest-driven fusion strategy (core/state_analysis.py): profiles "
                              "each seed for program points near a resource release, type "
                              "conversion, or exception boundary, then grafts one seed's "
@@ -100,10 +100,10 @@ if __name__ == "__main__":
                              "item nesting. [php] implements/extends + trait-use injection. "
                              "[swift] protocol conformance injection. [cpython] extra base-class "
                              "injection (MRO/metaclass conflicts at class-statement time). "
-                             "[haskell] typeclass superclass constraint injection. [flang] "
-                             "derived-type EXTENDS() injection. [mlir] function-signature operand/"
-                             "result type swap (verified structurally only, no compiler in this "
-                             "repo's dev environment for haskell/flang/swift/mlir/php).")
+                             "[haskell] typeclass superclass constraint injection. [flang/"
+                             "lfortran] derived-type EXTENDS() injection. [mlir] function-signature "
+                             "operand/result type swap (verified structurally only, no compiler in "
+                             "this repo's dev environment for haskell/flang/swift/mlir/php).")
     parser.add_argument("--corpus-size", type=int, default=None, metavar="N",
                         help="Sample N seeds from the loaded corpus for fusion "
                              "instead of using all seed programs")
