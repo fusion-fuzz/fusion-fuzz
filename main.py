@@ -448,6 +448,7 @@ if __name__ == "__main__":
             force            = args.setup,
             collect_metadata = args.pre_analysis,
             filter_valid     = args.dry_run,
+            project_name     = args.project,
         )
         logger.info(
             f"Using {len(_valid_corpus)}/{len(initial_corpus)} seeds for fuzzing"

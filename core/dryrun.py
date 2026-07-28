@@ -665,6 +665,7 @@ def run_dryrun_with_metadata(
     force: bool = False,
     collect_metadata: bool = True,
     filter_valid: bool = True,
+    project_name: Optional[str] = None,
 ) -> list:
     """
     Execute seeds that still need it — at most once each, even if both
@@ -682,7 +683,12 @@ def run_dryrun_with_metadata(
     db_path          : str | None  — path to corpus.db for metadata
                                      updates; pass None to skip persistence
     concurrency      : int         — parallel worker count
-    timeout          : int         — per-seed execution timeout (seconds)
+    timeout          : int         — per-seed execution timeout (seconds).
+                                     Bounds each individual seed's
+                                     subprocess (BaseDriver._run_command
+                                     kills the whole process group on
+                                     expiry) — but see project_name below
+                                     for why the pass can still stall.
     force            : bool        — if True, re-run even seeds that
                                      already satisfy the flags below
     collect_metadata : bool        — probe-instrument (where the language's
@@ -700,12 +706,36 @@ def run_dryrun_with_metadata(
                                      has run); this flag only controls
                                      whether the *return value* is filtered
                                      by it.
+    project_name     : str | None  — when given, periodically runs core/
+                                     driver.py's cleanup_stale_processes
+                                     (same one core/orchestrator.py's main
+                                     fuzzing loop calls every 2000
+                                     iterations): the per-seed timeout only
+                                     guarantees the host-side driver
+                                     process is killed, not a Docker-
+                                     contained or child process it spawned,
+                                     so a run touching many seeds can
+                                     accumulate leaked processes that
+                                     starve later executions until the
+                                     pass *looks* stuck even though each
+                                     individual timeout still fired. None
+                                     skips this (no project name to scope
+                                     pkill patterns to).
 
     Returns
     -------
     list[Seed] — enriched seeds; rc==0 only if filter_valid, else all of
                  them (still enriched with whatever ran).
     """
+    # Descriptive label for progress/log lines — reflects which pass(es)
+    # this call is actually doing instead of always saying "dry-run".
+    if collect_metadata and filter_valid:
+        label = "dry-run+pre-analysis"
+    elif collect_metadata:
+        label = "pre-analysis"
+    else:
+        label = "dry-run"
+
     # Split into "already satisfies what this call needs" and "must (re)run".
     already_done: list = []
     to_run:       list = []
@@ -726,16 +756,16 @@ def run_dryrun_with_metadata(
     skipped = len(seeds) - len(to_run)
     if skipped:
         logger.info(
-            f"  dry-run: {skipped} seeds already satisfy the requested "
+            f"  {label}: {skipped} seeds already satisfy the requested "
             f"pass(es) — skipping (pass force=True to re-run)"
         )
 
     if not to_run:
-        logger.info(f"  dry-run: nothing to execute, returning {len(already_done)} seeds.")
+        logger.info(f"  {label}: nothing to execute, returning {len(already_done)} seeds.")
         return already_done
 
     logger.info(
-        f"  dry-run: executing {len(to_run)} seeds "
+        f"  {label}: executing {len(to_run)} seeds "
         f"(metadata={collect_metadata}, filter={filter_valid}, "
         f"timeout={timeout}s, workers={concurrency})"
     )
@@ -744,6 +774,7 @@ def run_dryrun_with_metadata(
     from_run: list = []
     done_count = 0
     total = len(to_run)
+    _CLEANUP_EVERY = 500
 
     def _worker(seed):
         # Per-thread driver
@@ -795,7 +826,7 @@ def run_dryrun_with_metadata(
             try:
                 seed_out, rc, new_meta = fut.result()
             except Exception as e:
-                logger.debug(f"dry-run worker error for seed {seed.id}: {e}")
+                logger.debug(f"{label} worker error for seed {seed.id}: {e}")
                 done_count += 1
                 continue
 
@@ -813,12 +844,17 @@ def run_dryrun_with_metadata(
                 from_run.append(seed_out)
 
             done_count += 1
+            if project_name and done_count % _CLEANUP_EVERY == 0:
+                # See project_name's docstring note above — bounds leaked
+                # processes from accumulating across a long pass.
+                from .driver import cleanup_stale_processes
+                cleanup_stale_processes(project_name)
             if done_count % 500 == 0 or done_count == total:
-                logger.info(f"  dry-run progress: {done_count}/{total}")
+                logger.info(f"  {label} progress: {done_count}/{total}")
 
     result_seeds = already_done + from_run
     logger.info(
-        f"  dry-run complete: {len(result_seeds)}/{len(seeds)} seeds returned"
+        f"  {label} complete: {len(result_seeds)}/{len(seeds)} seeds returned"
         + (" (rc=0 only)" if filter_valid else " (unfiltered)")
     )
     return result_seeds
