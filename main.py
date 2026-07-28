@@ -38,7 +38,12 @@ if __name__ == "__main__":
     parser.add_argument("--project", type=str, default=None, help="Project name (folder in projects/)")
     parser.add_argument("--iterations", type=int, default=-1, help="Fuzzing iterations")
     parser.add_argument("--setup", action="store_true", default=False, help="Force project setup/seed parsing")
-    parser.add_argument("--preprocessing", action="store_true", default=False, help="Run seed preprocessing (dynamic info collection)")
+    parser.add_argument("--preprocessing", action="store_true", default=False,
+                        help="[cpython only] Run projects/cpython/preprocessing.py's dynamic "
+                             "tracing pass during --setup. Unrelated to --pre-analysis below "
+                             "(this is a cpython-specific setup-time step; --pre-analysis is "
+                             "the generic per-seed metadata pass used by every project's "
+                             "fusion strategies).")
     parser.add_argument("--bug-corpus", action="store_true", default=False,
                         help="Seed from ./corpus/corpus.db: inject pre-translated bug reproducers into the project corpus")
     parser.add_argument("--sample-log", type=str, default=None, nargs="?",
@@ -47,7 +52,23 @@ if __name__ == "__main__":
                         help="Log every sample's seed content + stdout/stderr. "
                              "Omit PATH to use default: output/<project>_samples.log")
     parser.add_argument("--dry-run", action="store_true", default=False,
-                        help="Execute every seed once before fuzzing to collect metadata and filter out non-zero-RC seeds")
+                        help="Execute every seed once before fuzzing and filter the corpus down "
+                             "to seeds whose own execution returns rc==0 (also computes the "
+                             "baseline valid rate used by the validity-gap metric). Does not "
+                             "collect fusion metadata by itself — pair with --pre-analysis for "
+                             "that; combined, they share one execution pass per seed rather "
+                             "than running it twice.")
+    parser.add_argument("--pre-analysis", action="store_true", default=False,
+                        help="Execute every seed once before fuzzing (probe-instrumented where "
+                             "a language needs one) and collect the metadata fusion strategies "
+                             "use at runtime: dataflow graphs, declared/observed variable types, "
+                             "and core/state_analysis.py's live-variable states of interest for "
+                             "state fusion. Does not filter the corpus by validity — pair with "
+                             "--dry-run for that. Required for --declaration-fusion/--struct-fusion "
+                             "(disabled otherwise, with a warning). Without it, --dataflow-fusion "
+                             "falls back to a lightweight on-the-fly random-variable-connect rule "
+                             "and --state-fusion falls back to picking any random line, for every "
+                             "project.")
     parser.add_argument("--concurrency", type=int, default=None, help="Override the number of threads for execution (default is from config.yaml)")
     parser.add_argument("--reduce", type=str, default=None, metavar="BUG_DIR",
                         help="Minimize a crash reproducer (test.<ext>) to min.<ext> using delta "
@@ -67,22 +88,29 @@ if __name__ == "__main__":
                              "--state-fusion/--declaration-fusion — every technique you enable is "
                              "added to the same pool and one is picked at random per iteration. "
                              "If none of --dataflow-fusion/--state-fusion/--declaration-fusion are "
-                             "given, dataflow fusion is enabled by default.")
+                             "given, dataflow fusion is enabled by default. Without --pre-analysis, "
+                             "falls back to a lightweight on-the-fly rule for every project: scan "
+                             "each side's variables straight from its source text and connect one "
+                             "uniformly random pair (no dependency graph, no type awareness).")
     parser.add_argument("--struct-fusion", action="store_true", default=False,
                         help="[rust only] Item-level fusion: nest struct/enum/trait/impl/fn "
                              "definitions from one seed inside a container (mod/fn body) found "
                              "in the other, plus supertrait injection, impl grafting, and "
                              "generic bound injection. Does not use statement/dataflow fusion. "
-                             "Alias of --declaration-fusion for rust.")
+                             "Alias of --declaration-fusion for rust. Requires --pre-analysis "
+                             "(disabled otherwise, with a warning).")
     parser.add_argument("--state-fusion", action="store_true", default=False,
                         help="[php/cpython/clang/flang/lfortran/swift/haskell/mlir] Enable the state-of-"
                              "interest-driven fusion strategy (core/state_analysis.py): profiles "
-                             "each seed for program points near a resource release, type "
-                             "conversion, or exception boundary, then grafts one seed's "
-                             "continuation into the other's state at one such point instead of "
-                             "only bridging a single value. Combinable with --dataflow-fusion/"
-                             "--declaration-fusion — every technique you enable is added to the "
-                             "same pool and one is picked at random per iteration. "
+                             "each seed for the point with the most live, still-in-scope variables, "
+                             "then grafts one seed's continuation into the other's state at that "
+                             "point instead of only bridging a single value. Combinable with "
+                             "--dataflow-fusion/--declaration-fusion — every technique you enable is "
+                             "added to the same pool and one is picked at random per iteration. "
+                             "Without --pre-analysis, falls back to picking any random line as the "
+                             "splice point instead. "
+                             "[haskell] always picks a random line regardless of --pre-analysis — "
+                             "its layout-based scoping doesn't fit the live-variable-count rule. "
                              "[haskell/mlir] least/moderately verified — no local ghc/mlir-opt "
                              "toolchain to compile-check against in this repo's dev environment; "
                              "clang/cpython were checked against g++ and ast.parse respectively.")
@@ -94,7 +122,9 @@ if __name__ == "__main__":
                              "seed. Triggers on declare/compile alone, no runtime dataflow needed. "
                              "Combinable with --dataflow-fusion/--state-fusion — every technique "
                              "you enable is added to the same pool and one is picked at random per "
-                             "iteration. "
+                             "iteration. Requires --pre-analysis (disabled otherwise, with a "
+                             "warning — not considered feasible without its richer per-seed "
+                             "metadata). "
                              "[rust] alias of --struct-fusion (item nesting, supertrait/impl/"
                              "bound injection). [clang] base class + template param injection, "
                              "item nesting. [php] implements/extends + trait-use injection. "
@@ -104,6 +134,17 @@ if __name__ == "__main__":
                              "lfortran] derived-type EXTENDS() injection. [mlir] function-signature "
                              "operand/result type swap (verified structurally only, no compiler in "
                              "this repo's dev environment for haskell/flang/swift/mlir/php).")
+    parser.add_argument("--dataflow-type-match", action="store_true", default=False,
+                        help="[clang/swift/mlir/rust/haskell/flang/lfortran] For dataflow "
+                             "fusion's bridge substitution: 90%% of the time, prefer a "
+                             "same-declared-type bridge pair (falling back to a random/"
+                             "type-agnostic pair when none of matching type exists), 10%% "
+                             "of the time deliberately pick a type-mismatched pair outright "
+                             "(stresses type-checker/verifier diagnostics). Off by default; "
+                             "each project's un-flagged behavior is unchanged. No effect on "
+                             "cpython/php (dynamically typed — dataflow fusion there always "
+                             "picks the bridge pair uniformly at random regardless of this "
+                             "flag).")
     parser.add_argument("--corpus-size", type=int, default=None, metavar="N",
                         help="Sample N seeds from the loaded corpus for fusion "
                              "instead of using all seed programs")
@@ -374,47 +415,64 @@ if __name__ == "__main__":
             save_subset(initial_corpus, args.save_subset)
             logger.info(f"Saved {len(initial_corpus)} selected seeds to {args.save_subset} for reuse via --load-subset.")
 
-    # 5. Corpus dry-run: execute every seed once, collect rich metadata,
-    #    persist it to the project corpus DB, and keep only rc=0 seeds.
-    #    Only runs when --dry-run is passed; otherwise all loaded seeds are used.
+    # 5. Corpus pre-run pass: execute seeds that need it once, optionally
+    #    filtering to rc=0 (--dry-run) and/or collecting rich fusion
+    #    metadata (--pre-analysis), persisting either to the project corpus
+    #    DB. Only runs when at least one of the two flags is passed;
+    #    otherwise all loaded seeds are used as-is.
     _max_workers = config.get("execution", {}).get("concurrency", 4)
 
     _baseline_valid_rate = None
-    if args.dry_run:
+    if args.dry_run or args.pre_analysis:
         from core.driver import get_driver
         from core.dryrun import run_dryrun_with_metadata
 
         logger.info(
-            f"Corpus dry-run: {len(initial_corpus)} seeds "
-            f"(timeout=5s, workers={_max_workers})"
+            f"Corpus pre-run pass: {len(initial_corpus)} seeds "
+            f"(dry-run={args.dry_run}, pre-analysis={args.pre_analysis}, "
+            f"timeout=5s, workers={_max_workers})"
         )
         _valid_corpus = run_dryrun_with_metadata(
-            seeds          = initial_corpus,
-            driver_factory = lambda: get_driver(config),
-            db_path        = project_corpus_path,
-            concurrency    = _max_workers,
-            timeout        = 5,
-            force          = args.setup,
+            seeds            = initial_corpus,
+            driver_factory   = lambda: get_driver(config),
+            db_path          = project_corpus_path,
+            concurrency      = _max_workers,
+            timeout          = 5,
+            force            = args.setup,
+            collect_metadata = args.pre_analysis,
+            filter_valid     = args.dry_run,
         )
-        logger.info(f"Using {len(_valid_corpus)}/{len(initial_corpus)} valid seeds for fuzzing.")
+        logger.info(
+            f"Using {len(_valid_corpus)}/{len(initial_corpus)} seeds for fuzzing"
+            + (" (filtered to rc=0)." if args.dry_run else " (unfiltered).")
+        )
         if initial_corpus:
             # Baseline for the validity-gap metric: how many *original*,
             # unfused seeds this target already accepts on their own. Fusion's
             # valid-rate is later compared against this to gauge how much of
-            # the invalidity is coming from the fusion mapping itself rather
-            # than the language's inherent rejection rate.
-            _baseline_valid_rate = 100.0 * len(_valid_corpus) / len(initial_corpus)
+            # the invalidity is coming from the fusion strategy itself rather
+            # than the language's inherent rejection rate. Computed from
+            # 'rc' directly (always recorded once a seed executes) rather
+            # than assuming _valid_corpus is already rc==0-filtered, since
+            # --pre-analysis alone leaves it unfiltered.
+            _valid_count = sum(1 for s in _valid_corpus if (s.metadata or {}).get("rc") == 0)
+            _baseline_valid_rate = 100.0 * _valid_count / len(initial_corpus)
             logger.info(f"Baseline (unfused) valid rate: {_baseline_valid_rate:.1f}%")
     else:
         _valid_corpus = initial_corpus
-        logger.info(f"Using all {len(_valid_corpus)} seeds for fuzzing (pass --dry-run to filter).")
+        logger.info(
+            f"Using all {len(_valid_corpus)} seeds for fuzzing "
+            "(pass --dry-run to filter, --pre-analysis to collect fusion metadata)."
+        )
 
     # 6. Initialize & Run Orchestrator
     _strategies = get_strategies(args.project,
                                  dataflow_fusion=args.dataflow_fusion,
                                  struct_fusion=args.struct_fusion,
                                  declaration_fusion=args.declaration_fusion,
-                                 state_fusion=args.state_fusion)
+                                 state_fusion=args.state_fusion,
+                                 dataflow_type_match=args.dataflow_type_match,
+                                 pre_analysis_enabled=args.pre_analysis)
     if not _strategies:
         requested = [name for flag, name in [
             (args.dataflow_fusion, "--dataflow-fusion"),

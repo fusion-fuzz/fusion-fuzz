@@ -5,11 +5,14 @@ import sqlite3
 import os
 import re
 import io
+import logging
 import tokenize
 import keyword
 from dataclasses import dataclass, field
 from typing import List, Dict, Any, Tuple
 from .mutation import BaseMutator, PHPMutator, CPythonMutator, RustMutator, HaskellMutator
+
+logger = logging.getLogger("FFL.Fusion")
 
 @dataclass
 class Seed:
@@ -26,9 +29,20 @@ class FusionStrategy(abc.ABC):
 # Helpers
 # ==========================================
 
+def pick_occurrence_count() -> int:
+    """
+    How many occurrences of a chosen bridge variable to replace in one
+    dataflow-fusion substitution: usually a single clean edge into B, rarely
+    two, almost never three — occasionally widening the bridge's reach
+    without making broad cross-contamination the common case.
+    """
+    return random.choices((1, 2, 3), weights=(89, 10, 1))[0]
+
 def replace_random_occurrence(s, old, new):
     """
-    Simple string replacement for non-sensitive contexts.
+    Simple string replacement for non-sensitive contexts. Replaces a
+    weighted-random number of occurrences (see pick_occurrence_count)
+    rather than always exactly one.
     """
     positions = []
     start = 0
@@ -42,35 +56,66 @@ def replace_random_occurrence(s, old, new):
     if not positions:
         return s
 
-    random_pos = random.choice(positions)
-    return s[:random_pos] + new + s[random_pos + len(old):]
+    n = min(pick_occurrence_count(), len(positions))
+    # Replace right-to-left so earlier offsets stay valid as we edit.
+    for pos in sorted(random.sample(positions, n), reverse=True):
+        s = s[:pos] + new + s[pos + len(old):]
+    return s
 
 def replace_random_occurrence_indented(s, old, new):
     """
     Context-aware replacement that respects indentation.
-    Vital for Python to prevent IndentationError.
+    Vital for Python to prevent IndentationError. Replaces a weighted-random
+    number of occurrences (see pick_occurrence_count) rather than always
+    exactly one.
     """
     matches = list(re.finditer(re.escape(old), s))
     if not matches:
         return s
 
-    match = random.choice(matches)
-    start, end = match.span()
+    n = min(pick_occurrence_count(), len(matches))
+    chosen = sorted(random.sample(matches, n), key=lambda m: m.start(), reverse=True)
 
-    line_start = s.rfind('\n', 0, start) + 1
-    line_content = s[line_start:start]
-    
-    indent_match = re.match(r'^(\s*)', line_content)
-    indent = indent_match.group(1) if indent_match else ""
+    for match in chosen:
+        start, end = match.span()
 
-    if '\n' in new:
-        lines = new.split('\n')
-        indented_new = lines[0] + '\n' + '\n'.join([indent + line for line in lines[1:]])
-        replacement = indented_new
-    else:
-        replacement = new
+        line_start = s.rfind('\n', 0, start) + 1
+        line_content = s[line_start:start]
 
-    return s[:start] + replacement + s[end:]
+        indent_match = re.match(r'^(\s*)', line_content)
+        indent = indent_match.group(1) if indent_match else ""
+
+        if '\n' in new:
+            lines = new.split('\n')
+            indented_new = lines[0] + '\n' + '\n'.join([indent + line for line in lines[1:]])
+            replacement = indented_new
+        else:
+            replacement = new
+
+        s = s[:start] + replacement + s[end:]
+    return s
+
+def replace_word_occurrences(s: str, old: str, new: str, ignorecase: bool = False) -> str:
+    """
+    Word-boundary-safe replacement — unlike PHP's `$`-sigil or MLIR's
+    `%`-sigil variables, bare identifiers (C, Swift, Fortran) have no
+    unambiguous prefix, so a naive substring replace can corrupt unrelated
+    identifiers or keywords that merely contain `old` as a substring (e.g.
+    replacing bare `r` would turn `struct` into `styuct`, or `for` into
+    `foy`). `ignorecase` is for Fortran, which is case-insensitive ('X' and
+    'x' are the same identifier). Replaces a weighted-random number of
+    occurrences (see pick_occurrence_count) rather than always exactly one.
+    """
+    flags = re.IGNORECASE if ignorecase else 0
+    matches = list(re.finditer(rf'(?<!\w){re.escape(old)}(?!\w)', s, flags))
+    if not matches:
+        return s
+    n = min(pick_occurrence_count(), len(matches))
+    chosen = sorted(random.sample(matches, n), key=lambda m: m.start(), reverse=True)
+    for match in chosen:
+        start, end = match.span()
+        s = s[:start] + new + s[end:]
+    return s
 
 # ==========================================
 # Python Fusion Helpers
@@ -123,30 +168,36 @@ def collect_bare_vars(src_text):
 
 def replace_one_b_occurrence(src_text, name, replacement):
     """
-    Replaces a variable in B with 'replacement', handling indentation context.
+    Replaces a weighted-random number of occurrences (see
+    pick_occurrence_count) of a variable in B with 'replacement', handling
+    indentation context for each.
     """
     if not name: return src_text, False
-    
+
     patt = re.compile(rf'(?<!\.)\b{re.escape(name)}\b(?!\s*\.)')
-    
+
     matches = list(patt.finditer(src_text))
     if not matches:
         return src_text, False
-    
-    match = random.choice(matches)
-    start, end = match.span()
-    
-    line_start = src_text.rfind('\n', 0, start) + 1
-    indent_match = re.match(r'^(\s*)', src_text[line_start:start])
-    indent = indent_match.group(1) if indent_match else ""
-    
-    final_repl = replacement
-    if '\n' in replacement:
-        lines = replacement.split('\n')
-        final_repl = lines[0] + '\n' + '\n'.join([indent + l for l in lines[1:]])
-    
-    new_text = src_text[:start] + final_repl + src_text[end:]
-    return new_text, True
+
+    n = min(pick_occurrence_count(), len(matches))
+    chosen = sorted(random.sample(matches, n), key=lambda m: m.start(), reverse=True)
+
+    for match in chosen:
+        start, end = match.span()
+
+        line_start = src_text.rfind('\n', 0, start) + 1
+        indent_match = re.match(r'^(\s*)', src_text[line_start:start])
+        indent = indent_match.group(1) if indent_match else ""
+
+        final_repl = replacement
+        if '\n' in replacement:
+            lines = replacement.split('\n')
+            final_repl = lines[0] + '\n' + '\n'.join([indent + l for l in lines[1:]])
+
+        src_text = src_text[:start] + final_repl + src_text[end:]
+
+    return src_text, True
 
 def mutate_constants_and_rhs_ops(src_text: str):
     # This logic is now handled by CPythonMutator in mutation.py
@@ -251,15 +302,57 @@ def mlir_strip_outer_module(src: str) -> str:
 # ==========================================
 
 class GenericDataflowStrategy(FusionStrategy):
-    def __init__(self, mutator: BaseMutator = None):
+    def __init__(self, mutator: BaseMutator = None, lightweight: bool = False):
         self.mut = mutator if mutator else BaseMutator()
         self.bridge_var_name = "fusion"
+        # --pre-analysis off: bypass whatever parse-time dataflow-graph
+        # metadata (dataflow1/dataflow2 below) this strategy would
+        # otherwise consume and do a fresh, on-the-fly variable scan +
+        # single random connect instead — see _lightweight_bridge.
+        self.lightweight = lightweight
 
     @abc.abstractmethod
     def format_assignment(self, lhs: str, rhs: str) -> str:
         pass
 
+    # --- lightweight (--pre-analysis off) fallback ----------------------
+
+    _LIGHTWEIGHT_VAR_RE = re.compile(r'\b[A-Za-z_]\w*\b')
+
+    def _lightweight_vars(self, code: str) -> List[str]:
+        """On-the-fly variable-name scan used in place of dataflow1/
+        dataflow2 when --pre-analysis is off. Subclasses override for
+        their own variable syntax (PHP's $var sigil, Fortran's
+        declarations, ...)."""
+        return self._LIGHTWEIGHT_VAR_RE.findall(code)
+
+    def _lightweight_replace(self, code: str, var: str, bridge: str) -> str:
+        """Substitute a weighted-random number of occurrences of `var`
+        with `bridge` in `code`. Subclasses override for identifier
+        syntax that needs word-boundary safety (bare C/Fortran
+        identifiers, where a substring replace could corrupt an unrelated
+        identifier)."""
+        return replace_random_occurrence(code, var, bridge)
+
+    def _lightweight_bridge(self, code1: str, code2: str):
+        """Very lightweight dataflow fusion for when --pre-analysis hasn't
+        populated dataflow1/dataflow2: scan each side's variables on the
+        fly (no dependency graph, no co-occurrence grouping) and connect
+        one uniformly random pair."""
+        vars1 = self._lightweight_vars(code1)
+        vars2 = self._lightweight_vars(code2)
+        if not vars1 or not vars2:
+            return code1, code2
+        var1 = random.choice(vars1)
+        var2 = random.choice(vars2)
+        bridge = self.bridge_var_name
+        code1 = code1 + f"\n{self.format_assignment(bridge, var1)}\n"
+        code2 = self._lightweight_replace(code2, var2, bridge)
+        return code1, code2
+
     def interleave_code_blocks(self, code1, code2, dataflow1, dataflow2, extra_flows=None):
+        if self.lightweight:
+            return self._lightweight_bridge(code1, code2)
         if not dataflow1 or not dataflow2:
             return code1, code2
 
@@ -308,8 +401,12 @@ class GenericDataflowStrategy(FusionStrategy):
 # ==========================================
 
 class PHPFusionStrategy(GenericDataflowStrategy):
-    def __init__(self, project_root="projects/php"):
-        super().__init__(mutator=PHPMutator())
+    # PHP variables carry a $ sigil, distinctive enough for the base
+    # class's plain substring _lightweight_replace to stay safe.
+    _LIGHTWEIGHT_VAR_RE = re.compile(r'\$[A-Za-z_]\w*')
+
+    def __init__(self, project_root="projects/php", lightweight: bool = False):
+        super().__init__(mutator=PHPMutator(), lightweight=lightweight)
         self.project_root = project_root
         self.bridge_var_name = "$fusion"
         self.apifuzz = True
@@ -1098,9 +1195,11 @@ class PHPStateFusionStrategy(PHPFusionStrategy):
         donor_code = self._resolve_name_conflicts(host_code, donor_code)
 
         host_point = pick_state_point(host_code, "php", self.project_root,
-                                       cached=(host.metadata or {}).get("states_of_interest"))
+                                       cached=(host.metadata or {}).get("states_of_interest"),
+                                       lightweight=self.lightweight)
         donor_point = pick_state_point(donor_code, "php", self.project_root,
-                                        cached=(donor.metadata or {}).get("states_of_interest"))
+                                        cached=(donor.metadata or {}).get("states_of_interest"),
+                                        lightweight=self.lightweight)
         if host_point is None:
             lines = host_code.splitlines()
             host_point = StatePoint(max(len(lines) - 1, 0), "fallback", "", "")
@@ -1262,19 +1361,17 @@ class PHPDeclarationFusionStrategy(PHPFusionStrategy):
 # ==========================================
 
 class CPythonFusionStrategy(FusionStrategy):
-    def __init__(self, project_root="projects/cpython"):
+    def __init__(self, project_root="projects/cpython", lightweight: bool = False):
         self.project_root = project_root
         self.mutation = True
         self.bridge_var_name = "fusion"
         self.mut = CPythonMutator()
-
-    def _are_types_compatible(self, types_a, types_b):
-        if not types_a.isdisjoint(types_b): return True
-        numerics = {'int', 'float', 'bool', 'complex'}
-        if not types_a.isdisjoint(numerics) and not types_b.isdisjoint(numerics): return True
-        collections = {'list', 'tuple', 'set', 'frozenset', 'dict', 'range'}
-        if not types_a.isdisjoint(collections) and not types_b.isdisjoint(collections): return True
-        return False
+        # Dataflow fusion here is already the on-the-fly, purely-random
+        # scheme --pre-analysis-off calls for (no cached metadata
+        # dependency), so this flag is a no-op for fuse() — it only exists
+        # so CPythonStateFusionStrategy (which inherits this __init__) can
+        # read self.lightweight for its own pick_state_point() calls.
+        self.lightweight = lightweight
 
     def _extract_imports_and_body(self, code):
         imports = []
@@ -1870,10 +1967,6 @@ except Exception as _e:
     def fuse(self, parent_a: Seed, parent_b: Seed) -> Seed:
         sa = parent_a.content
         sb = parent_b.content
-        meta1 = parent_a.metadata
-        meta2 = parent_b.metadata
-        types1 = meta1.get('dynamic_types') or {}
-        types2 = meta2.get('dynamic_types') or {}
 
         if self.mutation:
             sa = self.mut.mutate(sa)
@@ -1883,56 +1976,15 @@ except Exception as _e:
         b_body, b_imports = self._extract_imports_and_body(sb)
         all_imports = sorted(list(set(a_imports + b_imports)))
 
-        # ── A-side candidates: prefer runtime-live vars over syntactic ones ──
-        # live_vars (from dry-run) = variables confirmed alive at program end:
-        # not deleted, not inside a failed try block, not conditionally unset.
-        # Fall back to syntactic collect when dry-run data is absent.
-        syntactic_a  = collect_top_level_assigned_vars(a_body)
-        live_a       = meta1.get('live_vars') or []
-        if live_a:
-            # Intersection: syntactically assigned AND confirmed alive.
-            # This filters out variables that were assigned but then del'd or
-            # only assigned inside branches that didn't execute.
-            live_set = set(live_a)
-            a_candidates = [v for v in syntactic_a if v in live_set] or live_a
-        else:
-            a_candidates = syntactic_a
+        # CPython is dynamically typed, so a "same type" or "defined vs.
+        # undefined" check on the bridge pair buys little over chance —
+        # pick the A-side producer and the B-side substitution site
+        # uniformly at random from each side's candidate names.
+        a_candidates = collect_top_level_assigned_vars(a_body)
+        b_candidates = collect_bare_vars(b_body)
 
-        # ── B-side candidates: prefer undefined references over all bare vars ──
-        # undefined_refs = identifiers B uses but never defines/imports.
-        # Replacing one with 'fusion' satisfies a NameError rather than
-        # disrupting B's internal dataflow — maximally valid bridge targets.
-        # Fall back to collect_bare_vars when dry-run data is absent.
-        undef_b      = meta2.get('undefined_refs') or []
-        b_candidates = undef_b if undef_b else collect_bare_vars(b_body)
-
-        a_var   = None
-        b_choice = None
-
-        if a_candidates and b_candidates:
-            matching_pairs  = []
-            wildcard_pairs  = []
-            for va in a_candidates:
-                t_a = set(types1.get(va, []))
-                t_a.discard('function'); t_a.discard('builtin_function_or_method'); t_a.discard('type')
-                is_a_wildcard = (len(t_a) == 0)
-                for vb in b_candidates:
-                    t_b = set(types2.get(vb, []))
-                    t_b.discard('function'); t_b.discard('builtin_function_or_method'); t_b.discard('type')
-                    is_b_wildcard = (len(t_b) == 0)
-                    if is_a_wildcard or is_b_wildcard:
-                        wildcard_pairs.append((va, vb))
-                        continue
-                    if self._are_types_compatible(t_a, t_b):
-                        matching_pairs.append((va, vb))
-
-            if matching_pairs:
-                a_var, b_choice = random.choice(matching_pairs)
-            elif wildcard_pairs:
-                a_var, b_choice = random.choice(wildcard_pairs)
-
-        if not a_var and a_candidates:   a_var    = a_candidates[-1]
-        if not b_choice and b_candidates: b_choice = random.choice(b_candidates)
+        a_var    = random.choice(a_candidates) if a_candidates else None
+        b_choice = random.choice(b_candidates) if b_candidates else None
 
         fusion_rhs = a_var if a_var else "0"
         a_text = a_body
@@ -2004,9 +2056,11 @@ class CPythonStateFusionStrategy(CPythonFusionStrategy):
         all_imports = sorted(set(host_imports) | set(donor_imports))
 
         host_point = pick_state_point(host_body, "cpython", self.project_root,
-                                       cached=(host.metadata or {}).get("states_of_interest"))
+                                       cached=(host.metadata or {}).get("states_of_interest"),
+                                       lightweight=self.lightweight)
         donor_point = pick_state_point(donor_body, "cpython", self.project_root,
-                                        cached=(donor.metadata or {}).get("states_of_interest"))
+                                        cached=(donor.metadata or {}).get("states_of_interest"),
+                                        lightweight=self.lightweight)
         if host_point is None:
             lines = host_body.splitlines()
             host_point = StatePoint(max(len(lines) - 1, 0), "fallback", "", "")
@@ -2144,9 +2198,21 @@ class SwiftFusionStrategy(FusionStrategy):
     Ensures correct structure by strictly ordering imports and bodies,
     and attempting simple type-safe bridging of values.
     """
-    def __init__(self, project_root="projects/swift"):
+    def __init__(self, project_root="projects/swift", type_match: bool = False,
+                 lightweight: bool = False):
         self.project_root = project_root
         self.bridge_var_name = "fusion"
+        # --dataflow-type-match: bias the B-side bridge target toward a
+        # variable with the same inferred type as the chosen A-side variable
+        # 90% of the time (falling back to a random B variable when none
+        # match), and pick purely at random the other 10%. Off by default —
+        # behavior is unchanged from before this flag existed.
+        self.type_match = type_match
+        # Dataflow fusion here is already on-the-fly (_extract_vars scans
+        # the seed directly, no cached metadata), so this is a no-op for
+        # fuse() — it only exists so SwiftStateFusionStrategy (which
+        # inherits this __init__) can read self.lightweight.
+        self.lightweight = lightweight
 
     def _split_imports_and_body(self, code):
         """Extracts imports to ensure they can be hoisted."""
@@ -2191,18 +2257,16 @@ class SwiftFusionStrategy(FusionStrategy):
 
     def _replace_compatible_literal(self, code, source_var_name, source_type):
         """
-        Attempts to find a literal in 'code' that matches the 'source_type' and replace it with 'source_var_name'.
-        This avoids re-definition errors by modifying existing logic flow instead.
+        Finds literal(s) in 'code' that match 'source_type' and replaces a
+        weighted-random number of them (see pick_occurrence_count) with
+        'source_var_name', so the bridge value can cross-contaminate more
+        than one use site in B.
         """
-        lines = code.splitlines()
-        new_lines = []
-        replaced = False
-        
         # Regexes for literals
         int_lit = r'(?<![a-zA-Z0-9_])\d+(?![a-zA-Z0-9_])'
         str_lit = r'"[^"]*"'
-        bool_lit = r'\b(true|false)\b'
-        
+        bool_lit = r'\b(?:true|false)\b'
+
         target_regex = None
         if source_type == "Int": target_regex = int_lit
         elif source_type == "String": target_regex = str_lit
@@ -2211,22 +2275,44 @@ class SwiftFusionStrategy(FusionStrategy):
         if not target_regex:
             return code, False
 
-        for line in lines:
-            if not replaced and re.search(target_regex, line):
-                # Avoid replacing inside comments or imports
-                if "//" in line or "import " in line:
-                    new_lines.append(line)
-                    continue
-                    
-                # Replace FIRST occurrence of the literal with the variable name
-                # This bridges the dataflow: B uses A's variable instead of its own constant
-                new_line = re.sub(target_regex, source_var_name, line, count=1)
-                new_lines.append(new_line)
-                replaced = True
-            else:
-                new_lines.append(line)
-        
-        return "\n".join(new_lines), replaced
+        lines = code.splitlines()
+        candidates = []  # (line_idx, match)
+        for i, line in enumerate(lines):
+            if "//" in line or "import " in line:
+                continue
+            for m in re.finditer(target_regex, line):
+                candidates.append((i, m))
+
+        if not candidates:
+            return code, False
+
+        n = min(pick_occurrence_count(), len(candidates))
+        chosen_by_line: Dict[int, list] = {}
+        for i, m in random.sample(candidates, n):
+            chosen_by_line.setdefault(i, []).append(m)
+
+        for i, matches in chosen_by_line.items():
+            line = lines[i]
+            for m in sorted(matches, key=lambda mm: mm.start(), reverse=True):
+                line = line[:m.start()] + source_var_name + line[m.end():]
+            lines[i] = line
+
+        return "\n".join(lines), True
+
+    def _pick_bridge_target_var(self, v_type, b_vars):
+        """Choose the name of a B-side variable to substitute with the
+        bridge var. Under --dataflow-type-match: 90% of the time, prefer a
+        variable whose inferred type matches `v_type`, falling back to a
+        uniformly random B variable when none match; the other 10% (and
+        always, when the flag isn't set) picks uniformly at random. Returns
+        None if B has no extracted variables at all."""
+        if not b_vars:
+            return None
+        if self.type_match and random.random() < 0.90:
+            same_type = [n for n, t in b_vars if t == v_type]
+            if same_type:
+                return random.choice(same_type)
+        return random.choice([n for n, _ in b_vars])
 
     def _bug_primitives(self, bridge_var: str, bridge_type: str) -> list:
         """
@@ -2576,15 +2662,25 @@ do {{
             bridge_type = v_type
 
         # 4. Inject into B
-        # Try to replace a compatible literal in B with the bridge variable
+        # Under --dataflow-type-match, prefer substituting a same-type B
+        # variable's occurrences over the default literal-matching bridge.
         final_b_body = b_body
         if bridge_var:
-            modified_b, success = self._replace_compatible_literal(b_body, bridge_var, bridge_type)
-            if success:
-                final_b_body = modified_b
+            target_name = None
+            if self.type_match:
+                b_vars = self._extract_vars(b_body)
+                target_name = self._pick_bridge_target_var(bridge_type, b_vars)
+
+            if target_name:
+                final_b_body = replace_word_occurrences(b_body, target_name, bridge_var)
             else:
-                # If no replacement possible, append a dummy usage to ensure validity
-                final_b_body += f"\nprint({bridge_var})\n"
+                # Try to replace a compatible literal in B with the bridge variable
+                modified_b, success = self._replace_compatible_literal(b_body, bridge_var, bridge_type)
+                if success:
+                    final_b_body = modified_b
+                else:
+                    # If no replacement possible, append a dummy usage to ensure validity
+                    final_b_body += f"\nprint({bridge_var})\n"
 
         # 5. Pick one bug primitive and append it
         # Use a sentinel var if no bridge was created so primitives still compile
@@ -2633,9 +2729,11 @@ class SwiftStateFusionStrategy(SwiftFusionStrategy):
         all_imports = sorted(set(host_imports) | set(donor_imports))
 
         host_point = pick_state_point(host_body, "swift", self.project_root,
-                                       cached=(host.metadata or {}).get("states_of_interest"))
+                                       cached=(host.metadata or {}).get("states_of_interest"),
+                                       lightweight=self.lightweight)
         donor_point = pick_state_point(donor_body, "swift", self.project_root,
-                                        cached=(donor.metadata or {}).get("states_of_interest"))
+                                        cached=(donor.metadata or {}).get("states_of_interest"),
+                                        lightweight=self.lightweight)
         if host_point is None:
             lines = host_body.splitlines()
             host_point = StatePoint(max(len(lines) - 1, 0), "fallback", "", "")
@@ -2736,8 +2834,22 @@ class SwiftDeclarationFusionStrategy(SwiftFusionStrategy):
 # ==========================================
 
 class MLIRFusionStrategy(FusionStrategy):
-    def __init__(self, project_root="projects/mlir"):
+    def __init__(self, project_root="projects/mlir", type_match: bool = False,
+                 lightweight: bool = False):
         self.project_root = project_root
+        # --dataflow-type-match: 90% of the time, require the bridge's
+        # constants to share a scalar type (falling back to any two
+        # constants — a deliberate, likely ill-typed pairing — when no
+        # same-type group of >=2 exists), 10% of the time skip the
+        # same-type search outright. Off by default — behavior is
+        # unchanged from before this flag existed (always require same
+        # scalar type, or emit no bridge at all).
+        self.type_match = type_match
+        # Dataflow fusion here is already on-the-fly (mlir_extract_constants
+        # scans the seed directly, no cached metadata), so this is a no-op
+        # for fuse() — it only exists so MLIRStateFusionStrategy (which
+        # inherits this __init__) can read self.lightweight.
+        self.lightweight = lightweight
 
     def _bug_primitives(self):
         """
@@ -2945,12 +3057,22 @@ class MLIRFusionStrategy(FusionStrategy):
         existing function body (which was fragile and caused cross-module
         reference errors when mlir_strip_outer_module failed).
         Returns '' when there are no constants to work with.
+
+        --dataflow-type-match (self.type_match): 90% of the time, require a
+        same-scalar-type group of >=2 constants as before, falling back to
+        a type-agnostic pool when none exists instead of giving up (no
+        bridge); 10% of the time, skip the same-type search outright and
+        draw from all constants regardless of type — deliberately risking
+        a constant declared with another constant's (wrong) type, the same
+        tolerance for likely-invalid cross-seed values that Clang's
+        dataflow fusion already applies. With the flag off, behavior is
+        unchanged: only ever bridge same-type constants, or emit no bridge.
         """
         all_consts = a_consts + b_consts
         if not all_consts:
             return ""
 
-        # Try to find a pair with the same scalar type
+        # Try to find a group of >=2 constants sharing a simple scalar type.
         ty = None
         same = []
         for candidate_ty in dict.fromkeys(c["ty"] for c in all_consts):
@@ -2961,10 +3083,20 @@ class MLIRFusionStrategy(FusionStrategy):
                 same = group
                 break
 
-        if not same:
+        if self.type_match and (not same or random.random() >= 0.90):
+            same = []  # force the type-agnostic fallback below
+
+        if same:
+            n = min(pick_occurrence_count(), len(same))
+            picks = random.sample(same, n)
+        elif self.type_match:
+            pool = [c for c in all_consts if re.fullmatch(r'[iuf]\d+|index', c["ty"])] or all_consts
+            n = min(pick_occurrence_count(), len(pool))
+            picks = random.sample(pool, n)
+            ty = picks[0]["ty"]
+        else:
             return ""
 
-        picks = random.sample(same, min(4, len(same)))
         op = "arith.addf" if ty.startswith("f") else "arith.addi"
 
         lines = [f"func.func @_ffl_bridge_{uid}() -> {ty} {{"]
@@ -3206,9 +3338,11 @@ class MLIRStateFusionStrategy(MLIRFusionStrategy):
             })
 
         host_point = pick_state_point(host_body, "mlir", self.project_root,
-                                       cached=(host.metadata or {}).get("states_of_interest"))
+                                       cached=(host.metadata or {}).get("states_of_interest"),
+                                       lightweight=self.lightweight)
         donor_point = pick_state_point(donor_body, "mlir", self.project_root,
-                                        cached=(donor.metadata or {}).get("states_of_interest"))
+                                        cached=(donor.metadata or {}).get("states_of_interest"),
+                                        lightweight=self.lightweight)
         if host_point is None:
             lines = host_body.splitlines()
             host_point = StatePoint(max(len(lines) - 1, 0), "fallback", "", "")
@@ -3468,10 +3602,17 @@ class RustFusionStrategy(RustLexMixin, FusionStrategy):
     aren't called from `main`) are left as ordinary top-level items in the
     output — unused is harmless, a compile error is not.
     """
-    def __init__(self, project_root="projects/rust"):
+    def __init__(self, project_root="projects/rust", type_match: bool = False):
         self.project_root = project_root
         self.mut = RustMutator()
         self.bridge_var_name = "fusion_var"
+        # --dataflow-type-match: 90% of the time, prefer a type-compatible
+        # cross-seed `let` (falling back to any earlier cross-seed `let`
+        # when none is compatible), 10% of the time skip the type filter
+        # outright. Off by default — behavior is unchanged from before this
+        # flag existed (always require type compatibility, as _bridge_
+        # across_seeds did originally).
+        self.type_match = type_match
 
     def _process_seed(self, code, uid):
         """
@@ -3544,17 +3685,20 @@ class RustFusionStrategy(RustLexMixin, FusionStrategy):
         return False
 
     def _replace_random_identifier(self, s: str, name: str, replacement: str):
-        """Word-boundary-safe replace of one random occurrence of `name` in
-        `s` (not `->`/`::`-qualified). Returns None if no match — callers
-        must not fall back to plain substring replace, which would also
-        match `name` as a substring of unrelated identifiers (e.g. `a`
-        inside `break`)."""
+        """Word-boundary-safe replace of a weighted-random number of
+        occurrences (see pick_occurrence_count) of `name` in `s` (not
+        `->`/`::`-qualified). Returns None if no match — callers must not
+        fall back to plain substring replace, which would also match `name`
+        as a substring of unrelated identifiers (e.g. `a` inside `break`)."""
         pattern = re.compile(r'(?<![.\w:])' + re.escape(name) + r'(?!\w)')
         matches = list(pattern.finditer(s))
         if not matches:
             return None
-        m = random.choice(matches)
-        return s[:m.start()] + replacement + s[m.end():]
+        n = min(pick_occurrence_count(), len(matches))
+        chosen = sorted(random.sample(matches, n), key=lambda m: m.start(), reverse=True)
+        for m in chosen:
+            s = s[:m.start()] + replacement + s[m.end():]
+        return s
 
     # ------------------------------------------------------------------
     # Top-level free-function extraction & inlining
@@ -3820,8 +3964,19 @@ class RustFusionStrategy(RustLexMixin, FusionStrategy):
         random.shuffle(order)
         for k in order:
             tgt_idx, tgt_origin, tgt_name, tgt_type = defs[k]
-            candidates = [d for d in defs if d[0] < tgt_idx and d[1] != tgt_origin
-                          and self._types_compatible(d[3], tgt_type)]
+            earlier_other = [d for d in defs if d[0] < tgt_idx and d[1] != tgt_origin]
+            compatible = [d for d in earlier_other if self._types_compatible(d[3], tgt_type)]
+
+            if not self.type_match:
+                # Unchanged pre-flag behavior: only ever bridge type-compatible lets.
+                candidates = compatible
+            elif random.random() < 0.90:
+                # Prefer type-compatible, but fall back to any earlier cross-seed
+                # let (deliberately type-mismatched) when none is compatible.
+                candidates = compatible or earlier_other
+            else:
+                candidates = earlier_other
+
             if not candidates:
                 continue
             src_idx, src_origin, src_name, src_type = random.choice(candidates)
@@ -4392,12 +4547,29 @@ class HaskellFusionStrategy(FusionStrategy):
         },
     }
 
-    def __init__(self, project_root="projects/haskell"):
+    _HS_IDENT_RE = re.compile(r"\b[a-z_][A-Za-z0-9_']*\b")
+
+    def __init__(self, project_root="projects/haskell", type_match: bool = False,
+                 lightweight: bool = False):
         self.project_root = project_root
         self.mut = HaskellMutator()
         self.dataflow_fusion = True
         self.state_fusion = False
         self.all_fusion = False
+        # --dataflow-type-match: 90% of the time, splice into an integer-
+        # literal site as before (always type-safe via `fromInteger`),
+        # falling back to a random identifier when body has none; 10% of
+        # the time, skip straight to substituting a random identifier's
+        # occurrences with the raw bridge expression — deliberately risking
+        # a type mismatch to stress GHC's type-checker diagnostics. Off by
+        # default — behavior is unchanged from before this flag existed
+        # (always the type-safe integer-literal splice, or no-op).
+        self.type_match = type_match
+        # Dataflow fusion here is already on-the-fly (_harvest_int_literal
+        # scans the seed directly, no cached metadata), so this is a no-op
+        # for fuse() — it only exists so HaskellStateFusionStrategy (which
+        # inherits this __init__) can read self.lightweight.
+        self.lightweight = lightweight
 
     # ------------------------------------------------------------------
     # Seed processing
@@ -4474,15 +4646,42 @@ class HaskellFusionStrategy(FusionStrategy):
         return random.choice(matches) if matches else default
 
     def _splice_numeric_bridge(self, body: str, bridge_read_expr: str) -> str:
-        """Replace one random integer-literal occurrence in body with a read
-        from the shared cell, wrapped in `fromInteger` so it type-unifies
-        with (almost) any Num context the literal originally sat in."""
-        matches = list(self._INT_LIT_RE.finditer(body))
-        if not matches:
+        """Replace a weighted-random number of integer-literal occurrences
+        (see pick_occurrence_count) in body with a read from the shared
+        cell, wrapped in `fromInteger` so it type-unifies with (almost) any
+        Num context the literal originally sat in.
+
+        --dataflow-type-match (self.type_match): 90% of the time, splice
+        into integer-literal sites as above, falling back to a random
+        identifier occurrence when body has none; 10% of the time, replace
+        occurrences of a random non-keyword identifier in body with the raw
+        bridge expression instead — deliberately risking a type mismatch
+        (the point of the flag: stress GHC's type-checker diagnostics)
+        rather than always picking the type-safe numeric slot. With the
+        flag off, behavior is unchanged: always the integer-literal splice,
+        or a no-op if body has none.
+        """
+        use_numeric = not (self.type_match and random.random() >= 0.90)
+
+        if use_numeric:
+            matches = list(self._INT_LIT_RE.finditer(body))
+            if matches:
+                n = min(pick_occurrence_count(), len(matches))
+                chosen = sorted(random.sample(matches, n), key=lambda m: m.start(), reverse=True)
+                for m in chosen:
+                    body = body[:m.start()] + f"(fromInteger ({bridge_read_expr}))" + body[m.end():]
+                return body
+            if not self.type_match:
+                return body
+            # No integer literal to splice into — fall through to the
+            # identifier-substitution path below instead of giving up.
+
+        idents = [m.group(0) for m in self._HS_IDENT_RE.finditer(body)
+                  if m.group(0) not in self._HS_KEYWORDS]
+        if not idents:
             return body
-        m = random.choice(matches)
-        start, end = m.span()
-        return body[:start] + f"(fromInteger ({bridge_read_expr}))" + body[end:]
+        target = random.choice(idents)
+        return replace_word_occurrences(body, target, f"({bridge_read_expr})")
 
     def _pick_shared_kind(self, meta_a: dict, meta_b: dict) -> str:
         for meta in (meta_a, meta_b):
@@ -4670,6 +4869,16 @@ class HaskellStateFusionStrategy(HaskellFusionStrategy):
     state-of-interest point, then runs the fused single action —
     structurally closer to how the other languages' state fusion works.
 
+    State-of-interest selection: unlike the other languages (a live-
+    variable-count analysis, see core/state_analysis.py), Haskell always
+    just picks any random line — pattern-bound names (function arguments,
+    case alternatives, do-binds) are Haskell's real equivalent of "many
+    variables," but its layout-based scoping (where/let-in/do blocks
+    scoped by indentation, not braces) makes tracking where those go out
+    of scope too unreliable to be worth it, so this doesn't try; it's
+    independent of --pre-analysis (no richer analysis to fall back to
+    here regardless of the flag).
+
     CAVEAT: this is the least-verified of the state-fusion strategies —
     no local `ghc` was available to check the grafted output against
     Haskell's indentation-sensitive layout rule (unlike Clang, which was
@@ -4703,10 +4912,10 @@ class HaskellStateFusionStrategy(HaskellFusionStrategy):
         entry_host = self._build_entry_action(proc_host['main_name'], proc_host['had_main'],
                                                host.metadata.get('nullary_bindings', []))
 
-        host_point = pick_state_point(body_host, "haskell", self.project_root,
-                                       cached=(host.metadata or {}).get("states_of_interest"))
-        donor_point = pick_state_point(body_donor, "haskell", self.project_root,
-                                        cached=(donor.metadata or {}).get("states_of_interest"))
+        # Always random-line selection (see class docstring) — independent
+        # of self.lightweight/--pre-analysis, not just when it's off.
+        host_point = pick_state_point(body_host, "haskell", lightweight=True)
+        donor_point = pick_state_point(body_donor, "haskell", lightweight=True)
         if host_point is None:
             lines = body_host.splitlines()
             host_point = StatePoint(max(len(lines) - 1, 0), "fallback", "", "")
@@ -4886,19 +5095,46 @@ class ClangFusionStrategy(GenericDataflowStrategy):
       into a compound block body.
     """
 
-    def __init__(self, project_root="projects/clang"):
-        super().__init__(mutator=BaseMutator())
+    # Best-effort C/C++ variable-declaration type extractor — a heuristic,
+    # not a real parser, used only to bias --dataflow-type-match's same-type
+    # preference. Matches `<base-type> [*...] name (=|;|,|\))`.
+    _C_VAR_DECL_RE = re.compile(
+        r'\b(_Bool|bool|char|short(?:\s+int)?|int|long(?:\s+long)?(?:\s+int)?|'
+        r'float|double|long\s+double|'
+        r'unsigned(?:\s+(?:char|short|int|long(?:\s+long)?))?|'
+        r'signed(?:\s+(?:char|short|int|long(?:\s+long)?))?|'
+        r'size_t|ssize_t|int8_t|int16_t|int32_t|int64_t|'
+        r'uint8_t|uint16_t|uint32_t|uint64_t)'
+        r'\s*(\*{0,2})\s*([A-Za-z_]\w*)\s*(?:\[[^\]]*\])?\s*(?:=(?!=)|;|,|\))'
+    )
+
+    def __init__(self, project_root="projects/clang", type_match: bool = False,
+                 lightweight: bool = False):
+        super().__init__(mutator=BaseMutator(), lightweight=lightweight)
         self.project_root = project_root
         self.bridge_var_name = "ffl_fusion"
         self.mutation = True
         self.stmt_fusion = False
         self.dataflow_fusion = True
         self.all_fusion = False
+        # --dataflow-type-match: bias bridge-variable selection toward a
+        # same-declared-type pair 90% of the time (falling back to random
+        # when no match exists), and pick purely at random the other 10%.
+        # Off by default — behavior is unchanged from before this flag existed.
+        self.type_match = type_match
 
     def format_assignment(self, lhs: str, rhs: str) -> str:
         # Top-level declaration — valid C/C++ syntax even when `rhs` turns out
         # not to be a real compile-time constant (clang just diagnoses it).
         return f"static long {lhs} = (long)({rhs});"
+
+    def _lightweight_vars(self, code: str) -> List[str]:
+        """Reuse the --dataflow-type-match variable-declaration extractor
+        on the fly instead of parse-time dataflow1/dataflow2 metadata."""
+        return list(self._infer_c_var_types(code).keys())
+
+    def _lightweight_replace(self, code: str, var: str, bridge: str) -> str:
+        return self._replace_random_occurrence_word(code, var, bridge)
 
     @staticmethod
     def _replace_random_occurrence_word(s: str, old: str, new: str) -> str:
@@ -4907,18 +5143,46 @@ class ClangFusionStrategy(GenericDataflowStrategy):
         so a naive substring replace (replace_random_occurrence) can corrupt
         unrelated identifiers or even keywords that merely contain `old` as
         a substring (e.g. replacing bare `r` would turn `struct` into
-        `styuct`, or `for` into `foy`)."""
-        matches = list(re.finditer(rf'(?<!\w){re.escape(old)}(?!\w)', s))
-        if not matches:
-            return s
-        match = random.choice(matches)
-        start, end = match.span()
-        return s[:start] + new + s[end:]
+        `styuct`, or `for` into `foy`). Delegates to the shared
+        replace_word_occurrences (also used by Swift) for the actual
+        weighted-occurrence-count replacement."""
+        return replace_word_occurrences(s, old, new)
+
+    def _infer_c_var_types(self, code: str) -> Dict[str, str]:
+        """Best-effort name -> declared-type map (e.g. 'int', 'char*') from
+        simple declarations in `code`. Heuristic, not a real parser — good
+        enough to bias --dataflow-type-match's same-type preference."""
+        types = {}
+        for m in self._C_VAR_DECL_RE.finditer(code):
+            base_type, stars, name = m.group(1), m.group(2), m.group(3)
+            types[name] = re.sub(r'\s+', ' ', base_type.strip()) + stars
+        return types
+
+    def _pick_var2(self, var1, code1, code2, dataflow2, fallback):
+        """Choose the bridge-substitution target in B. Under
+        --dataflow-type-match: 90% of the time, search *all* of B's
+        dataflow-tracked variables for one whose inferred declared type
+        matches var1's, falling back to `fallback()` (the pre-existing
+        random pick) when var1's type is unknown or no match exists; the
+        other 10% always calls `fallback()`. With the flag off, always
+        calls `fallback()` — identical to pre-flag behavior."""
+        if self.type_match and random.random() < 0.90:
+            t1 = self._infer_c_var_types(code1).get(var1)
+            if t1:
+                all_b_vars = {v for group in dataflow2 for v in group}
+                types2 = self._infer_c_var_types(code2)
+                same_type = [v for v in all_b_vars if types2.get(v) == t1]
+                if same_type:
+                    return random.choice(same_type)
+        return fallback()
 
     def interleave_code_blocks(self, code1, code2, dataflow1, dataflow2, extra_flows=None):
         """Override of GenericDataflowStrategy.interleave_code_blocks that
         substitutes via word boundaries instead of raw substring replace —
-        see _replace_random_occurrence_word."""
+        see _replace_random_occurrence_word. Bridge-target selection goes
+        through _pick_var2 so --dataflow-type-match can bias it."""
+        if self.lightweight:
+            return self._lightweight_bridge(code1, code2)
         if not dataflow1 or not dataflow2:
             return code1, code2
 
@@ -4932,7 +5196,7 @@ class ClangFusionStrategy(GenericDataflowStrategy):
                 group1 = random.choice(dataflow1)
                 var1 = random.choice(group1)
                 group2 = random.choice(dataflow2)
-                var2 = random.choice(group2)
+                var2 = self._pick_var2(var1, code1, code2, dataflow2, lambda: random.choice(group2))
                 bridge_stmt = self.format_assignment(bridge, var1)
                 code1 += f"\n{bridge_stmt}\n"
                 code2 = self._replace_random_occurrence_word(code2, var2, bridge)
@@ -4945,7 +5209,7 @@ class ClangFusionStrategy(GenericDataflowStrategy):
 
         if max_df1 and max_df2:
             var1 = random.choice(max_df1)
-            var2 = random.choice(max_df2)
+            var2 = self._pick_var2(var1, code1, code2, dataflow2, lambda: random.choice(max_df2))
             bridge_stmt = self.format_assignment(bridge, var1)
             code1 += f"\n{bridge_stmt}\n"
             code2 = self._replace_random_occurrence_word(code2, var2, bridge)
@@ -5696,9 +5960,11 @@ class ClangStateFusionStrategy(ClangFusionStrategy):
         all_includes = sorted(set(i.strip() for i in host_includes) | set(i.strip() for i in donor_includes))
 
         host_point = pick_state_point(host_body, "clang", self.project_root,
-                                       cached=(host.metadata or {}).get("states_of_interest"))
+                                       cached=(host.metadata or {}).get("states_of_interest"),
+                                       lightweight=self.lightweight)
         donor_point = pick_state_point(donor_body, "clang", self.project_root,
-                                        cached=(donor.metadata or {}).get("states_of_interest"))
+                                        cached=(donor.metadata or {}).get("states_of_interest"),
+                                        lightweight=self.lightweight)
         if host_point is None:
             lines = host_body.splitlines()
             host_point = StatePoint(max(len(lines) - 1, 0), "fallback", "", "")
@@ -5768,17 +6034,78 @@ class FlangFusionStrategy(GenericDataflowStrategy):
       backslash escaping.
     """
 
-    def __init__(self, project_root="projects/flang"):
-        super().__init__(mutator=BaseMutator())
+    # Best-effort Fortran variable-declaration type extractor — a
+    # heuristic, not a real parser, used only to bias --dataflow-type-
+    # match's same-type preference. Matches `<type>[(kind)] :: name[, ...]`.
+    _FORTRAN_VAR_DECL_RE = re.compile(
+        r'\b(integer|real|double\s+precision|complex|logical|character)\b'
+        r'\s*(\([^)]*\)|\*\d+)?\s*(?:,[^:]*)?::\s*([A-Za-z_]\w*(?:\s*,\s*[A-Za-z_]\w*)*)',
+        re.IGNORECASE,
+    )
+
+    def __init__(self, project_root="projects/flang", type_match: bool = False,
+                 lightweight: bool = False):
+        super().__init__(mutator=BaseMutator(), lightweight=lightweight)
         self.project_root = project_root
         self.bridge_var_name = "ffl_fusion"
         self.mutation = True
         self.stmt_fusion = False
         self.dataflow_fusion = True
         self.all_fusion = False
+        # --dataflow-type-match: bias bridge-variable selection toward a
+        # same-declared-type pair 90% of the time (falling back to random
+        # when no match exists), and pick purely at random the other 10%.
+        # Off by default — behavior is unchanged from before this flag existed.
+        self.type_match = type_match
 
     def format_assignment(self, lhs: str, rhs: str) -> str:
         return f"{lhs} = ({rhs})"
+
+    def _lightweight_vars(self, code: str) -> List[str]:
+        """On-the-fly declared-name scan (original case, unlike
+        _infer_fortran_var_types's uppercased keys) instead of parse-time
+        dataflow1/dataflow2 metadata."""
+        names = []
+        for m in self._FORTRAN_VAR_DECL_RE.finditer(code):
+            for name in m.group(3).split(','):
+                name = re.split(r'[\s(]', name.strip(), 1)[0]
+                if name:
+                    names.append(name)
+        return names
+
+    def _lightweight_replace(self, code: str, var: str, bridge: str) -> str:
+        return self._replace_random_occurrence_word(code, var, bridge)
+
+    def _infer_fortran_var_types(self, code: str) -> Dict[str, str]:
+        """Best-effort name -> declared-type map (e.g. 'integer', 'real')
+        from simple `TYPE :: name` declarations. Heuristic, not a real
+        parser — good enough to bias --dataflow-type-match's same-type
+        preference. Keyed case-insensitively (Fortran identifiers are)."""
+        types = {}
+        for m in self._FORTRAN_VAR_DECL_RE.finditer(code):
+            base_type, kind = m.group(1), m.group(2)
+            norm = re.sub(r'\s+', ' ', base_type.strip().lower()) + (kind or '')
+            for name in m.group(3).split(','):
+                types[name.strip().upper()] = norm
+        return types
+
+    def _pick_var2(self, var1, code1, code2, dataflow2, fallback):
+        """Choose the bridge-substitution target in B. Under
+        --dataflow-type-match: 90% of the time, search *all* of B's
+        dataflow-tracked variables for one whose inferred declared type
+        matches var1's, falling back to `fallback()` (the pre-existing
+        random pick) when var1's type is unknown or no match exists; the
+        other 10% always calls `fallback()`. With the flag off, always
+        calls `fallback()` — identical to pre-flag behavior."""
+        if self.type_match and random.random() < 0.90:
+            t1 = self._infer_fortran_var_types(code1).get(var1.upper())
+            if t1:
+                all_b_vars = {v for group in dataflow2 for v in group}
+                types2 = self._infer_fortran_var_types(code2)
+                same_type = [v for v in all_b_vars if types2.get(v.upper()) == t1]
+                if same_type:
+                    return random.choice(same_type)
+        return fallback()
 
     # ── Shared lexical helpers ──────────────────────────────────────
 
@@ -6181,13 +6508,10 @@ class FlangFusionStrategy(GenericDataflowStrategy):
 
     def _replace_random_occurrence_word(self, s: str, old: str, new: str) -> str:
         """Word-boundary-safe, case-insensitive replacement (Fortran is
-        case-insensitive, so 'X' and 'x' are the same identifier)."""
-        matches = list(re.finditer(rf'(?<!\w){re.escape(old)}(?!\w)', s, re.IGNORECASE))
-        if not matches:
-            return s
-        match = random.choice(matches)
-        start, end = match.span()
-        return s[:start] + new + s[end:]
+        case-insensitive, so 'X' and 'x' are the same identifier). Delegates
+        to the shared replace_word_occurrences for the actual weighted-
+        occurrence-count replacement."""
+        return replace_word_occurrences(s, old, new, ignorecase=True)
 
     def _stmt_cross_replace_variable(self, code: str, vars_a: List[str], vars_b: List[str]) -> str:
         if not vars_a or not vars_b:
@@ -6298,12 +6622,32 @@ class FlangFusionStrategy(GenericDataflowStrategy):
 
     # ── Dataflow fusion: insert before the outermost unit's END ──────
 
+    def _lightweight_bridge(self, code1: str, code2: str):
+        """Override: Fortran has no valid "append a statement after the
+        last program unit" construct, so the bridge assignment goes
+        through _insert_before_last_unit_end instead of the base class's
+        plain append."""
+        vars1 = self._lightweight_vars(code1)
+        vars2 = self._lightweight_vars(code2)
+        if not vars1 or not vars2:
+            return code1, code2
+        var1 = random.choice(vars1)
+        var2 = random.choice(vars2)
+        bridge = self.bridge_var_name
+        code1 = self._insert_before_last_unit_end(code1, self.format_assignment(bridge, var1))
+        code2 = self._lightweight_replace(code2, var2, bridge)
+        return code1, code2
+
     def interleave_code_blocks(self, code1, code2, dataflow1, dataflow2, extra_flows=None):
         """Override of GenericDataflowStrategy.interleave_code_blocks:
         Fortran has no valid "append a statement after the last program
         unit" construct (unlike C's top-level declaration trick), so the
         bridge assignment is inserted just before code1's outermost unit
-        closing END instead of appended at the very end."""
+        closing END instead of appended at the very end. Bridge-target
+        selection goes through _pick_var2 so --dataflow-type-match can
+        bias it."""
+        if self.lightweight:
+            return self._lightweight_bridge(code1, code2)
         if not dataflow1 or not dataflow2:
             return code1, code2
 
@@ -6317,7 +6661,7 @@ class FlangFusionStrategy(GenericDataflowStrategy):
                 group1 = random.choice(dataflow1)
                 var1 = random.choice(group1)
                 group2 = random.choice(dataflow2)
-                var2 = random.choice(group2)
+                var2 = self._pick_var2(var1, code1, code2, dataflow2, lambda: random.choice(group2))
                 bridge_stmt = self.format_assignment(bridge, var1)
                 code1 = self._insert_before_last_unit_end(code1, bridge_stmt)
                 code2 = self._replace_random_occurrence_word(code2, var2, bridge)
@@ -6330,7 +6674,7 @@ class FlangFusionStrategy(GenericDataflowStrategy):
 
         if max_df1 and max_df2:
             var1 = random.choice(max_df1)
-            var2 = random.choice(max_df2)
+            var2 = self._pick_var2(var1, code1, code2, dataflow2, lambda: random.choice(max_df2))
             bridge_stmt = self.format_assignment(bridge, var1)
             code1 = self._insert_before_last_unit_end(code1, bridge_stmt)
             code2 = self._replace_random_occurrence_word(code2, var2, bridge)
@@ -6485,9 +6829,11 @@ class FlangStateFusionStrategy(FlangFusionStrategy):
         donor_code = self._resolve_name_conflicts(host_code, donor_code)
 
         host_point = pick_state_point(host_code, "flang", self.project_root,
-                                       cached=(host.metadata or {}).get("states_of_interest"))
+                                       cached=(host.metadata or {}).get("states_of_interest"),
+                                       lightweight=self.lightweight)
         donor_point = pick_state_point(donor_code, "flang", self.project_root,
-                                        cached=(donor.metadata or {}).get("states_of_interest"))
+                                        cached=(donor.metadata or {}).get("states_of_interest"),
+                                        lightweight=self.lightweight)
         if host_point is None:
             lines = host_code.splitlines()
             host_point = StatePoint(max(len(lines) - 1, 0), "fallback", "", "")
@@ -6593,15 +6939,16 @@ class LFortranFusionStrategy(FlangFusionStrategy):
     default project_root differs.
     """
 
-    def __init__(self, project_root="projects/lfortran"):
-        super().__init__(project_root=project_root)
+    def __init__(self, project_root="projects/lfortran", type_match: bool = False,
+                 lightweight: bool = False):
+        super().__init__(project_root=project_root, type_match=type_match, lightweight=lightweight)
 
 
 class LFortranStateFusionStrategy(FlangStateFusionStrategy):
     """State fusion for LFortran — see LFortranFusionStrategy."""
 
-    def __init__(self, project_root="projects/lfortran"):
-        super().__init__(project_root=project_root)
+    def __init__(self, project_root="projects/lfortran", lightweight: bool = False):
+        super().__init__(project_root=project_root, lightweight=lightweight)
 
 
 class LFortranDeclarationFusionStrategy(FlangDeclarationFusionStrategy):
@@ -6616,7 +6963,8 @@ class LFortranDeclarationFusionStrategy(FlangDeclarationFusionStrategy):
 # ==========================================
 
 def get_strategies(project_name=None, dataflow_fusion=False,
-                    struct_fusion=False, declaration_fusion=False, state_fusion=False):
+                    struct_fusion=False, declaration_fusion=False, state_fusion=False,
+                    dataflow_type_match=False, pre_analysis_enabled=True):
     """
     Build the pool of fusion strategies for `project_name`. Each of
     dataflow_fusion/state_fusion/declaration_fusion independently adds its
@@ -6630,6 +6978,38 @@ def get_strategies(project_name=None, dataflow_fusion=False,
     to get the default, which is now every technique the project
     supports (so combined fusion is on by default) rather than dataflow
     fusion alone.
+
+    dataflow_type_match only affects statically-typed-language dataflow
+    strategies (clang, swift, mlir, rust, haskell, flang, lfortran): 90% of
+    the time it biases the bridge substitution toward a same-declared-type
+    pair (falling back to random/type-agnostic when none exists), 10% of
+    the time it deliberately picks a type-mismatched pair — each language's
+    own notion of "bridge pair" and "same type" varies (variable-for-
+    variable for clang/swift/flang/lfortran, a same-declared-type `let` for
+    rust, a same-scalar-type constant group for mlir, an integer-literal
+    slot vs. an arbitrary identifier for haskell) but the 90/10 split and
+    off-by-default/unchanged-behavior guarantee are consistent across all
+    of them. Dynamically-typed languages (cpython, php) always pick the
+    bridge pair uniformly at random and ignore this flag — a "same type"
+    preference isn't meaningful for them.
+
+    pre_analysis_enabled (--pre-analysis) gates the richer per-seed
+    metadata every strategy would otherwise prefer to consume. When False:
+      - dataflow fusion falls back to a very lightweight, on-the-fly rule
+        for every project: scan each side's variables directly from its
+        source text (no parse-time dataflow graph, no dependency-graph
+        grouping) and connect one uniformly random pair. (cpython, swift,
+        rust, mlir, haskell already work this way regardless of this flag
+        — they never depended on cached metadata to begin with; only php/
+        clang/flang/lfortran's default dataflow mode normally consumes a
+        parse-time dataflow graph, and this flag makes them bypass it.)
+      - state fusion falls back to picking any uniformly random line as
+        the splice point, instead of core/state_analysis.py's live-
+        variable-count analysis (or Haskell's category scan).
+      - declaration fusion is disabled outright (not considered feasible
+        without --pre-analysis) — a warning is logged if it would
+        otherwise have been requested (explicitly or via the "no flags"
+        default).
     """
     # Default: if no technique is explicitly requested, enable every
     # technique the project has — process_iteration's chaining is what
@@ -6639,85 +7019,121 @@ def get_strategies(project_name=None, dataflow_fusion=False,
         declaration_fusion = True
         state_fusion = True
 
+    lightweight = not pre_analysis_enabled
+    if lightweight and (declaration_fusion or struct_fusion):
+        logger.warning(
+            "--pre-analysis is not enabled: declaration fusion isn't "
+            "feasible without its richer per-seed metadata, so "
+            "--declaration-fusion/--struct-fusion is being disabled for "
+            "this run. Dataflow fusion falls back to a lightweight, "
+            "on-the-fly random-variable-connect rule, and state fusion "
+            "falls back to picking any random line, for every project."
+        )
+        declaration_fusion = False
+        struct_fusion = False
+
     strategies = []
 
     if project_name == "haskell":
         if os.path.exists("projects/haskell"):
             if dataflow_fusion:
-                strategies.append(HaskellFusionStrategy(project_root="projects/haskell"))
+                strategies.append(HaskellFusionStrategy(project_root="projects/haskell",
+                                                          type_match=dataflow_type_match,
+                                                          lightweight=lightweight))
             if declaration_fusion:
                 strategies.append(HaskellDeclarationFusionStrategy(project_root="projects/haskell"))
             if state_fusion:
-                strategies.append(HaskellStateFusionStrategy(project_root="projects/haskell"))
+                strategies.append(HaskellStateFusionStrategy(project_root="projects/haskell",
+                                                               lightweight=lightweight))
         return strategies
 
     if project_name == "php":
         if os.path.exists("projects/php"):
             if dataflow_fusion:
-                strategies.append(PHPFusionStrategy(project_root="projects/php"))
+                strategies.append(PHPFusionStrategy(project_root="projects/php",
+                                                      lightweight=lightweight))
             if declaration_fusion:
                 strategies.append(PHPDeclarationFusionStrategy(project_root="projects/php"))
             if state_fusion:
-                strategies.append(PHPStateFusionStrategy(project_root="projects/php"))
+                strategies.append(PHPStateFusionStrategy(project_root="projects/php",
+                                                           lightweight=lightweight))
         return strategies
 
     if project_name == "clang":
         if os.path.exists("projects/clang"):
             if dataflow_fusion:
-                strategies.append(ClangFusionStrategy(project_root="projects/clang"))
+                strategies.append(ClangFusionStrategy(project_root="projects/clang",
+                                                       type_match=dataflow_type_match,
+                                                       lightweight=lightweight))
             if declaration_fusion:
                 strategies.append(ClangDeclarationFusionStrategy(project_root="projects/clang"))
             if state_fusion:
-                strategies.append(ClangStateFusionStrategy(project_root="projects/clang"))
+                strategies.append(ClangStateFusionStrategy(project_root="projects/clang",
+                                                            lightweight=lightweight))
         return strategies
 
     if project_name == "flang":
         if os.path.exists("projects/flang"):
             if dataflow_fusion:
-                strategies.append(FlangFusionStrategy(project_root="projects/flang"))
+                strategies.append(FlangFusionStrategy(project_root="projects/flang",
+                                                        type_match=dataflow_type_match,
+                                                        lightweight=lightweight))
             if declaration_fusion:
                 strategies.append(FlangDeclarationFusionStrategy(project_root="projects/flang"))
             if state_fusion:
-                strategies.append(FlangStateFusionStrategy(project_root="projects/flang"))
+                strategies.append(FlangStateFusionStrategy(project_root="projects/flang",
+                                                             lightweight=lightweight))
         return strategies
 
     if project_name == "lfortran":
         if os.path.exists("projects/lfortran"):
             if dataflow_fusion:
-                strategies.append(LFortranFusionStrategy(project_root="projects/lfortran"))
+                strategies.append(LFortranFusionStrategy(project_root="projects/lfortran",
+                                                           type_match=dataflow_type_match,
+                                                           lightweight=lightweight))
             if declaration_fusion:
                 strategies.append(LFortranDeclarationFusionStrategy(project_root="projects/lfortran"))
             if state_fusion:
-                strategies.append(LFortranStateFusionStrategy(project_root="projects/lfortran"))
+                strategies.append(LFortranStateFusionStrategy(project_root="projects/lfortran",
+                                                                lightweight=lightweight))
         return strategies
 
     if project_name == "cpython":
         if os.path.exists("projects/cpython"):
             if dataflow_fusion:
-                strategies.append(CPythonFusionStrategy(project_root="projects/cpython"))
+                strategies.append(CPythonFusionStrategy(project_root="projects/cpython",
+                                                          lightweight=lightweight))
             if declaration_fusion:
                 strategies.append(CPythonDeclarationFusionStrategy(project_root="projects/cpython"))
             if state_fusion:
-                strategies.append(CPythonStateFusionStrategy(project_root="projects/cpython"))
+                strategies.append(CPythonStateFusionStrategy(project_root="projects/cpython",
+                                                               lightweight=lightweight))
         return strategies
 
     if project_name == "mlir":
         if os.path.exists("projects/mlir"):
             if dataflow_fusion:
-                strategies.append(MLIRFusionStrategy(project_root="projects/mlir"))
+                strategies.append(MLIRFusionStrategy(project_root="projects/mlir",
+                                                       type_match=dataflow_type_match,
+                                                       lightweight=lightweight))
             if declaration_fusion:
                 strategies.append(MLIRDeclarationFusionStrategy(project_root="projects/mlir"))
             if state_fusion:
-                strategies.append(MLIRStateFusionStrategy(project_root="projects/mlir"))
+                strategies.append(MLIRStateFusionStrategy(project_root="projects/mlir",
+                                                            lightweight=lightweight))
         return strategies
 
     if project_name == "rust":
         if os.path.exists("projects/rust"):
             if dataflow_fusion:
-                strategies.append(RustFusionStrategy(project_root="projects/rust"))
+                strategies.append(RustFusionStrategy(project_root="projects/rust",
+                                                       type_match=dataflow_type_match))
             # --struct-fusion is Rust's original name for this project's
             # declaration-fusion strategy; --declaration-fusion is accepted
             # as an alias so the flag name is consistent across projects.
+            # (No state-fusion strategy exists for Rust, so lightweight
+            # has nothing to thread into here — Rust's dataflow fusion is
+            # already on-the-fly regardless.)
             if struct_fusion or declaration_fusion:
                 strategies.append(RustStructFusionStrategy(project_root="projects/rust"))
         return strategies
@@ -6725,11 +7141,14 @@ def get_strategies(project_name=None, dataflow_fusion=False,
     if project_name == "swift":
         if os.path.exists("projects/swift"):
             if dataflow_fusion:
-                strategies.append(SwiftFusionStrategy(project_root="projects/swift"))
+                strategies.append(SwiftFusionStrategy(project_root="projects/swift",
+                                                       type_match=dataflow_type_match,
+                                                       lightweight=lightweight))
             if declaration_fusion:
                 strategies.append(SwiftDeclarationFusionStrategy(project_root="projects/swift"))
             if state_fusion:
-                strategies.append(SwiftStateFusionStrategy(project_root="projects/swift"))
+                strategies.append(SwiftStateFusionStrategy(project_root="projects/swift",
+                                                            lightweight=lightweight))
         return strategies
 
     # Fallback / Legacy behavior — only for the "no project specified" case;

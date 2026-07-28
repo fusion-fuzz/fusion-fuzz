@@ -706,10 +706,10 @@ class FusionFuzzLoop:
 
         A large positive gap means fusion is producing far more invalid
         programs than the language's own seeds do on their own — a signal
-        that the per-language state-of-interest / declaration-expression
-        mapping needs refinement for this target (see
-        core/state_analysis.py and core/llm_mapping.py). None when no
-        baseline was collected (i.e. fuzzer was run without --dry-run).
+        that splices are landing at structurally risky points more often
+        than this target's baseline would predict (see
+        core/state_analysis.py). None when no baseline was collected (i.e.
+        fuzzer was run without --dry-run).
         """
         if self.baseline_valid_rate is None or self.sample_count == 0:
             return None
