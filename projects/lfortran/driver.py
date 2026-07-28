@@ -1,0 +1,157 @@
+import os
+import re
+import random
+import shutil
+import time
+from core.driver import BaseDriver, ExecutionResult
+
+
+class LfortranDriver(BaseDriver):
+    """
+    LFortran driver: invokes the `lfortran` binary built by setup.py
+    (installed to /opt/lfortran/bin, already on PATH — see Dockerfile).
+
+    LFortran's crash reporting is its own (LCompilers) machinery, not
+    LLVM's/clang's, so the modes and signature extraction below are
+    LFortran-specific: see src/bin/lfortran.cpp's main()/main_app() and
+    src/libasr/stacktrace.cpp in the upstream source for the exact
+    wording matched here.
+    """
+
+    LFORTRAN_BIN = "lfortran"
+
+    # Different compilation depths to exercise. --show-asr is weighted
+    # heaviest: it forces full semantic analysis (parser + ASR build +
+    # passes) without needing the LLVM backend to succeed, mirroring why
+    # flang's driver weights -fsyntax-only heaviest — most frontend bugs
+    # live there. The rest push further into codegen (LLVM IR/ASM/object)
+    # or the alternate C/C++ backends.
+    MODES = [
+        "--show-ast", "--show-asr", "--show-llvm", "--show-c",
+        "--show-cpp", "--show-asm", "-S -o /dev/null", "-c -o /dev/null",
+    ]
+    MODE_WEIGHTS = [15, 30, 15, 10, 5, 5, 10, 10]
+
+    STD_VALUES = ["lf", "f23", "legacy"]
+
+    MISC_FLAGS = [
+        "--implicit-typing", "--implicit-interface",
+        "--implicit-argument-casting", "--logical-casting",
+        "--use-loop-variable-after-loop", "--legacy-array-sections",
+        "--cpp", "-g",
+    ]
+
+    _FIXED_FORM_EXTS = (".f", ".F")
+
+    def _lang_flags(self, ext):
+        return ["--fixed-form"] if ext in self._FIXED_FORM_EXTS else []
+
+    def _get_random_flags(self, ext):
+        flags = [random.choices(self.MODES, weights=self.MODE_WEIGHTS, k=1)[0]]
+        flags.extend(self._lang_flags(ext))
+        if random.random() > 0.5:
+            flags.append(f"--std={random.choice(self.STD_VALUES)}")
+        flags.extend(random.sample(self.MISC_FLAGS, random.randint(0, 3)))
+        return " ".join(flags)
+
+    def execute(self, seed):
+        start = time.time()
+        workdir = self._make_workdir()
+        seed_file = None
+        cmd = "unknown"
+        rc, stdout, stderr = 1, "", ""
+        try:
+            ext = seed.metadata.get("extension") or ".f90"
+            seed_file = os.path.join(workdir, f"{seed.id}{ext}")
+            with open(seed_file, "w", encoding="utf-8") as f:
+                f.write(seed.content)
+
+            flags = self._get_random_flags(ext)
+            cmd = f"ulimit -v 3145728; {self.LFORTRAN_BIN} {flags} {seed_file}"
+            rc, stdout, stderr = self._run_command(cmd, cwd=workdir)
+        finally:
+            shutil.rmtree(workdir, ignore_errors=True)
+
+        duration = time.time() - start
+        crashed = self._check_crash(stdout, stderr, rc)
+        sig = self.extract_crash_signature(stdout, stderr, rc) if crashed else None
+        res = ExecutionResult(rc, stdout, stderr, duration, crashed, sig)
+        res.command = cmd
+        res.seed_file = seed_file
+        return res
+
+    _TRACEBACK_RE = re.compile(r'Traceback \(most recent call last\):\n((?:.*\n?){1,80})')
+    _FRAME_IN_RE = re.compile(r', in ([A-Za-z_][\w:<>,~ &*0-9]*)')
+    _NOISE_FRAME_RE = re.compile(
+        r'^(?:main|main_app|loc_segfault_callback_print_stack|'
+        r'loc_abort_callback_print_stack)$'
+    )
+
+    def _stacktrace_fingerprint(self, text):
+        """Fingerprint the crash *location* (top real ASR/codegen frames
+        from LFortran's own Traceback block), not the invocation, so two
+        runs of the same underlying bug with different random flags/temp
+        paths collapse to the same signature. Mirrors FlangDriver's
+        _stack_dump_fingerprint, adapted to LCompilers' stacktrace2str
+        format ('File "...", line N, in <function>')."""
+        m = self._TRACEBACK_RE.search(text)
+        if not m:
+            return None
+        body = m.group(1)
+        frames = []
+        for fm in self._FRAME_IN_RE.finditer(body):
+            name = fm.group(1).strip()
+            if not name or self._NOISE_FRAME_RE.match(name):
+                continue
+            frames.append(name)
+            if len(frames) >= 3:
+                break
+        return " > ".join(frames) if frames else None
+
+    def extract_crash_signature(self, stdout, stderr, return_code):
+        combined = stderr + stdout
+
+        m = re.search(r"SUMMARY: AddressSanitizer:\s+([^\n]+)", combined)
+        if m:
+            return f"ASAN: {m.group(1).strip()}"
+
+        m = re.search(r"SUMMARY: UndefinedBehaviorSanitizer:\s+([^\n]+)", combined)
+        if m:
+            return f"UBSAN: {m.group(1).strip()}"
+
+        fp = self._stacktrace_fingerprint(combined)
+
+        if "Internal Compiler Error" in combined:
+            tail = combined[combined.find("Internal Compiler Error"):]
+            m = re.search(r'\n(\w[\w:]*): (.+)', tail)
+            detail = f": {m.group(1)}: {m.group(2).strip()}" if m else ""
+            label = f"ICE{detail}"
+            return f"{label} [{fp}]" if fp else label
+
+        if "Segfault: Signal SIGSEGV" in combined:
+            return f"SIGSEGV [{fp}]" if fp else "SIGSEGV"
+
+        if "Abort: Signal SIGABRT" in combined:
+            return f"SIGABRT [{fp}]" if fp else "SIGABRT"
+
+        m = re.search(r"terminate called after throwing an instance of '([^']+)'", combined)
+        if m:
+            return f"terminate: {m.group(1)}"
+
+        m = re.search(r"runtime_error:\s*([^\n]+)", combined)
+        if m:
+            return f"runtime_error: {m.group(1).strip()}"
+
+        m = re.search(r"std::exception:\s*([^\n]+)", combined)
+        if m:
+            return f"std::exception: {m.group(1).strip()}"
+
+        if "Unknown Exception" in combined:
+            return "Unknown Exception"
+
+        if "Aborted" in combined:
+            return "Aborted"
+        if "Segmentation fault" in combined:
+            return "Segmentation fault"
+
+        return super().extract_crash_signature(stdout, stderr, return_code)

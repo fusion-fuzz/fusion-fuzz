@@ -2,7 +2,7 @@
 
 ![Tests](https://github.com/fusion-fuzz/fusion-fuzz/actions/workflows/tests.yml/badge.svg)
 
-**Fusion Fuzz** is a language-agnostic, scalable semantic fuzzer designed to uncover deep bugs in language processors (compilers and interpreters) across a growing list of targets — PHP, CPython, Swift, Clang, MLIR, Flang, Haskell, and more.
+**Fusion Fuzz** is a language-agnostic, scalable semantic fuzzer designed to uncover deep bugs in language processors (compilers and interpreters) across a growing list of targets — PHP, CPython, Swift, Clang, MLIR, Flang, LFortran, Haskell, and more.
 
 Unlike traditional grammar-based fuzzers (which generate code from scratch) or mutation-based fuzzers (which flip bits blindly), Fusion Fuzz operates at a higher semantic level: **program fusion** — bridging the behavior of two independent seed programs together so the result exercises interactions neither seed triggers alone.
 
@@ -40,6 +40,7 @@ To know whether a language's mapping needs refining, Fusion Fuzz tracks the **va
 | ![Clang](https://img.shields.io/badge/Clang-supported-brightgreen?logo=llvm&logoColor=white) | **Supported** | ✅ | ✅ | ✅ |
 | ![MLIR](https://img.shields.io/badge/MLIR-supported-brightgreen?logo=llvm&logoColor=white) | **Supported** | ✅ | ✅ | ✅ |
 | ![Flang](https://img.shields.io/badge/Flang-supported-brightgreen?logo=llvm&logoColor=white) | **Supported** | ✅ | ✅ | ✅ |
+| ![LFortran](https://img.shields.io/badge/LFortran-supported-brightgreen?logo=fortran&logoColor=white) | **Supported** | ✅ | ✅ | ✅ |
 | ![Haskell](https://img.shields.io/badge/GHC-supported-brightgreen?logo=haskell&logoColor=white) | **Supported** | ✅ | ✅ | ✅ |
 | ![Rust](https://img.shields.io/badge/Rust-experimental-orange?logo=rust&logoColor=white) | **Experimental** | ✅ | — | ✅ |
 | ![GCC](https://img.shields.io/badge/GCC-planned-lightgrey?logo=gnu&logoColor=white) | **Planned** | - | - | - |
@@ -49,7 +50,7 @@ To know whether a language's mapping needs refining, Fusion Fuzz tracks the **va
 >
 > Rust's "declaration fusion" is item-level struct/enum/trait/impl fusion, reachable via either `--struct-fusion` or `--declaration-fusion` (the latter is an accepted alias); Rust has no state-fusion strategy yet. State/declaration fusion for the other 7 projects are each opt-in independently via `--state-fusion`/`--declaration-fusion` — pass any combination of `--dataflow-fusion`/`--state-fusion`/`--declaration-fusion`; only the ones you pass are active (defaults to dataflow fusion alone if you pass none). See [CLI Reference](#cli-reference) below.
 >
-> **Verification note:** Clang and CPython's state/declaration strategies were checked against real toolchains (`g++ -fsyntax-only`, `ast.parse`). PHP, Flang, Swift, Haskell, and MLIR were verified structurally only (brace/indentation/block balance) — no local compiler for those targets was available during development. Haskell in particular has the least verification confidence given its layout-rule sensitivity; treat its `--state-fusion` output as more likely to hit `--dry-run`'s validity filter than the other targets until it's been run against real `ghc`.
+> **Verification note:** Clang and CPython's state/declaration strategies were checked against real toolchains (`g++ -fsyntax-only`, `ast.parse`). PHP, Flang, LFortran, Swift, Haskell, and MLIR were verified structurally only (brace/indentation/block balance) — no local compiler for those targets was available during development. Haskell in particular has the least verification confidence given its layout-rule sensitivity; treat its `--state-fusion` output as more likely to hit `--dry-run`'s validity filter than the other targets until it's been run against real `ghc`. LFortran's strategies are `FlangFusionStrategy`/`FlangStateFusionStrategy`/`FlangDeclarationFusionStrategy` reused as-is (see `core/fusion.py`'s `LFortranFusionStrategy` and siblings) since both frontends fuzz off the same plain-Fortran seed corpus — carries the same verification confidence as flang's.
 
 ## Bugs Found
 
@@ -71,7 +72,7 @@ All targets run inside Docker to protect host integrity — never build/run a ta
 ### Step 1: Build the Image and Start a Container
 
 ```bash
-cd ./projects/<name>              # e.g. php, cpython, clang, mlir, flang, swift, haskell, rust
+cd ./projects/<name>              # e.g. php, cpython, clang, mlir, flang, lfortran, swift, haskell, rust
 docker build -t fusion-fuzz-<name> .
 cd ../..
 
@@ -224,6 +225,10 @@ The build/run pattern in [Step 1](#step-1-build-the-image-and-start-a-container)
 
 > The first `--setup` compiles LLVM/MLIR from source, which can take several hours and requires substantial RAM. On a 32 GB machine, limit compilation parallelism (the Dockerfile does this automatically with `-j4`).
 
+#### LFortran
+
+> The first `--setup` clones and builds lfortran from source (installed to `/opt/lfortran`), which can take a while and use several GB of RAM per build job — see `projects/lfortran/setup.py`'s `_ninja_job_count` for why parallelism is capped by memory rather than CPU count alone. Shares its seed corpus with `projects/flang` (both are plain Fortran frontends fuzzing the same `llvm-project` test sources) instead of maintaining a separate clone.
+
 #### PHP / CPython / Swift / Flang / Rust / Haskell
 
 No special first-run steps beyond the standard flow above.
@@ -260,8 +265,8 @@ python3 main.py --project <name> [options]
 | Flag | Default | Description |
 |------|---------|-------------|
 | `--dataflow-fusion` | on when no technique flag is given | Bridge variable linking via def-use dataflow graph. Each fusion randomly picks A→B or B→A direction. Combinable with `--state-fusion`/`--declaration-fusion` — every technique you enable is added to the same pool and one is picked at random per iteration. |
-| `--state-fusion` | off | [php/cpython/clang/flang/swift/haskell/mlir] Add a state-of-interest-driven strategy (`core/state_analysis.py`) to the pool — profiles each seed for points near a resource release/type conversion/exception boundary, then grafts one seed's continuation into the other's state there. Combinable with `--dataflow-fusion`/`--declaration-fusion`. |
-| `--declaration-fusion` | off | Confuse declarations instead of dataflow: make an extensible declaration expression in one seed (base class list, template/generic parameter, trait/superclass bound, operand type constraint) refer to a declaration in the other. No runtime dataflow needed. Combinable with `--dataflow-fusion`/`--state-fusion`. [rust] alias of `--struct-fusion`. [clang] base-class + template-param injection, item nesting. [php] `implements`/`extends`/trait-use injection. [swift] protocol-conformance injection. [cpython] extra base-class injection (MRO/metaclass conflicts at class-statement time). [haskell] typeclass superclass-constraint injection. [flang] derived-type `EXTENDS()` injection. [mlir] function-signature operand/result-type swap. |
+| `--state-fusion` | off | [php/cpython/clang/flang/lfortran/swift/haskell/mlir] Add a state-of-interest-driven strategy (`core/state_analysis.py`) to the pool — profiles each seed for points near a resource release/type conversion/exception boundary, then grafts one seed's continuation into the other's state there. Combinable with `--dataflow-fusion`/`--declaration-fusion`. |
+| `--declaration-fusion` | off | Confuse declarations instead of dataflow: make an extensible declaration expression in one seed (base class list, template/generic parameter, trait/superclass bound, operand type constraint) refer to a declaration in the other. No runtime dataflow needed. Combinable with `--dataflow-fusion`/`--state-fusion`. [rust] alias of `--struct-fusion`. [clang] base-class + template-param injection, item nesting. [php] `implements`/`extends`/trait-use injection. [swift] protocol-conformance injection. [cpython] extra base-class injection (MRO/metaclass conflicts at class-statement time). [haskell] typeclass superclass-constraint injection. [flang/lfortran] derived-type `EXTENDS()` injection. [mlir] function-signature operand/result-type swap. |
 | `--struct-fusion` | off | [rust only] Item-level fusion: nest struct/enum/trait/impl/fn definitions from one seed inside a container found in the other, plus supertrait injection, impl grafting, and generic bound injection. Same strategy as `--declaration-fusion` for this project. |
 
 Pass none of `--dataflow-fusion`/`--state-fusion`/`--declaration-fusion` to get the default (dataflow fusion only). Pass any subset to run exactly those techniques, side by side in the same random-pick pool — e.g. `--state-fusion --declaration-fusion` (no `--dataflow-fusion`) runs only those two, never plain dataflow bridging. A combination unsupported by the target project (e.g. `--state-fusion` on `rust`, which has no state-fusion strategy) fails fast at startup with an error rather than silently doing nothing.

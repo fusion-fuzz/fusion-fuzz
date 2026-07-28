@@ -1,0 +1,43 @@
+project_name: "lfortran"
+
+execution:
+  # The driver picks flags dynamically per seed; this template is only
+  # used as a BaseDriver fallback.
+  command: "lfortran --show-asr {seed_path}"
+  timeout: 10
+  concurrency: 16
+
+analysis:
+  crash_patterns:
+    - "SUMMARY: AddressSanitizer"
+    - "SUMMARY: UndefinedBehaviorSanitizer"
+    - "Segfault: Signal SIGSEGV"
+    - "Abort: Signal SIGABRT"
+    - "Internal Compiler Error"
+    - "AssertFailed"
+    - "LCOMPILERS_ASSERT failed"
+    - "runtime_error:"
+    - "std::exception:"
+    - "Unknown Exception"
+    - "terminate called after throwing"
+    - "Segmentation fault"
+    - "Aborted"
+    - "core dumped"
+  syntax_patterns:
+    - "syntax error"
+    - "semantic error"
+    - "tokenizer error"
+    - "prescanner error"
+
+paths:
+  # Shared with projects/flang: both are Fortran frontends, so they fuzz
+  # off the exact same seed corpus (llvm-project's flang/test) instead of
+  # each maintaining a separate clone. See projects/lfortran/setup.py.
+  seed_source: "projects/flang/llvm-project/flang/test"
+  seed_corpus: "projects/lfortran/corpus.db"
+
+llm:
+  provider: "openai"  # Options: gemini, openai, vllm, ollama
+  model: "gpt-5.4-mini"
+  api_key: "" # Defaults to LLM_API_KEY env var
+  timeout: 30
