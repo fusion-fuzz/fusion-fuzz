@@ -16,13 +16,31 @@ class PairwiseCoverageMatrix:
 
     Internally stored as a set of frozensets so order doesn't matter.
     Guides parent selection toward unexplored, producer/consumer-compatible
-    combinations (see core/resource_matching.py); falls back to plain
-    unfused sampling, then fully random sampling, once those are exhausted.
+    combinations (see core/resource_matching.py) when guided_fusion_enabled
+    (--guided-fusion) is on; falls back to plain unfused sampling, then
+    fully random sampling, once those are exhausted.
+
+    --guided-fusion only takes effect when pre_analysis_enabled (--pre-
+    analysis) is also on: extract_resource_profile's produce/consume
+    signal is built entirely from dry-run-collected metadata (var_types,
+    struct_names, functions, imports, ...) — with that metadata absent, it
+    would fall back to raw-token overlap, a much weaker, closer-to-noise
+    signal not worth the cost of scoring every candidate pair. So
+    compatibility scoring only runs when *both* flags are on; otherwise
+    select_parents just prefers an unfused pair uniformly at random.
     """
 
-    def __init__(self):
+    def __init__(self, pre_analysis_enabled: bool = True, guided_fusion_enabled: bool = False):
         self._fused: set = set()
         self._profile_cache: dict = {}
+        self.guided = guided_fusion_enabled and pre_analysis_enabled
+        if guided_fusion_enabled and not pre_analysis_enabled:
+            logger.warning(
+                "--guided-fusion has no effect without --pre-analysis (its "
+                "compatibility signal is built entirely from dry-run-"
+                "collected metadata) — falling back to unfused-pair-only "
+                "random parent selection."
+            )
 
     def record(self, id_a: str, id_b: str) -> None:
         """Mark the pair (id_a, id_b) as fused."""
@@ -64,6 +82,10 @@ class PairwiseCoverageMatrix:
         unfused-but-incompatible pair seen during the search, then to plain
         random sampling once all pairs are saturated — so sparse metadata
         never stalls fuzzing, it just loses the compatibility bias.
+
+        Without --guided-fusion (or without --pre-analysis alongside it —
+        see class docstring), skips compatibility scoring entirely and
+        just prefers an unfused pair uniformly at random.
         """
         n = len(corpus)
         if n < 2:
@@ -73,6 +95,18 @@ class PairwiseCoverageMatrix:
         # saturation approaches. Retry budget scales with corpus size so
         # large corpora still find uncovered pairs without excessive looping.
         max_tries = max(n, 50)
+
+        if not self.guided:
+            for _ in range(max_tries):
+                a, b = random.sample(corpus, 2)
+                if not self.has_been_fused(a.id, b.id):
+                    self.record(a.id, b.id)
+                    return a, b
+            logger.debug("Pairwise coverage saturated; falling back to random selection.")
+            a, b = random.sample(corpus, 2)
+            self.record(a.id, b.id)
+            return a, b
+
         fallback = None
         for _ in range(max_tries):
             a, b = random.sample(corpus, 2)

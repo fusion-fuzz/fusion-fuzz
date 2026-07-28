@@ -29,8 +29,8 @@ Two things make a point usable:
    guarantee the grafted program is semantically valid — a donor
    continuation referencing the donor's own earlier variables is exactly
    the kind of "reach into an unfamiliar state" case state fusion is
-   for, and it is expected to sometimes fail. The validity-gap metric
-   (core/orchestrator.py) tracks how often that happens per language.
+   for, and it is expected to sometimes fail. core/orchestrator.py's
+   FuseValidRate tracks how often that happens per language.
 """
 
 import re

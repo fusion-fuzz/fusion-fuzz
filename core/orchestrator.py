@@ -52,17 +52,11 @@ def _extract_display_code(content: str, ext: str) -> tuple[str, str]:
     return content, ext.lstrip(".")
 
 class FusionFuzzLoop:
-    def __init__(self, config, strategies, initial_corpus, baseline_valid_rate=None):
+    def __init__(self, config, strategies, initial_corpus, pre_analysis_enabled=True,
+                 guided_fusion_enabled=False):
         self.config = config
         self.strategies = strategies
 
-        # Validity-gap metric: % of *original* (unfused) seeds accepted without
-        # error by the target, captured once via --dry-run before fuzzing starts.
-        # Compared against the running fused valid-rate to gauge how much the
-        # state/declaration recognition mapping for this language is losing to
-        # malformed fusions vs. the language's own baseline rejection rate.
-        self.baseline_valid_rate = baseline_valid_rate
-        
         # Sanitize corpus: Ensure everything is a Seed object
         self.corpus = []
         if initial_corpus:
@@ -93,8 +87,12 @@ class FusionFuzzLoop:
         self.unique_crashes = set()
         self._load_existing_crashes()
 
-        # Pairwise conjunction coverage matrix
-        self.coverage = PairwiseCoverageMatrix()
+        # Pairwise conjunction coverage matrix — producer-consumer guided
+        # parent selection (--guided-fusion) only takes effect when
+        # --pre-analysis is also enabled (see PairwiseCoverageMatrix's
+        # docstring).
+        self.coverage = PairwiseCoverageMatrix(pre_analysis_enabled=pre_analysis_enabled,
+                                                guided_fusion_enabled=guided_fusion_enabled)
         
         self.original_cwd = os.getcwd()
         self.current_workspace = None
@@ -700,42 +698,6 @@ class FusionFuzzLoop:
             return 100.0
         return 100.0 * (1.0 - (self.syntax_error_count / self.sample_count))
 
-    def _validity_gap(self):
-        """
-        Validity gap = baseline_valid_rate - fused_valid_rate.
-
-        A large positive gap means fusion is producing far more invalid
-        programs than the language's own seeds do on their own — a signal
-        that splices are landing at structurally risky points more often
-        than this target's baseline would predict (see
-        core/state_analysis.py). None when no baseline was collected (i.e.
-        fuzzer was run without --dry-run).
-        """
-        if self.baseline_valid_rate is None or self.sample_count == 0:
-            return None
-        return self.baseline_valid_rate - self._fused_valid_rate()
-
-    def _persist_validity_gap(self):
-        """Write current validity-gap stats to output/<project>_validity_gap.json."""
-        gap = self._validity_gap()
-        if self.baseline_valid_rate is None:
-            return
-        try:
-            import json
-            os.makedirs(os.path.join(self.original_cwd, "output"), exist_ok=True)
-            path = os.path.join(self.original_cwd, "output", f"{self.project_name}_validity_gap.json")
-            with open(path, "w", encoding="utf-8") as f:
-                json.dump({
-                    "project": self.project_name,
-                    "baseline_valid_rate": round(self.baseline_valid_rate, 2),
-                    "fused_valid_rate": round(self._fused_valid_rate(), 2),
-                    "validity_gap": round(gap, 2) if gap is not None else None,
-                    "sample_count": self.sample_count,
-                    "updated_at": datetime.datetime.now().isoformat(timespec="seconds"),
-                }, f, indent=2)
-        except Exception as e:
-            logger.debug(f"Could not persist validity gap: {e}")
-
     def _print_status(self):
         """Prints a dynamic status bar to stdout."""
         current_time = time.time()
@@ -756,13 +718,11 @@ class FusionFuzzLoop:
         covered = self.coverage.covered_count()
         cov_pct = (covered / total_pairs * 100.0) if total_pairs > 0 else 100.0
         pairs_per_sec = covered / elapsed
-        gap = self._validity_gap()
-        gap_segment = f" | ValidityGap: {gap:+.1f}pp" if gap is not None else ""
         status = (
             f"\r[ {str(datetime.timedelta(seconds=int(elapsed)))} ] "
             f"Throughput: {throughput:.1f} tests/s | "
             f"Bugs: {len(self.unique_crashes)} | "
-            f"FuseValidRate: {valid_rate:.1f}%{gap_segment} | "
+            f"FuseValidRate: {valid_rate:.1f}% | "
             f"PairCov: {covered}/{total_pairs} ({cov_pct:.1f}%, {pairs_per_sec:.1f} pairs/s)"
         )
 
@@ -959,10 +919,6 @@ class FusionFuzzLoop:
                                 if self.iterations % 2000 == 0:
                                     gc.collect()
 
-                                # Periodic validity-gap snapshot
-                                if self.iterations % 2000 == 0:
-                                    self._persist_validity_gap()
-
                                 pairs = future.result()
 
                                 for child, result in pairs:
@@ -1040,14 +996,8 @@ class FusionFuzzLoop:
                     self._sample_log_file.close()
                 except Exception:
                     pass
-            self._persist_validity_gap()
-            gap = self._validity_gap()
-            if gap is not None:
-                logger.info(
-                    f"Validity gap: baseline={self.baseline_valid_rate:.1f}% "
-                    f"fused={self._fused_valid_rate():.1f}% gap={gap:+.1f}pp "
-                    f"(output/{self.project_name}_validity_gap.json)"
-                )
+            if self.sample_count > 0:
+                logger.info(f"Fused valid rate: {self._fused_valid_rate():.1f}%")
 
         # 3. Cleanup Workspace
         os.chdir(self.original_cwd)
