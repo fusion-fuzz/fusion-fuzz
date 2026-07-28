@@ -53,22 +53,30 @@ if __name__ == "__main__":
                              "Omit PATH to use default: output/<project>_samples.log")
     parser.add_argument("--dry-run", action="store_true", default=False,
                         help="Execute every seed once before fuzzing and filter the corpus down "
-                             "to seeds whose own execution returns rc==0 (also computes the "
-                             "baseline valid rate used by the validity-gap metric). Does not "
-                             "collect fusion metadata by itself — pair with --pre-analysis for "
-                             "that; combined, they share one execution pass per seed rather "
-                             "than running it twice.")
+                             "to seeds whose own execution returns rc==0. Does not collect fusion "
+                             "metadata by itself — pair with --pre-analysis for that; combined, "
+                             "they share one execution pass per seed rather than running it twice.")
     parser.add_argument("--pre-analysis", action="store_true", default=False,
                         help="Execute every seed once before fuzzing (probe-instrumented where "
                              "a language needs one) and collect the metadata fusion strategies "
                              "use at runtime: dataflow graphs, declared/observed variable types, "
                              "and core/state_analysis.py's live-variable states of interest for "
-                             "state fusion. Does not filter the corpus by validity — pair with "
-                             "--dry-run for that. Required for --declaration-fusion/--struct-fusion "
-                             "(disabled otherwise, with a warning). Without it, --dataflow-fusion "
-                             "falls back to a lightweight on-the-fly random-variable-connect rule "
-                             "and --state-fusion falls back to picking any random line, for every "
+                             "state fusion. Also a prerequisite for --guided-fusion (see below). "
+                             "Does not filter the corpus by validity — pair with --dry-run for "
+                             "that. Required for --declaration-fusion/--struct-fusion (disabled "
+                             "otherwise, with a warning). Without it, --dataflow-fusion falls back "
+                             "to a lightweight on-the-fly random-variable-connect rule and "
+                             "--state-fusion falls back to picking any random line, for every "
                              "project.")
+    parser.add_argument("--guided-fusion", action="store_true", default=False,
+                        help="Producer-consumer guided parent selection (core/resource_matching.py, "
+                             "core/coverage.py): among unfused seed pairs, prefer one where a "
+                             "resource one seed produces (a type it instantiates, a symbol it "
+                             "defines) matches a consumption site the other exposes, instead of "
+                             "picking any unfused pair uniformly at random. Only takes effect "
+                             "together with --pre-analysis (the compatibility signal is built "
+                             "entirely from dry-run-collected metadata) — passing this alone logs "
+                             "a warning and has no effect.")
     parser.add_argument("--concurrency", type=int, default=None, help="Override the number of threads for execution (default is from config.yaml)")
     parser.add_argument("--reduce", type=str, default=None, metavar="BUG_DIR",
                         help="Minimize a crash reproducer (test.<ext>) to min.<ext> using delta "
@@ -422,7 +430,6 @@ if __name__ == "__main__":
     #    otherwise all loaded seeds are used as-is.
     _max_workers = config.get("execution", {}).get("concurrency", 4)
 
-    _baseline_valid_rate = None
     if args.dry_run or args.pre_analysis:
         from core.driver import get_driver
         from core.dryrun import run_dryrun_with_metadata
@@ -446,18 +453,6 @@ if __name__ == "__main__":
             f"Using {len(_valid_corpus)}/{len(initial_corpus)} seeds for fuzzing"
             + (" (filtered to rc=0)." if args.dry_run else " (unfiltered).")
         )
-        if initial_corpus:
-            # Baseline for the validity-gap metric: how many *original*,
-            # unfused seeds this target already accepts on their own. Fusion's
-            # valid-rate is later compared against this to gauge how much of
-            # the invalidity is coming from the fusion strategy itself rather
-            # than the language's inherent rejection rate. Computed from
-            # 'rc' directly (always recorded once a seed executes) rather
-            # than assuming _valid_corpus is already rc==0-filtered, since
-            # --pre-analysis alone leaves it unfiltered.
-            _valid_count = sum(1 for s in _valid_corpus if (s.metadata or {}).get("rc") == 0)
-            _baseline_valid_rate = 100.0 * _valid_count / len(initial_corpus)
-            logger.info(f"Baseline (unfused) valid rate: {_baseline_valid_rate:.1f}%")
     else:
         _valid_corpus = initial_corpus
         logger.info(
@@ -491,7 +486,8 @@ if __name__ == "__main__":
         config=config,
         strategies=_strategies,
         initial_corpus=_valid_corpus,
-        baseline_valid_rate=_baseline_valid_rate,
+        pre_analysis_enabled=args.pre_analysis,
+        guided_fusion_enabled=args.guided_fusion,
     )
     
     # === GCOV RESET (before fuzzing) ===

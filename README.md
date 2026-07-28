@@ -18,17 +18,13 @@ The result is a program whose behavior — or whose declared structure — is a 
 
 ### Producer-Consumer Guided Fusion
 
-Not every pair of seeds is worth fusing — meaningful fusion needs an asymmetric relationship, where one seed contributes a semantic resource (a type it defines, a value it produces) and the other exposes a context that can consume it. Rather than pairing seeds at random, Fusion Fuzz extracts a lightweight produce/consume profile from each seed (types instantiated, symbols defined, symbols referenced) and biases parent selection toward pairs with real overlap, falling back to plain-random pairing only when no compatible match is found in budget — so fuzzing never stalls, it just loses the bias.
+Not every pair of seeds is worth fusing — meaningful fusion needs an asymmetric relationship, where one seed contributes a semantic resource (a type it defines, a value it produces) and the other exposes a context that can consume it. Passing `--guided-fusion`, Fusion Fuzz extracts a lightweight produce/consume profile from each seed (types instantiated, symbols defined, symbols referenced) and biases parent selection toward pairs with real overlap, falling back to plain-random pairing only when no compatible match is found in budget — so fuzzing never stalls, it just loses the bias. Off by default, and only takes effect together with `--pre-analysis`: the profile is built entirely from dry-run-collected metadata (`var_types`, `struct_names`, `functions`, `imports`, ...), so `--guided-fusion` alone logs a warning and has no effect. Without it (or without `--pre-analysis` alongside it), parent selection just prefers an unfused pair uniformly at random instead of scoring compatibility.
 
 ### Seed Migration
 
 Program fusion needs a rich, well-structured seed corpus (unit tests covering language features, regression tests encoding known bug patterns) — something few languages, especially emerging ones, have accumulated independently. Fusion Fuzz instead **migrates seeds across languages**: tests already collected for one target are translated into every other target with a one-time LLM effort (`corpus/main.py`), rather than requiring each language to build a corpus from scratch.
 
 State fusion's "state of interest" (`core/state_analysis.py`) is a single rule applied uniformly across every supported language (Haskell aside — its layout-based scoping doesn't fit this model): the point with the most *live* variables — declared, and still in scope — is the most complex, offering a donor continuation the richest surface of names to collide with. This is a static, best-effort approximation (a per-language declare/decrement/scope config, not a real dataflow analysis), computed the same way for every target rather than needing a hand- or LLM-authored mapping per language.
-
-### Validity Gap Metric
-
-Fusion Fuzz tracks the **validity gap**: the difference between how often a target's *original*, unfused seeds are accepted without error, and how often *fused* programs are. A small gap means fusion is producing programs about as often-valid as the seeds themselves; a large gap flags a language where splices are landing at structurally risky points more often than that language's baseline would predict.
 
 ## Supported Projects
 
@@ -58,7 +54,7 @@ Bugs found by Fusion Fuzz are tracked at https://fusion-fuzz.github.io (updated 
 
 ## Quick Start: Recommended Workflow
 
-Fusion Fuzz has a **one-time offline pre-analysis phase** that should run *before* your first real fuzzing session for a project, and again any time you add new seeds. Skipping it doesn't break anything, but it means every fusion strategy has to recompute dataflow graphs and state-of-interest points **during** fuzzing instead of once up front, and you lose the baseline needed for the validity-gap metric. The steps below are numbered in the order you should actually run them.
+Fusion Fuzz has a **one-time offline pre-analysis phase** that should run *before* your first real fuzzing session for a project, and again any time you add new seeds. Skipping it doesn't break anything, but it means every fusion strategy has to recompute dataflow graphs and state-of-interest points **during** fuzzing instead of once up front. The steps below are numbered in the order you should actually run them.
 
 ### Step 0: Prerequisites
 
@@ -113,7 +109,7 @@ python3 main.py --project <name> --dry-run --pre-analysis
 
 This is the step the paper calls **seed formulation and pre-analysis**, split into two independent flags that share a single execution pass over the corpus when both are given (so passing both isn't twice the cost of passing one):
 
-- **`--dry-run`** — executes each seed once against the real target (5s timeout by default) and filters the corpus down to seeds with a zero return code (invalid seeds are just noise for fusion). Also records the corpus's **baseline valid rate**: how many of the *original*, unfused seeds this target accepts, threaded into the orchestrator as the baseline for the **validity-gap metric** (`FuseValidRate` vs. baseline, shown live during fuzzing — see [Step 6](#step-6-monitoring-a-run)). Does not collect any fusion metadata by itself.
+- **`--dry-run`** — executes each seed once against the real target (5s timeout by default) and filters the corpus down to seeds with a zero return code (invalid seeds are just noise for fusion). Does not collect any fusion metadata by itself.
 - **`--pre-analysis`** — executes each seed once (probe-instrumented first, for languages whose collector needs one) and extracts and caches, per seed, in `corpus.db`:
   - its **dataflow graph** (`meta['dataflows']`) — consumed by dataflow fusion so it never has to recompute def-use chains at fusion time;
   - its **states of interest** (`meta['states_of_interest']`) — the point(s) with the most live, still-in-scope variables, consumed by `--state-fusion` so it never has to re-scan a seed to find a splice point (Haskell always just picks a random line instead, regardless of this cache — its layout-based scoping doesn't fit the live-variable-count rule);
@@ -158,14 +154,13 @@ You do **not** need to repeat `--setup`/`--bug-corpus`/`--dry-run`/`--pre-analys
 The live status line reports:
 
 ```
-[ 0:12:34 ] Throughput: 42.1 tests/s | Bugs: 3 | FuseValidRate: 87.4% | ValidityGap: +6.2pp | PairCov: 512/4950 (10.3%, 0.7 pairs/s)
+[ 0:12:34 ] Throughput: 42.1 tests/s | Bugs: 3 | FuseValidRate: 87.4% | PairCov: 512/4950 (10.3%, 0.7 pairs/s)
 ```
 
 - **FuseValidRate** — % of fused samples this run accepted without a syntax/parse error.
-- **ValidityGap** — `baseline_valid_rate - FuseValidRate` (only shown if you ran `--dry-run` first). A large, growing positive number means the active fusion strategy is producing far more invalid output than this language's seeds do on their own.
 - **PairCov** — how much of the seed corpus's pairwise combination space has been explored (producer-consumer-guided, see above).
 
-The same numbers are persisted to `output/<name>_validity_gap.json` every 2000 iterations and at shutdown, so you can inspect them without watching the terminal.
+The final `Fused valid rate` is also logged once at shutdown.
 
 ### Step 7: Triage and Reduce
 
@@ -243,8 +238,9 @@ python3 main.py --project <name> [options]
 | `--setup` | off | Re-parse seeds and rebuild the corpus |
 | `--bug-corpus` | off | Seed corpus with pre-translated reproducers from `corpus/corpus.db` (pair with `--setup`) |
 | `--preprocessing` | off | [cpython only] Run dynamic type-tracing on seeds during `--setup` — unrelated to `--pre-analysis` |
-| `--dry-run` | off | Execute every seed once, discard non-zero-RC seeds, record the validity-gap baseline. No metadata collection by itself |
+| `--dry-run` | off | Execute every seed once, discard non-zero-RC seeds. No metadata collection by itself |
 | `--pre-analysis` | off | Execute every seed once, cache dataflow graphs + states of interest + type metadata. No corpus filtering by itself. Combine with `--dry-run` to share one execution pass |
+| `--guided-fusion` | off | Producer-consumer guided parent selection — only takes effect together with `--pre-analysis` |
 | `--corpus-size <n>` | off | Sample N seeds from the loaded corpus for fusion instead of using all of them |
 | `--diverse` | off | With `--corpus-size`: greedy farthest-point sampling for a dissimilar subset, instead of uniform random |
 | `--save-subset <path>` | off | Save the selected corpus subset (after `--corpus-size`/`--diverse`) for reuse |
@@ -285,7 +281,6 @@ output/
 ├── bugs/
 │   └── <project>/
 │       └── crash_<id>.md              # Metadata, logs, and reproduction content
-├── <project>_validity_gap.json        # Baseline vs. fused valid rate, updated live (see Step 6)
 ├── <project>_samples.log              # Only with --sample-log
 └── ...
 projects/<project>/
@@ -307,7 +302,7 @@ python3 main.py --reduce ./output/bugs/php/crash_<id>
 Fusion Fuzz is structured around the following decoupled components:
 
 ### 1. Orchestrator (`core/orchestrator.py`)
-The central fuzzing loop. Manages a dynamic thread pool, monitors for stalled workers, deduplicates crashes by signature (e.g., from AddressSanitizer output), tracks the validity-gap metric (baseline vs. fused valid rate) and persists it to `output/<project>_validity_gap.json`, and runs each iteration in an isolated temporary directory.
+The central fuzzing loop. Manages a dynamic thread pool, monitors for stalled workers, deduplicates crashes by signature (e.g., from AddressSanitizer output), tracks the fused valid rate (FuseValidRate), and runs each iteration in an isolated temporary directory.
 
 ### 2. Parent Selection (`core/coverage.py`, `core/resource_matching.py`)
 `PairwiseCoverageMatrix` tracks which seed pairs have already been fused and prefers unexplored combinations. `core/resource_matching.py` extracts a lightweight produce/consume resource profile per seed (from cached pre-analysis metadata, or raw token overlap as a fallback) and biases selection toward producer/consumer-compatible pairs — the **producer-consumer guided fusion** design — falling back to plain-unfused, then fully random, sampling so fuzzing never stalls.
@@ -320,7 +315,7 @@ Adapters that abstract target execution. Three layers:
 
 ### 4. Seed Parsers & Pre-Analysis (`core/parser.py`, `core/dryrun.py`, `projects/*/parser.py`)
 - **`BaseParser`**/project parsers — scan source trees, extract metadata, and populate a per-project `corpus.db` (SQLite).
-- **`core/dryrun.py`** — the **seed formulation and pre-analysis** pass, split into `--dry-run` (validity filter + baseline valid rate) and `--pre-analysis` (caches each seed's dataflow graph and, via `core/state_analysis.py`, its states of interest) — see [Step 4](#step-4-run-pre-analysis-first). Both share one execution pass per seed when combined.
+- **`core/dryrun.py`** — the **seed formulation and pre-analysis** pass, split into `--dry-run` (validity filter) and `--pre-analysis` (caches each seed's dataflow graph and, via `core/state_analysis.py`, its states of interest) — see [Step 4](#step-4-run-pre-analysis-first). Both share one execution pass per seed when combined.
 
 ### 5. Fusion Engine (`core/fusion.py`, `core/state_analysis.py`)
 Implements **program fusion** — bridging two seeds' behavior or declarations into one novel input:
