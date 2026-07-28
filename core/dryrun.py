@@ -1,10 +1,22 @@
 """
-core/dryrun.py — Dry-Run Metadata Collector for FusionFuzzLoop
+core/dryrun.py — Pre-Fuzzing Seed Execution: Validity Filter + Metadata Collector
 
-During the dry-run phase (before fuzzing starts), every seed is executed
-once. This module uses that opportunity to collect both *static*
-(source-level regex analysis) and *dynamic* (stdout/stderr) metadata,
-then persists it back to the corpus DB.
+Two independent concerns share one execution pass over the corpus, each
+gated by its own CLI flag (main.py):
+
+  --dry-run       execute each seed once, keep only rc==0 ("is this seed
+                  even valid on its own?"). No metadata collection.
+  --pre-analysis  execute each seed once (probe-instrumented, for
+                  languages that need one) and collect *static*
+                  (source-level regex analysis) and *dynamic*
+                  (stdout/stderr) metadata for the fusion strategies —
+                  dataflow graphs, declared/observed types, and
+                  core/state_analysis.py's live-variable states of
+                  interest. Does not filter the corpus.
+
+Pass both and they share the same single execution per seed rather than
+running it twice — run_dryrun_with_metadata's collect_metadata/
+filter_valid params are what --pre-analysis/--dry-run map to.
 
 Why this matters for fusion quality
 ------------------------------------
@@ -55,9 +67,17 @@ WGSL / naga / wgslc:
   var_types        dict[str,str]
   line_count       int
 
-All languages also receive:
-  dryrun_done      bool            marker so a second run skips the seed
-  rc               int             return code from the dry-run execution
+All languages also receive (whenever the seed is executed at all, under
+either flag):
+  dryrun_done        bool          marker so a later --dry-run run can
+                                    skip re-executing this seed
+  rc                 int           return code from the execution
+
+--pre-analysis additionally sets:
+  pre_analysis_done  bool          marker so a later --pre-analysis run
+                                    can skip re-collecting this seed
+  states_of_interest list[dict]    core/state_analysis.py's StatePoint
+                                    cache, consumed by *StateFusionStrategy
 """
 
 import json
@@ -643,57 +663,85 @@ def run_dryrun_with_metadata(
     concurrency: int = 4,
     timeout: int = 5,
     force: bool = False,
+    collect_metadata: bool = True,
+    filter_valid: bool = True,
 ) -> list:
     """
-    Execute every seed once, collect rich metadata, persist to *db_path*,
-    and return only the seeds whose execution returned rc == 0.
+    Execute seeds that still need it — at most once each, even if both
+    concerns below are requested — then return the result.
+
+    collect_metadata (--pre-analysis) and filter_valid (--dry-run) are
+    independent: pass either alone, or both to reproduce this function's
+    original combined behavior in one pass instead of two.
 
     Parameters
     ----------
-    seeds          : list[Seed]   — corpus loaded from the project DB
-    driver_factory : callable()   — returns a fresh driver instance;
-                                    called once per worker thread
-    db_path        : str | None   — path to corpus.db for metadata updates;
-                                    pass None to skip persistence
-    concurrency    : int          — parallel worker count
-    timeout        : int          — per-seed execution timeout (seconds)
-    force          : bool         — if True, re-collect even for seeds that
-                                    already have dryrun_done=True
+    seeds            : list[Seed]  — corpus loaded from the project DB
+    driver_factory   : callable()  — returns a fresh driver instance;
+                                     called once per worker thread
+    db_path          : str | None  — path to corpus.db for metadata
+                                     updates; pass None to skip persistence
+    concurrency      : int         — parallel worker count
+    timeout          : int         — per-seed execution timeout (seconds)
+    force            : bool        — if True, re-run even seeds that
+                                     already satisfy the flags below
+    collect_metadata : bool        — probe-instrument (where the language's
+                                     collector needs one) and run static/
+                                     dynamic/states-of-interest collection,
+                                     persisting it and marking
+                                     'pre_analysis_done'. Skipped seeds are
+                                     ones that already have it, unless
+                                     force. If False, the seed executes
+                                     as-is with no collection at all.
+    filter_valid     : bool        — drop rc != 0 seeds from the returned
+                                     list. 'rc'/'dryrun_done' are always
+                                     recorded from the execution regardless
+                                     of this flag (it's free once the seed
+                                     has run); this flag only controls
+                                     whether the *return value* is filtered
+                                     by it.
 
     Returns
     -------
-    valid_seeds : list[Seed]   — enriched seeds with rc == 0
+    list[Seed] — enriched seeds; rc==0 only if filter_valid, else all of
+                 them (still enriched with whatever ran).
     """
-    # Split into "already processed" and "needs dry-run"
-    already_valid: list = []
-    to_run:        list = []
+    # Split into "already satisfies what this call needs" and "must (re)run".
+    already_done: list = []
+    to_run:       list = []
 
     for seed in seeds:
-        done = (seed.metadata or {}).get("dryrun_done", False)
-        if done and not force:
-            if (seed.metadata or {}).get("rc", -1) == 0:
-                already_valid.append(seed)
-        else:
+        meta = seed.metadata or {}
+        needs_run = force
+        if filter_valid and not meta.get("dryrun_done", False):
+            needs_run = True
+        if collect_metadata and not meta.get("pre_analysis_done", False):
+            needs_run = True
+
+        if needs_run:
             to_run.append(seed)
+        elif not filter_valid or meta.get("rc", -1) == 0:
+            already_done.append(seed)
 
     skipped = len(seeds) - len(to_run)
     if skipped:
         logger.info(
-            f"  dry-run: {skipped} seeds already processed — skipping "
-            f"(pass force=True to re-collect)"
+            f"  dry-run: {skipped} seeds already satisfy the requested "
+            f"pass(es) — skipping (pass force=True to re-run)"
         )
 
     if not to_run:
-        logger.info(f"  dry-run: nothing to execute, returning {len(already_valid)} pre-validated seeds.")
-        return already_valid
+        logger.info(f"  dry-run: nothing to execute, returning {len(already_done)} seeds.")
+        return already_done
 
     logger.info(
         f"  dry-run: executing {len(to_run)} seeds "
-        f"(timeout={timeout}s, workers={concurrency})"
+        f"(metadata={collect_metadata}, filter={filter_valid}, "
+        f"timeout={timeout}s, workers={concurrency})"
     )
 
     _thread_local = threading.local()
-    valid_from_run: list = []
+    from_run: list = []
     done_count = 0
     total = len(to_run)
 
@@ -709,9 +757,15 @@ def run_dryrun_with_metadata(
         language  = (seed.metadata or {}).get("type", "unknown")
         collector = get_collector(language)
 
-        # Optionally instrument the seed with a runtime probe
-        probe_content = collector.instrument_for_probe(seed.content)
-        needs_probe   = (probe_content != seed.content)
+        # Only instrument with a runtime probe when metadata collection
+        # actually needs one — a filter-only run should execute the
+        # pristine seed, matching what "is this seed valid on its own"
+        # should mean.
+        if collect_metadata:
+            probe_content = collector.instrument_for_probe(seed.content)
+        else:
+            probe_content = seed.content
+        needs_probe = (probe_content != seed.content)
 
         # Create a temporary seed copy for execution so the original is unchanged
         from .fusion import Seed as _Seed
@@ -723,9 +777,14 @@ def run_dryrun_with_metadata(
 
         result = _thread_local.driver.execute(run_seed)
 
-        # Collect metadata using the *original* content for static analysis
-        # but the execution result for dynamic analysis
-        new_meta = collector.collect(seed, result)
+        # rc/dryrun_done are free once we've executed the seed at all.
+        new_meta = {"dryrun_done": True, "rc": result.return_code}
+        if collect_metadata:
+            # Collect metadata using the *original* content for static
+            # analysis but the execution result for dynamic analysis.
+            new_meta.update(collector.collect(seed, result))
+            new_meta["pre_analysis_done"] = True
+
         return seed, result.return_code, new_meta
 
     with ThreadPoolExecutor(max_workers=concurrency) as pool:
@@ -750,15 +809,16 @@ def run_dryrun_with_metadata(
             if identifier:
                 update_seed_metadata_in_db(db_path, identifier, new_meta)
 
-            if rc == 0:
-                valid_from_run.append(seed_out)
+            if not filter_valid or rc == 0:
+                from_run.append(seed_out)
 
             done_count += 1
             if done_count % 500 == 0 or done_count == total:
                 logger.info(f"  dry-run progress: {done_count}/{total}")
 
-    valid_seeds = already_valid + valid_from_run
+    result_seeds = already_done + from_run
     logger.info(
-        f"  dry-run complete: {len(valid_seeds)}/{len(seeds)} seeds are valid (rc=0)"
+        f"  dry-run complete: {len(result_seeds)}/{len(seeds)} seeds returned"
+        + (" (rc=0 only)" if filter_valid else " (unfiltered)")
     )
-    return valid_seeds
+    return result_seeds
