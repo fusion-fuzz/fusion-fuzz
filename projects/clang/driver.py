@@ -88,7 +88,7 @@ class ClangDriver(BaseDriver):
             asan_opts = "abort_on_error=1:detect_leaks=0:symbolize=1"
             ubsan_opts = "print_stacktrace=1:halt_on_error=1"
             cmd = (
-                f"ulimit -v {self.mem_limit_kb}; "
+                f"ulimit -v {self.mem_limit_kb}; ulimit -c 0; "
                 f"ASAN_OPTIONS='{asan_opts}' UBSAN_OPTIONS='{ubsan_opts}' "
                 f"{binname} {flags} {seed_file}"
             )
