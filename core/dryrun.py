@@ -67,6 +67,12 @@ WGSL / naga / wgslc:
   var_types        dict[str,str]
   line_count       int
 
+Clang (C / C++ / Obj-C):
+  has_declaration  bool            whether the seed has a struct/class/enum
+                                   ClangDeclarationFusionStrategy could
+                                   donate — see is_viable_pair in
+                                   core/fusion.py
+
 All languages also receive (whenever the seed is executed at all, under
 either flag):
   dryrun_done        bool          marker so a later --dry-run run can
@@ -571,6 +577,34 @@ class WGSLMetadataCollector(BaseMetadataCollector):
 
 
 # ---------------------------------------------------------------------------
+# Clang / C / C++ / Obj-C
+# ---------------------------------------------------------------------------
+
+class ClangMetadataCollector(BaseMetadataCollector):
+    """
+    has_declaration caches whether the seed contains a struct/class/enum
+    that core/fusion.py's ClangDeclarationFusionStrategy could donate (base
+    class, template default, or item-nest source). Declaration fusion only
+    produces a real (non-no-op) child when BOTH parents have one —
+    ClangDeclarationFusionStrategy.is_viable_pair reads this flag so
+    core/orchestrator.py can skip the technique for a pair instead of
+    wasting a full compile on a fuse that's syntactically a no-op.
+    """
+
+    language = "clang"
+
+    def static_collect(self, content: str, filename: str = "") -> dict:
+        # Local import: avoids a module-load-time cycle (core.fusion doesn't
+        # import core.dryrun, but importing at module scope here would still
+        # force fusion.py — with its own heavier import chain — to load just
+        # to run a --dry-run-only pass that doesn't need it otherwise).
+        from .fusion import ClangDeclarationFusionStrategy
+        return {
+            "has_declaration": ClangDeclarationFusionStrategy.has_injectable_declaration(content),
+        }
+
+
+# ---------------------------------------------------------------------------
 # Generic fallback
 # ---------------------------------------------------------------------------
 
@@ -597,6 +631,11 @@ _COLLECTORS: Dict[str, BaseMetadataCollector] = {
     "wgsl":    WGSLMetadataCollector(),
     "naga":    WGSLMetadataCollector(),
     "wgslc":   WGSLMetadataCollector(),
+    # projects/clang/parser.py's ClangParser.parse_content sets "type" to
+    # one of these three depending on extension (.c/.cpp,.cc,.cxx,.mm/.m).
+    "c":       ClangMetadataCollector(),
+    "cpp":     ClangMetadataCollector(),
+    "objc":    ClangMetadataCollector(),
 }
 _generic_collector = GenericMetadataCollector()
 

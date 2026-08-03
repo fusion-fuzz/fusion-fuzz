@@ -151,17 +151,17 @@ class FusionFuzzLoop:
     # it was filled (so a third technique never appears without a second).
     _CHAIN_LAYER_ODDS = [0.5, 0.25]
 
-    def _pick_strategy_chain(self) -> List:
+    def _pick_strategy_chain(self, pool: List) -> List:
         """
-        Choose 1-3 distinct strategies from self.strategies to combine on
-        the same parent pair: the first is always used, a second (distinct)
-        strategy layers on top 50% of the time, and — only if a second was
-        picked — a third (distinct) strategy layers on top of that 25% of
-        the time. With a pool of size 1 (e.g. --dataflow-fusion passed
-        alone) this always degenerates to a chain of length 1, matching the
-        old single-strategy behavior.
+        Choose 1-3 distinct strategies from `pool` to combine on the same
+        parent pair: the first is always used, a second (distinct) strategy
+        layers on top 50% of the time, and — only if a second was picked —
+        a third (distinct) strategy layers on top of that 25% of the time.
+        With a pool of size 1 (e.g. --dataflow-fusion passed alone) this
+        always degenerates to a chain of length 1, matching the old
+        single-strategy behavior.
         """
-        remaining = list(self.strategies)
+        remaining = list(pool)
         first = random.choice(remaining)
         chain = [first]
         remaining.remove(first)
@@ -193,8 +193,19 @@ class FusionFuzzLoop:
         if not parent_a or not parent_b:
             return [(None, None)]
 
+        # Drop strategies that would just be a no-op on this specific pair
+        # (e.g. clang declaration fusion when one side has nothing to
+        # donate — see FusionStrategy.is_viable_pair) instead of spending a
+        # full compile on a syntactically-unchanged child. If that leaves
+        # nothing usable (e.g. the pool is declaration-fusion-only and this
+        # pair truly has no declarations on either side), skip the
+        # iteration rather than force an unviable technique.
+        usable = [s for s in self.strategies if s.is_viable_pair(parent_a, parent_b)]
+        if not usable:
+            return [(None, None)]
+
         try:
-            chain = self._pick_strategy_chain()
+            chain = self._pick_strategy_chain(usable)
             host = parent_a
             for strategy in chain[:-1]:
                 host = strategy.fuse(host, parent_b)

@@ -25,6 +25,18 @@ class FusionStrategy(abc.ABC):
     def fuse(self, parent_a: Seed, parent_b: Seed) -> Seed:
         pass
 
+    def is_viable_pair(self, parent_a: Seed, parent_b: Seed) -> bool:
+        """True if this strategy is worth attempting on this specific parent
+        pair. Default: always viable — most strategies degrade gracefully
+        (e.g. dataflow fusion falls back to an on-the-fly scan) rather than
+        needing a hard precondition. Override when a strategy can determine,
+        from cached pre-analysis metadata, that it would just produce a
+        syntactically-unchanged no-op fuse for this pair (see
+        ClangDeclarationFusionStrategy) — core/orchestrator.py's
+        process_iteration uses this to drop the strategy from the pair's
+        technique pool instead of wasting a compile on a no-op."""
+        return True
+
 # ==========================================
 # Helpers
 # ==========================================
@@ -5759,17 +5771,18 @@ class ClangDeclarationFusionStrategy(ClangFusionStrategy):
 
     # ── Declaration-site discovery ──────────────────────────────────
 
-    def _extract_type_names(self, code: str):
+    @classmethod
+    def _extract_type_names(cls, code: str):
         """name -> True if declared as a template (so any reference to it as
         a base class or default-template-argument needs `<...>` args)."""
         names: Dict[str, bool] = {}
-        for m in self._CLASS_HEADER_RE.finditer(code):
+        for m in cls._CLASS_HEADER_RE.finditer(code):
             name = m.group('name')
-            if name in self._C_KEYWORDS or name in self._C_CONTROL_KW:
+            if name in cls._C_KEYWORDS or name in cls._C_CONTROL_KW:
                 continue
             names[name] = names.get(name, False) or bool(m.group('template'))
-        for name in self._C_TYPE_DEF_RE.findall(code):
-            if name in self._C_KEYWORDS or name in self._C_CONTROL_KW:
+        for name in cls._C_TYPE_DEF_RE.findall(code):
+            if name in cls._C_KEYWORDS or name in cls._C_CONTROL_KW:
                 continue
             names.setdefault(name, False)
         return names
@@ -5782,11 +5795,12 @@ class ClangDeclarationFusionStrategy(ClangFusionStrategy):
         # would deterministically fail with the same boring diagnostic.
         return f"{name}<int>" if is_template else name
 
-    def _donor_type_items(self, code: str):
+    @classmethod
+    def _donor_type_items(cls, code: str):
         """Top-level struct/class/enum declaration units from `code`,
         suitable for nesting whole into another seed's container."""
         items = []
-        for stmt in self._split_statements(code):
+        for stmt in cls._split_statements(code):
             head = stmt.lstrip()[:200]
             if re.match(r'(?:template\s*<[^>]*>\s*)?\b(?:struct|class|enum)\b', head):
                 # _split_statements emits the closing '}' of a struct/class/
@@ -5798,6 +5812,32 @@ class ClangDeclarationFusionStrategy(ClangFusionStrategy):
                 fixed = stmt if stmt.rstrip().endswith(';') else stmt.rstrip() + ';'
                 items.append(fixed)
         return items
+
+    @classmethod
+    def has_injectable_declaration(cls, code: str) -> bool:
+        """True if `code` has at least one struct/class/enum a donor could
+        contribute — either as a base-class/template-default reference
+        (_extract_type_names, which also picks up bare forward
+        declarations) or as a whole nestable unit (_donor_type_items).
+        Mirrors exactly what _build_declaration_fused_test checks before
+        setting `applied`, so pre-analysis's cached has_declaration flag
+        (core/dryrun.py) never drifts from what this strategy actually
+        looks for."""
+        return bool(cls._extract_type_names(code)) or bool(cls._donor_type_items(code))
+
+    def is_viable_pair(self, parent_a: Seed, parent_b: Seed) -> bool:
+        """Declaration fusion only does something on a pair when BOTH seeds
+        can donate a declaration — fuse_bidirectional tries each seed as
+        donor in turn (ab and ba), so a seed with none is dead weight in
+        either role. Without --pre-analysis's has_declaration metadata
+        (get_strategies already disables this strategy entirely in that
+        case, so this branch shouldn't normally run), falls back to
+        scanning both seeds on the spot rather than assuming viability."""
+        meta_a, meta_b = parent_a.metadata or {}, parent_b.metadata or {}
+        if "has_declaration" in meta_a and "has_declaration" in meta_b:
+            return bool(meta_a["has_declaration"]) and bool(meta_b["has_declaration"])
+        return (self.has_injectable_declaration(parent_a.content)
+                and self.has_injectable_declaration(parent_b.content))
 
     # ── Primitive 1: base class list injection ──────────────────────
 
