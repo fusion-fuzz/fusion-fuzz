@@ -82,7 +82,7 @@ either flag):
 --pre-analysis additionally sets:
   pre_analysis_done  bool          marker so a later --pre-analysis run
                                     can skip re-collecting this seed
-  states_of_interest list[dict]    core/state_analysis.py's StatePoint
+  most_complex_states list[dict]   core/state_analysis.py's StatePoint
                                     cache, consumed by *StateFusionStrategy
 """
 
@@ -167,7 +167,7 @@ class BaseMetadataCollector:
             except Exception as e:
                 logger.debug(f"[{self.language}] dynamic_collect error for {seed.id}: {e}")
 
-        # State-of-interest pre-analysis (state fusion design, core/
+        # Most-complex-state pre-analysis (state fusion design, core/
         # state_analysis.py): computed once here during the one-time
         # dry-run pass and cached in seed metadata, so state fusion never
         # has to re-scan a seed at fusion time. Language is derived from
@@ -175,15 +175,21 @@ class BaseMetadataCollector:
         # language) via state_analysis.LANGUAGE_ALIASES; a no-op for
         # languages without patterns defined yet.
         try:
-            from .state_analysis import find_states_of_interest, LANGUAGE_ALIASES
+            from .state_analysis import find_most_complex_state, LANGUAGE_ALIASES
             seed_type = (seed.metadata or {}).get("type") or self.language
             lang = LANGUAGE_ALIASES.get(str(seed_type).lower())
             if lang:
-                points = find_states_of_interest(content, lang)
-                if points:
-                    meta["states_of_interest"] = [p.to_dict() for p in points]
+                points = find_most_complex_state(content, lang)
+                # Always record the result, even when empty — pick_state_point
+                # distinguishes "cached: no points" ([]) from "never analyzed"
+                # (key absent) to decide whether to recompute at fusion time.
+                # Guarding this on `if points` used to drop the key for seeds
+                # with zero state points, making them silently re-run the full
+                # scan on every single fusion attempt for the seed's entire
+                # lifetime instead of caching the (empty) answer once here.
+                meta["most_complex_states"] = [p.to_dict() for p in points]
         except Exception as e:
-            logger.debug(f"[{self.language}] state-of-interest pre-analysis error for {seed.id}: {e}")
+            logger.debug(f"[{self.language}] most-complex-state pre-analysis error for {seed.id}: {e}")
 
         meta["dryrun_done"] = True
         if result is not None:
