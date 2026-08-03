@@ -70,12 +70,19 @@ Supported projects are:
 Try fusion-fuzz: 
 
 () fusion-fuzz is tested in ubuntu 22.04 and ubuntu 24.04.
+
 (i) before cloning fusion-fuzz, please install *git-lfs*, which is necessary to download our translated corpus (hundreds of MBs).
+
 (ii) install *docker.io*. fusion-fuzz only runs in the docker to keep the host clean.
+
 (iii) for every supported project, go to the project folder. Take PHP as example: `cd ./projects/php` and build the docker `docker build -t fusion-fuzz-php .`
+
 (iv) start the docker `docker run --name fuzz-php -dit -v <your fusion-fuzz path>:/home/fuzz/WorkSpace/fusion-fuzz fusion-fuzz-php:latest` and go to the docker bash `docker exec -it fuzz-php bash`
+
 (v) in the docker bash, you might want to grant 777 permissions for the fuzzing folder first. fusion-fuzz docker user:pass is `fuzz:fuzz`. You can try `sudo chmod -R 777 /home/fuzz/WorkSpace/fusion-fuzz`
+
 (vi) create a tmux bash and start the fuzzer in the docker. `python3 main.py --project php --setup --pre-analysis --dataflow-fusion --state-fusion --declaration-fusion`
+
 
 
 You should be able to see bugs found by fusion-fuzz in ./output/bugs/<project-name>
