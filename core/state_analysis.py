@@ -222,14 +222,30 @@ def _lexical_mask(content: str, language: str) -> List[bool]:
     return mask
 
 
-def _paren_depth_at(content: str, mask: List[bool], upto: int) -> int:
+def _paren_depth_prefix(content: str, mask: List[bool]) -> List[int]:
+    """Running paren/bracket/brace depth after each prefix of `content` —
+    prefix[i] is the depth after content[:i]. Built once in O(n).
+
+    Both callers (find_states_of_interest's _is_safe, and
+    truncate_to_balanced) probe the depth at O(n) increasing offsets while
+    walking a file line by line. The previous approach called a
+    _paren_depth_at(content, mask, upto) helper that rescanned from
+    position 0 on every probe, making a single find_states_of_interest /
+    truncate_to_balanced call O(n^2) in content length — cheap on typical
+    seeds but a multi-minute stall (and, since this runs inside a
+    ThreadPoolExecutor worker holding the GIL, a full stall of every
+    worker thread) on the corpus's larger outliers. Precomputing the
+    prefix once turns every probe into an O(1) lookup."""
+    n = len(content)
+    prefix = [0] * (n + 1)
     depth = 0
-    for i in range(upto):
+    for i in range(n):
         if mask[i] and content[i] in "([{":
             depth += 1
         elif mask[i] and content[i] in ")]}":
             depth -= 1
-    return depth
+        prefix[i + 1] = depth
+    return prefix
 
 
 # ---------------------------------------------------------------------------
@@ -381,6 +397,8 @@ def find_states_of_interest(content: str, language: str, project_root: Optional[
     counts = (_count_live_flat if cfg.mode == "flat" else _count_live_brace)(
         lines, line_starts, mask, cfg)
 
+    paren_prefix = _paren_depth_prefix(content, mask)
+
     # A line is a safe anchor if it's real code (not mostly inside a
     # string/comment) and not already structurally unbalanced.
     def _is_safe(idx: int, line: str) -> bool:
@@ -388,7 +406,7 @@ def find_states_of_interest(content: str, language: str, project_root: Optional[
         real_chars = sum(1 for k in range(start, start + len(line)) if k < len(mask) and mask[k])
         if len(line.strip()) > 0 and real_chars < len(line.strip()) * 0.5:
             return False
-        return _paren_depth_at(content, mask, start + len(line)) >= 0
+        return paren_prefix[start + len(line)] >= 0
 
     # First pass: find the true global max among safe lines (must scan the
     # whole file — max_points caps how many *tied* points we return, not
@@ -484,10 +502,11 @@ def truncate_to_balanced(content: str, start_line_idx: int, language: str) -> in
     for ln in lines:
         offsets.append(off)
         off += len(ln) + 1
-    baseline = _paren_depth_at(content, mask, offsets[start_line_idx])
+    paren_prefix = _paren_depth_prefix(content, mask)
+    baseline = paren_prefix[offsets[start_line_idx]]
     for i in range(start_line_idx, len(lines)):
         end_off = min(offsets[i] + len(lines[i]), len(mask))
-        depth = _paren_depth_at(content, mask, end_off)
+        depth = paren_prefix[end_off]
         if depth - baseline < 0:
             return i
     return len(lines)
