@@ -1,5 +1,5 @@
 """
-core/state_analysis.py — State-of-Interest Profiling & Safe Splice
+core/state_analysis.py — Most-Complex-State Profiling & Safe Splice
 
 Implements the "state" half of state fusion: a *state* is the point in a
 seed's execution immediately following a given statement. Rather than
@@ -11,17 +11,21 @@ richer search space, deeper interactions.
 
 Two things make a point usable:
 
-1. It must be a *state of interest* — likely to interact meaningfully
-   with another seed's continuation. Unified rule across all supported
-   languages except Haskell: the point(s) with the most *live*
-   variables — declared, and still in scope — is the "most complex" state,
-   offering a donor continuation the richest possible surface of names to
-   collide with. Computed per-language via a small (declare/decrement/
-   reset-or-brace-scope) regex config below — a static best-effort
-   approximation, not a real dataflow/liveness analysis. Haskell instead
-   just picks a uniformly random line (HaskellStateFusionStrategy in
-   core/fusion.py) — its layout-based scoping doesn't fit this model, and
-   simplicity won out over trying to make it fit.
+1. It must be the *most complex state* — the point most likely to
+   interact meaningfully with another seed's continuation. Unified rule
+   across all supported languages except Haskell: the point(s) with the
+   most *live* variables — declared, and still in scope — is the "most
+   complex" state, offering a donor continuation the richest possible
+   surface of names to collide with (find_most_complex_state below).
+   Computed per-language via a small (declare/decrement/reset-or-brace-
+   scope) regex config below — a static best-effort approximation, not a
+   real dataflow/liveness analysis. When no line has any live variables
+   at all, find_most_complex_state falls back to a single random *safe*
+   line instead of coming back empty, so state fusion still gets a splice
+   point. Haskell instead just picks a uniformly random line
+   (HaskellStateFusionStrategy in core/fusion.py) unconditionally — its
+   layout-based scoping doesn't fit this model, and simplicity won out
+   over trying to make it fit.
 2. It must be *safe* to splice at — inserting statements there can't
    break the enclosing syntactic/structural integrity (an unterminated
    string, a line mid-expression, wrong indentation for Python). This
@@ -33,6 +37,7 @@ Two things make a point usable:
    FuseValidRate tracks how often that happens per language.
 """
 
+import random
 import re
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional
@@ -226,11 +231,11 @@ def _paren_depth_prefix(content: str, mask: List[bool]) -> List[int]:
     """Running paren/bracket/brace depth after each prefix of `content` —
     prefix[i] is the depth after content[:i]. Built once in O(n).
 
-    Both callers (find_states_of_interest's _is_safe, and
+    Both callers (find_most_complex_state's _is_safe, and
     truncate_to_balanced) probe the depth at O(n) increasing offsets while
     walking a file line by line. The previous approach called a
     _paren_depth_at(content, mask, upto) helper that rescanned from
-    position 0 on every probe, making a single find_states_of_interest /
+    position 0 on every probe, making a single find_most_complex_state /
     truncate_to_balanced call O(n^2) in content length — cheap on typical
     seeds but a multi-minute stall (and, since this runs inside a
     ThreadPoolExecutor worker holding the GIL, a full stall of every
@@ -269,7 +274,7 @@ class StatePoint:
 
 
 # Haskell is deliberately NOT in LIVE_VAR_CONFIGS and has no dedicated
-# find_states_of_interest path: its real "many variables" equivalent
+# find_most_complex_state path: its real "many variables" equivalent
 # (function-argument/case-alternative/do-bind pattern names, not let/
 # where) is abundant enough to count, but its layout-based scoping
 # (where/let-in/do blocks scoped by indentation, not braces) makes
@@ -365,21 +370,31 @@ def _count_live_brace(lines: List[str], line_starts: List[int], mask: List[bool]
     return counts
 
 
-def find_states_of_interest(content: str, language: str, project_root: Optional[str] = None,
+def find_most_complex_state(content: str, language: str, project_root: Optional[str] = None,
                              max_points: int = 25) -> List[StatePoint]:
-    """Scan `content` for the state(s) with the most live (declared and
-    still-in-scope) variables — the "most complex" point(s) to graft a
-    continuation into — among lines that are also safe to splice at (real
-    code, not mid-string, non-negative running paren depth so we're not
-    already inside a broken construct). Ties all come back so
-    pick_state_point can still pick among them at random. `project_root` is
-    accepted for call-site compatibility but unused — there's no more
-    per-project pattern override to load.
+    """Scan `content` for the *most complex* state(s) — the safe-to-splice
+    line(s) with the most live (declared and still-in-scope) variables —
+    to graft a continuation into. A line is safe to splice at when it's
+    real code (not mid-string, not mid-comment) and structurally balanced
+    (non-negative running paren depth, so we're not already inside a
+    broken construct). Ties all come back so pick_state_point can still
+    pick among them at random. `project_root` is accepted for call-site
+    compatibility but unused — there's no more per-project pattern
+    override to load.
 
-    Returns [] for languages with no LIVE_VAR_CONFIGS entry (currently
-    just Haskell — see the note above this function's neighboring comment
-    block — which always uses pick_state_point(..., lightweight=True)
-    instead of calling this at all).
+    When there's at least one safe line but none of them declare any live
+    variable (best == 0 — e.g. a trivial file, or one whose declare/
+    decrement patterns just never matched), falls back to a single
+    uniformly-random safe line instead of coming back empty, so state
+    fusion still gets a splice point rather than degenerating to whatever
+    fixed fallback the caller applies for []. Only returns [] when there
+    is no safe line at all (empty content, or every line is unsafe).
+
+    Returns [] outright for languages with no LIVE_VAR_CONFIGS entry
+    (currently just Haskell — see the note above this function's
+    neighboring comment block — which always uses
+    pick_state_point(..., lightweight=True) instead of calling this at
+    all).
     """
     lang = LANGUAGE_ALIASES.get(language, language)
     cfg = LIVE_VAR_CONFIGS.get(lang)
@@ -408,19 +423,27 @@ def find_states_of_interest(content: str, language: str, project_root: Optional[
             return False
         return paren_prefix[start + len(line)] >= 0
 
-    # First pass: find the true global max among safe lines (must scan the
-    # whole file — max_points caps how many *tied* points we return, not
-    # how far we look for the maximum).
-    best = max((counts[idx] for idx, line in enumerate(lines) if _is_safe(idx, line)),
-               default=0)
-    if best <= 0:
+    safe_idxs = [idx for idx, line in enumerate(lines) if _is_safe(idx, line)]
+    if not safe_idxs:
         return []
 
+    best = max(counts[idx] for idx in safe_idxs)
+    if best <= 0:
+        # No safe line declares a live variable — pick one random safe
+        # line from the file's middle (skip the very first/last safe line
+        # when there's an actual middle to pick from) rather than always
+        # collapsing to the same fixed first/last-line fallback the
+        # caller uses for [].
+        middle = safe_idxs[1:-1] if len(safe_idxs) > 2 else safe_idxs
+        idx = random.choice(middle)
+        indent_m = re.match(r"[ \t]*", lines[idx])
+        return [StatePoint(idx, "random_mid", "", indent_m.group(0))]
+
     points: List[StatePoint] = []
-    for idx, line in enumerate(lines):
-        if counts[idx] != best or not _is_safe(idx, line):
+    for idx in safe_idxs:
+        if counts[idx] != best:
             continue
-        indent_m = re.match(r"[ \t]*", line)
+        indent_m = re.match(r"[ \t]*", lines[idx])
         points.append(StatePoint(idx, f"live{best}", "", indent_m.group(0)))
         if len(points) >= max_points:
             break
@@ -515,7 +538,7 @@ def truncate_to_balanced(content: str, start_line_idx: int, language: str) -> in
 def pick_state_point(content: str, language: str, project_root: Optional[str] = None,
                       cached: Optional[List[dict]] = None,
                       lightweight: bool = False) -> Optional[StatePoint]:
-    """Convenience: reuse a cached points list (e.g. seed.metadata['states_of_interest']
+    """Convenience: reuse a cached points list (e.g. seed.metadata['most_complex_states']
     written during --pre-analysis) when available, else compute fresh.
 
     lightweight (no --pre-analysis): skip the live-variable-count analysis
@@ -523,6 +546,13 @@ def pick_state_point(content: str, language: str, project_root: Optional[str] = 
     per-language config, no scanning, no safety filtering. Deliberately
     the cheapest possible choice of splice point, not a best-effort
     approximation of the real rule.
+
+    `cached` uses `is not None` rather than truthiness: an explicit `[]`
+    means pre-analysis already ran and confirmed zero state points for
+    this content, which is a cache hit (no points, don't recompute) —
+    treating it the same as "never analyzed" (key absent, `None`) would
+    force a full rescan on every fusion attempt for exactly the seeds
+    that always come up empty.
     """
     import random
     if lightweight:
@@ -532,8 +562,8 @@ def pick_state_point(content: str, language: str, project_root: Optional[str] = 
         idx = random.randrange(len(lines))
         indent_m = re.match(r"[ \t]*", lines[idx])
         return StatePoint(idx, "random", "", indent_m.group(0))
-    if cached:
+    if cached is not None:
         points = [StatePoint.from_dict(d) for d in cached]
     else:
-        points = find_states_of_interest(content, language, project_root)
+        points = find_most_complex_state(content, language, project_root)
     return random.choice(points) if points else None

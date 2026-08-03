@@ -1187,7 +1187,7 @@ class PHPFusionStrategy(GenericDataflowStrategy):
 class PHPStateFusionStrategy(PHPFusionStrategy):
     """
     State fusion for PHP (core/state_analysis.py): grafts one seed's
-    continuation into the other's state at a profiled *state of interest*
+    continuation into the other's state at a profiled *most complex state*
     (resource release / type conversion / exception boundary) rather than
     bridging a single value through --dataflow-fusion's shared variable,
     or interleaving whole statements by dependency graph like PHP's
@@ -1207,10 +1207,10 @@ class PHPStateFusionStrategy(PHPFusionStrategy):
         donor_code = self._resolve_name_conflicts(host_code, donor_code)
 
         host_point = pick_state_point(host_code, "php", self.project_root,
-                                       cached=(host.metadata or {}).get("states_of_interest"),
+                                       cached=(host.metadata or {}).get("most_complex_states"),
                                        lightweight=self.lightweight)
         donor_point = pick_state_point(donor_code, "php", self.project_root,
-                                        cached=(donor.metadata or {}).get("states_of_interest"),
+                                        cached=(donor.metadata or {}).get("most_complex_states"),
                                         lightweight=self.lightweight)
         if host_point is None:
             lines = host_code.splitlines()
@@ -2038,7 +2038,7 @@ except Exception as _e:
 class CPythonStateFusionStrategy(CPythonFusionStrategy):
     """
     State fusion for CPython (core/state_analysis.py): grafts one seed's
-    continuation into the other's state at a profiled state of interest
+    continuation into the other's state at a profiled most complex state
     (a `.close()`/`del`/context-manager exit, a type-coercion call, an
     `except`/`finally` boundary) instead of CPythonFusionStrategy's
     single-bridge-variable substitution. Complements it rather than
@@ -2068,10 +2068,10 @@ class CPythonStateFusionStrategy(CPythonFusionStrategy):
         all_imports = sorted(set(host_imports) | set(donor_imports))
 
         host_point = pick_state_point(host_body, "cpython", self.project_root,
-                                       cached=(host.metadata or {}).get("states_of_interest"),
+                                       cached=(host.metadata or {}).get("most_complex_states"),
                                        lightweight=self.lightweight)
         donor_point = pick_state_point(donor_body, "cpython", self.project_root,
-                                        cached=(donor.metadata or {}).get("states_of_interest"),
+                                        cached=(donor.metadata or {}).get("most_complex_states"),
                                         lightweight=self.lightweight)
         if host_point is None:
             lines = host_body.splitlines()
@@ -2725,7 +2725,7 @@ do {{
 class SwiftStateFusionStrategy(SwiftFusionStrategy):
     """
     State fusion for Swift (core/state_analysis.py): grafts one seed's
-    continuation into the other's state at a profiled state of interest
+    continuation into the other's state at a profiled most complex state
     (`deinit`/`.close()`, an `as`/`as!`/`as?` cast, a `do`/`catch`
     boundary) instead of SwiftFusionStrategy's single-literal bridge +
     phase-directed bug primitive. Complements it rather than replacing it.
@@ -2741,10 +2741,10 @@ class SwiftStateFusionStrategy(SwiftFusionStrategy):
         all_imports = sorted(set(host_imports) | set(donor_imports))
 
         host_point = pick_state_point(host_body, "swift", self.project_root,
-                                       cached=(host.metadata or {}).get("states_of_interest"),
+                                       cached=(host.metadata or {}).get("most_complex_states"),
                                        lightweight=self.lightweight)
         donor_point = pick_state_point(donor_body, "swift", self.project_root,
-                                        cached=(donor.metadata or {}).get("states_of_interest"),
+                                        cached=(donor.metadata or {}).get("most_complex_states"),
                                         lightweight=self.lightweight)
         if host_point is None:
             lines = host_body.splitlines()
@@ -3299,11 +3299,11 @@ class MLIRStateFusionStrategy(MLIRFusionStrategy):
     MLIRFusionStrategy's default mode — which emits seed A and seed B as
     two independent `--split-input-file` sections plus a separate bridge
     module, so each half stands alone — this strategy actually grafts
-    donor ops into the host's op stream at a profiled state-of-interest
+    donor ops into the host's op stream at a profiled most-complex-state
     point (right after a `memref.dealloc`, a cast op, or a `cf.assert`),
     inside one shared `module { }`, so the verifier has to resolve the
     donor's ops (SSA operands, types) in the host's context rather than
-    in isolation. "state of interest" is an approximation for a
+    in isolation. "most complex state" is an approximation for a
     declarative IR (see core/state_analysis.py's mlir entry) — this is
     the closest analogue to the paper's runtime-state grafting available
     without an execution model.
@@ -3350,10 +3350,10 @@ class MLIRStateFusionStrategy(MLIRFusionStrategy):
             })
 
         host_point = pick_state_point(host_body, "mlir", self.project_root,
-                                       cached=(host.metadata or {}).get("states_of_interest"),
+                                       cached=(host.metadata or {}).get("most_complex_states"),
                                        lightweight=self.lightweight)
         donor_point = pick_state_point(donor_body, "mlir", self.project_root,
-                                        cached=(donor.metadata or {}).get("states_of_interest"),
+                                        cached=(donor.metadata or {}).get("most_complex_states"),
                                         lightweight=self.lightweight)
         if host_point is None:
             lines = host_body.splitlines()
@@ -4465,7 +4465,7 @@ class HaskellFusionStrategy(FusionStrategy):
     wired to any CLI flag or entry point. See HaskellStateFusionStrategy
     below for the actual `--state-fusion` strategy, which is a different
     mechanism entirely: it grafts a donor's continuation into a profiled
-    state-of-interest point rather than racing two whole programs
+    most-complex-state point rather than racing two whole programs
     concurrently.
 
     - Dataflow fusion ('df_ab'/'df_ba'): a value harvested from the source
@@ -4873,15 +4873,15 @@ class HaskellFusionStrategy(FusionStrategy):
 class HaskellStateFusionStrategy(HaskellFusionStrategy):
     """
     State fusion for Haskell using core/state_analysis.py's profiled
-    state-of-interest points (`hClose`, `fromIntegral`, a `catch`/`throw`
+    splice points (`hClose`, `fromIntegral`, a `catch`/`throw`
     boundary), distinct from HaskellFusionStrategy's own 'state_ab'/
     'state_ba' modes (a *concurrent* forkIO race on a shared cell — see
     that class's docstring). This strategy instead grafts the donor's
     continuation directly into the host's body as text, at the host's
-    state-of-interest point, then runs the fused single action —
+    splice point, then runs the fused single action —
     structurally closer to how the other languages' state fusion works.
 
-    State-of-interest selection: unlike the other languages (a live-
+    Splice-point selection: unlike the other languages (a live-
     variable-count analysis, see core/state_analysis.py), Haskell always
     just picks any random line — pattern-bound names (function arguments,
     case alternatives, do-binds) are Haskell's real equivalent of "many
@@ -5968,7 +5968,7 @@ class ClangDeclarationFusionStrategy(ClangFusionStrategy):
 class ClangStateFusionStrategy(ClangFusionStrategy):
     """
     State fusion for C/C++ (core/state_analysis.py): grafts one seed's
-    continuation into the other's state at a profiled state of interest
+    continuation into the other's state at a profiled most complex state
     (`free()`/destructor call, an explicit cast, a try/catch boundary)
     instead of bridging a single value or interleaving whole statements by
     dependency graph. Complements ClangFusionStrategy's existing modes.
@@ -6000,10 +6000,10 @@ class ClangStateFusionStrategy(ClangFusionStrategy):
         all_includes = sorted(set(i.strip() for i in host_includes) | set(i.strip() for i in donor_includes))
 
         host_point = pick_state_point(host_body, "clang", self.project_root,
-                                       cached=(host.metadata or {}).get("states_of_interest"),
+                                       cached=(host.metadata or {}).get("most_complex_states"),
                                        lightweight=self.lightweight)
         donor_point = pick_state_point(donor_body, "clang", self.project_root,
-                                        cached=(donor.metadata or {}).get("states_of_interest"),
+                                        cached=(donor.metadata or {}).get("most_complex_states"),
                                         lightweight=self.lightweight)
         if host_point is None:
             lines = host_body.splitlines()
@@ -6837,7 +6837,7 @@ class FlangFusionStrategy(GenericDataflowStrategy):
 class FlangStateFusionStrategy(FlangFusionStrategy):
     """
     State fusion for Fortran (core/state_analysis.py): grafts one seed's
-    continuation into the other's state at a profiled state of interest
+    continuation into the other's state at a profiled most complex state
     (CLOSE/DEALLOCATE, an INT/REAL/DBLE conversion, an ERROR STOP/STAT=
     boundary). Fortran has no brace delimiters, so the continuation is
     truncated at the next program-unit boundary (bare END, or a fresh
@@ -6869,10 +6869,10 @@ class FlangStateFusionStrategy(FlangFusionStrategy):
         donor_code = self._resolve_name_conflicts(host_code, donor_code)
 
         host_point = pick_state_point(host_code, "flang", self.project_root,
-                                       cached=(host.metadata or {}).get("states_of_interest"),
+                                       cached=(host.metadata or {}).get("most_complex_states"),
                                        lightweight=self.lightweight)
         donor_point = pick_state_point(donor_code, "flang", self.project_root,
-                                        cached=(donor.metadata or {}).get("states_of_interest"),
+                                        cached=(donor.metadata or {}).get("most_complex_states"),
                                         lightweight=self.lightweight)
         if host_point is None:
             lines = host_code.splitlines()
