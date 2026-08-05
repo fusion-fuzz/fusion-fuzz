@@ -199,6 +199,7 @@ if __name__ == "__main__":
         "go": "go", "rust": "rust", "php": "php",
         "swift": "swift", "lean": "lean", "mlir": "mlir",
         "naga": "rust", "wgslc": "wgsl", "sql": "sql",
+        "lfortran": "flang",
     }
     _tgt_lang = _LANG_MAP.get(args.project.lower(), args.project.lower())
 
