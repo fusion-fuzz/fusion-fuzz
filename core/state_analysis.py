@@ -473,14 +473,23 @@ def strip_donor_wrapper(content: str, language: str) -> str:
 
 def graft_continuation(host_content: str, donor_content: str,
                         host_point: StatePoint, donor_point: Optional[StatePoint],
-                        reindent: bool = True) -> str:
+                        reindent: bool = True, tag_comment: Optional[str] = None) -> str:
     """Splice `donor_content`'s continuation (from `donor_point` onward, or
     its whole body if `donor_point` is None) into `host_content` right
     after `host_point` — grafting one seed's continuation into the other's
     intermediate state, per the state-fusion design. Reindents the donor
     continuation to the host point's indentation when `reindent` is set
     (needed for indentation-sensitive hosts like Python; harmless no-op
-    risk for brace languages, so left on by default)."""
+    risk for brace languages, so left on by default).
+
+    `tag_comment`, when given (a full comment, e.g. "// state fusion", in
+    the host language's own syntax — callers own picking that syntax), is
+    appended as a trailing same-line comment onto the first non-blank line
+    of the grafted continuation — deliberately NOT its own standalone
+    comment line, so a line-based test-case reducer can't strip the tag
+    without also removing the statement it marks. Only applied when
+    there's actually a continuation to graft, so an empty splice doesn't
+    leave a dangling comment with nothing under it."""
     host_lines = host_content.splitlines()
     donor_lines = donor_content.splitlines()
 
@@ -499,6 +508,10 @@ def graft_continuation(host_content: str, donor_content: str,
             stripped = ln.lstrip()
             reindented.append(host_point.indent + stripped if stripped else ln)
         continuation = reindented
+
+    if tag_comment and continuation:
+        idx = next((i for i, ln in enumerate(continuation) if ln.strip()), 0)
+        continuation[idx] = continuation[idx] + f"  {tag_comment}"
 
     insert_at = min(host_point.line_idx + 1, len(host_lines))
     fused_lines = host_lines[:insert_at] + continuation + host_lines[insert_at:]

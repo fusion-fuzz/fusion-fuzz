@@ -21,6 +21,37 @@ class Seed:
     metadata: dict = field(default_factory=dict)
 
 class FusionStrategy(abc.ABC):
+    # Which language this strategy targets, purely to pick the right
+    # single-line comment token when tagging an altered/inserted statement
+    # (see _tag) — set per concrete subclass, inherited by its state/
+    # declaration variants.
+    LANGUAGE = "clang"
+
+    LINE_COMMENT_TOKENS: Dict[str, str] = {
+        "php": "//", "cpython": "#", "clang": "//", "flang": "!",
+        "swift": "//", "mlir": "//", "rust": "//", "haskell": "--",
+    }
+
+    def _tag(self, kind: str) -> str:
+        """One-line comment, in this strategy's own language syntax,
+        tagging a statement this fusion technique altered or inserted.
+        `kind` is one of "dataflow", "state", "declaration"."""
+        token = self.LINE_COMMENT_TOKENS.get(self.LANGUAGE, "//")
+        return f"{token} {kind} fusion"
+
+    def _tag_after(self, text: str, search_from: int, kind: str) -> str:
+        """Return `text` with a trailing same-line comment tagging `kind`
+        spliced in just before the next newline at/after `search_from`
+        (or appended at the very end of `text` if there is none).
+        Deliberately placed on the SAME physical line as the statement
+        this fusion technique altered/inserted, rather than as its own
+        standalone comment line — a line-based test-case reducer can't
+        delete just the tag while keeping the statement it marks, since
+        doing so would delete both or neither."""
+        nl = text.find('\n', search_from)
+        tag = f"  {self._tag(kind)}"
+        return text[:nl] + tag + text[nl:] if nl != -1 else text + tag
+
     @abc.abstractmethod
     def fuse(self, parent_a: Seed, parent_b: Seed) -> Seed:
         pass
@@ -358,7 +389,7 @@ class GenericDataflowStrategy(FusionStrategy):
         var1 = random.choice(vars1)
         var2 = random.choice(vars2)
         bridge = self.bridge_var_name
-        code1 = code1 + f"\n{self.format_assignment(bridge, var1)}\n"
+        code1 = code1 + f"\n{self.format_assignment(bridge, var1)}  {self._tag('dataflow')}\n"
         code2 = self._lightweight_replace(code2, var2, bridge)
         return code1, code2
 
@@ -380,8 +411,8 @@ class GenericDataflowStrategy(FusionStrategy):
                 group2 = random.choice(dataflow2)
                 var2 = random.choice(group2)
                 bridge_stmt = self.format_assignment(bridge, var1)
-                code1 += f"\n{bridge_stmt}\n"
-                
+                code1 += f"\n{bridge_stmt}  {self._tag('dataflow')}\n"
+
                 # Use context-aware replacement if Python-like indentation matters
                 # For Generic, we assume loose (like PHP), but we can check subclass
                 if isinstance(self, CPythonFusionStrategy):
@@ -399,8 +430,8 @@ class GenericDataflowStrategy(FusionStrategy):
             var1 = random.choice(max_df1)
             var2 = random.choice(max_df2)
             bridge_stmt = self.format_assignment(bridge, var1)
-            code1 += f"\n{bridge_stmt}\n"
-            
+            code1 += f"\n{bridge_stmt}  {self._tag('dataflow')}\n"
+
             if isinstance(self, CPythonFusionStrategy):
                 code2 = replace_random_occurrence_indented(code2, var2, bridge)
             else:
@@ -413,6 +444,8 @@ class GenericDataflowStrategy(FusionStrategy):
 # ==========================================
 
 class PHPFusionStrategy(GenericDataflowStrategy):
+    LANGUAGE = "php"
+
     # PHP variables carry a $ sigil, distinctive enough for the base
     # class's plain substring _lightweight_replace to stay safe.
     _LIGHTWEIGHT_VAR_RE = re.compile(r'\$[A-Za-z_]\w*')
@@ -1216,7 +1249,8 @@ class PHPStateFusionStrategy(PHPFusionStrategy):
             lines = host_code.splitlines()
             host_point = StatePoint(max(len(lines) - 1, 0), "fallback", "", "")
 
-        fused_body = graft_continuation(host_code, donor_code, host_point, donor_point)
+        fused_body = graft_continuation(host_code, donor_code, host_point, donor_point,
+                                         tag_comment=self._tag("state"))
         php_body = f"try {{\n{fused_body}\n}} catch (\\Throwable $_ffl_e) {{}}\n"
         fused_file = f"\n--FILE--\n<?php\n{php_body}"
         desc = f"--TEST--\nState-fused {host.id} <- {donor.id} ({direction}, {host_point.category})\n"
@@ -1299,6 +1333,7 @@ class PHPDeclarationFusionStrategy(PHPFusionStrategy):
             new_code = code[:brace_pos].rstrip() + f", {donor_name} " + code[brace_pos:]
         else:
             new_code = code[:brace_pos].rstrip() + f" {keyword} {donor_name} " + code[brace_pos:]
+        new_code = self._tag_after(new_code, m.start(), 'declaration')
         return new_code, True
 
     def _inject_trait_use(self, code: str, donor_name: str):
@@ -1313,7 +1348,7 @@ class PHPDeclarationFusionStrategy(PHPFusionStrategy):
         if close is None:
             return code, False
         insert_at = brace_pos + 1
-        new_code = code[:insert_at] + f"\n    use {donor_name};\n" + code[insert_at:]
+        new_code = code[:insert_at] + f"\n    use {donor_name};  {self._tag('declaration')}\n" + code[insert_at:]
         return new_code, True
 
     def _build_declaration_fused_test(self, host: Seed, donor: Seed, direction: str) -> Seed:
@@ -1373,6 +1408,8 @@ class PHPDeclarationFusionStrategy(PHPFusionStrategy):
 # ==========================================
 
 class CPythonFusionStrategy(FusionStrategy):
+    LANGUAGE = "cpython"
+
     def __init__(self, project_root="projects/cpython", lightweight: bool = False):
         self.project_root = project_root
         self.mutation = True
@@ -1972,7 +2009,7 @@ except Exception as _e:
 
         imports1, blocks1 = get_blocks(code1)
         imports2, blocks2 = get_blocks(code2)
-        bridge_def = f"\n# --- Fusion Bridge ---\nfusion = {fusion_rhs}\n"
+        bridge_def = f"\nfusion = {fusion_rhs}  {self._tag('dataflow')}\n"
         final_content = "\n".join(blocks1) + bridge_def + "\n".join(blocks2)
         return final_content
 
@@ -2077,7 +2114,8 @@ class CPythonStateFusionStrategy(CPythonFusionStrategy):
             lines = host_body.splitlines()
             host_point = StatePoint(max(len(lines) - 1, 0), "fallback", "", "")
 
-        fused_body = graft_continuation(host_body, donor_body, host_point, donor_point)
+        fused_body = graft_continuation(host_body, donor_body, host_point, donor_point,
+                                         tag_comment=self._tag("state"))
         final_content = "\n".join(all_imports) + "\n" + fused_body
 
         return Seed(
@@ -2159,6 +2197,9 @@ class CPythonDeclarationFusionStrategy(CPythonFusionStrategy):
         else:
             colon_pos = m.end() - 1
             new_code = code[:colon_pos] + f"({donor_name})" + code[colon_pos:]
+        # Trailing comment on the class header's own line — same physical
+        # line as the statement this fusion technique altered.
+        new_code = self._tag_after(new_code, m.start(), 'declaration')
         return new_code, True
 
     def _build_declaration_fused_test(self, host: Seed, donor: Seed, direction: str) -> Seed:
@@ -2210,6 +2251,8 @@ class SwiftFusionStrategy(FusionStrategy):
     Ensures correct structure by strictly ordering imports and bodies,
     and attempting simple type-safe bridging of values.
     """
+    LANGUAGE = "swift"
+
     def __init__(self, project_root="projects/swift", type_match: bool = False,
                  lightweight: bool = False):
         self.project_root = project_root
@@ -2668,7 +2711,7 @@ do {{
 
             # Define a bridge alias to avoid naming conflicts if 'v_name' is reused
             self.bridge_var_name = f"fusion_{uuid.uuid4().hex[:4]}"
-            bridge_code = f"\n// --- Fusion Bridge ---\nvar {self.bridge_var_name} = {v_name}\n"
+            bridge_code = f"\nvar {self.bridge_var_name} = {v_name}  {self._tag('dataflow')}\n"
 
             bridge_var = self.bridge_var_name
             bridge_type = v_type
@@ -2755,7 +2798,8 @@ class SwiftStateFusionStrategy(SwiftFusionStrategy):
         end_idx = truncate_to_balanced(donor_body, start_idx, "swift")
         truncated_donor = "\n".join(donor_lines[:end_idx])
 
-        fused_body = graft_continuation(host_body, truncated_donor, host_point, donor_point)
+        fused_body = graft_continuation(host_body, truncated_donor, host_point, donor_point,
+                                         tag_comment=self._tag("state"))
         final_content = "\n".join(all_imports) + "\n" + fused_body
 
         return Seed(
@@ -2808,6 +2852,7 @@ class SwiftDeclarationFusionStrategy(SwiftFusionStrategy):
             new_code = code[:brace_pos].rstrip() + f", {donor_name} " + code[brace_pos:]
         else:
             new_code = code[:brace_pos].rstrip() + f": {donor_name} " + code[brace_pos:]
+        new_code = self._tag_after(new_code, m.start(), 'declaration')
         return new_code, True
 
     def _build_declaration_fused_test(self, host: Seed, donor: Seed, direction: str) -> Seed:
@@ -2846,6 +2891,8 @@ class SwiftDeclarationFusionStrategy(SwiftFusionStrategy):
 # ==========================================
 
 class MLIRFusionStrategy(FusionStrategy):
+    LANGUAGE = "mlir"
+
     def __init__(self, project_root="projects/mlir", type_match: bool = False,
                  lightweight: bool = False):
         self.project_root = project_root
@@ -3111,7 +3158,7 @@ class MLIRFusionStrategy(FusionStrategy):
 
         op = "arith.addf" if ty.startswith("f") else "arith.addi"
 
-        lines = [f"func.func @_ffl_bridge_{uid}() -> {ty} {{"]
+        lines = [f"func.func @_ffl_bridge_{uid}() -> {ty} {{  {self._tag('dataflow')}"]
         varnames = []
         for i, p in enumerate(picks):
             vn = f"%_b{i}"
@@ -3365,7 +3412,8 @@ class MLIRStateFusionStrategy(MLIRFusionStrategy):
         end_idx = self._truncate_before_terminator(donor_lines, start_idx, end_idx)
         truncated_donor = "\n".join(donor_lines[:end_idx])
 
-        fused_body = graft_continuation(host_body, truncated_donor, host_point, donor_point)
+        fused_body = graft_continuation(host_body, truncated_donor, host_point, donor_point,
+                                         tag_comment=self._tag("state"))
         final_code = f"module {{\n{fused_body}\n}}\n"
 
         return Seed(content=final_code, metadata={
@@ -3429,6 +3477,7 @@ class MLIRDeclarationFusionStrategy(MLIRFusionStrategy):
         tm = random.choice(type_matches)
         new_segment = segment[:tm.start()] + donor_type + segment[tm.end():]
         new_body = body[:seg_start] + new_segment + body[seg_end:]
+        new_body = self._tag_after(new_body, seg_start, 'declaration')
         return new_body, True
 
     def _build_declaration_fused_test(self, host: Seed, donor: Seed, direction: str) -> Seed:
@@ -3614,6 +3663,8 @@ class RustFusionStrategy(RustLexMixin, FusionStrategy):
     aren't called from `main`) are left as ordinary top-level items in the
     output — unused is harmless, a compile error is not.
     """
+    LANGUAGE = "rust"
+
     def __init__(self, project_root="projects/rust", type_match: bool = False):
         self.project_root = project_root
         self.mut = RustMutator()
@@ -3994,7 +4045,7 @@ class RustFusionStrategy(RustLexMixin, FusionStrategy):
             src_idx, src_origin, src_name, src_type = random.choice(candidates)
             needs_clone = self._base_type(src_type) not in self._COPY_TYPES
             rhs = f"{src_name}.clone()" if needs_clone else src_name
-            bridge_stmt = f"let {self.bridge_var_name} = {rhs};"
+            bridge_stmt = f"let {self.bridge_var_name} = {rhs};  {self._tag('dataflow')}"
             tagged_stmts.insert(src_idx + 1, (src_origin, bridge_stmt))
             # src_idx < tgt_idx, so inserting before tgt shifts its position by 1.
             new_tgt_idx = tgt_idx + 1
@@ -4099,6 +4150,7 @@ class RustStructFusionStrategy(RustLexMixin, FusionStrategy):
     This strategy does NOT do statement-level/dataflow fusion at all — it
     only rearranges item definitions.
     """
+    LANGUAGE = "rust"
 
     def __init__(self, project_root="projects/rust"):
         self.project_root = project_root
@@ -4203,7 +4255,11 @@ class RustStructFusionStrategy(RustLexMixin, FusionStrategy):
 
     def _rebuild_container(self, item: dict, extra_texts: list):
         """Return new item text with `extra_texts` prepended inside its body."""
-        new_inner = "\n".join(extra_texts) + "\n" + (item['inner'] or '')
+        # Trailing comment on the first line of the first moved item — same
+        # physical line as (the start of) the statement being nested in.
+        tagged_texts = list(extra_texts)
+        tagged_texts[0] = self._tag_after(tagged_texts[0], 0, 'declaration')
+        new_inner = "\n".join(tagged_texts) + "\n" + (item['inner'] or '')
         item = dict(item, inner=new_inner)
         item['text'] = f"{item['header']} {{\n{new_inner}\n}}"
         return item
@@ -4293,7 +4349,8 @@ class RustStructFusionStrategy(RustLexMixin, FusionStrategy):
             has_bound = ':' in header_wo_generics
             sep = ' + ' if has_bound else ': '
             new_header = f"{header}{sep}{super_name}"
-        new_target = dict(target, header=new_header, text=f"{new_header} {{\n{target['inner']}\n}}")
+        new_target = dict(target, header=new_header,
+                          text=f"{new_header} {{  {self._tag('declaration')}\n{target['inner']}\n}}")
         new_lst = [new_target if it is target else it for it in lst]
         return (new_lst, items_b) if tag == 'a' else (items_a, new_lst)
 
@@ -4348,7 +4405,7 @@ class RustStructFusionStrategy(RustLexMixin, FusionStrategy):
         stub_body = self._stub_impl_body(trait_item['inner'] or '')
         impl_text = f"impl {trait_item['name']} for {target_type['name']} {{\n{stub_body}\n}}"
         new_impl = {'kind': 'impl', 'name': None, 'header': impl_text.split('{', 1)[0].strip(),
-                    'inner': stub_body, 'text': impl_text}
+                    'inner': stub_body, 'text': self._tag_after(impl_text, 0, 'declaration')}
         new_lst = lst + [new_impl]
         return (new_lst, items_b) if tag == 'a' else (items_a, new_lst)
 
@@ -4380,11 +4437,11 @@ class RustStructFusionStrategy(RustLexMixin, FusionStrategy):
             new_header = target['header'][:m.end(1)] + f": {trait_name}" + target['header'][m.end(1):]
         new_target = dict(target, header=new_header)
         if target['inner'] is not None:
-            new_target['text'] = f"{new_header} {{\n{target['inner']}\n}}"
+            new_target['text'] = f"{new_header} {{  {self._tag('declaration')}\n{target['inner']}\n}}"
         else:
             # semicolon item — reconstruct from the original text's tail
             tail = target['text'][len(target['header']):]
-            new_target['text'] = new_header + tail
+            new_target['text'] = self._tag_after(new_header + tail, 0, 'declaration')
         new_lst = [new_target if it is target else it for it in lst]
         return (new_lst, items_b) if tag == 'a' else (items_a, new_lst)
 
@@ -4560,6 +4617,8 @@ class HaskellFusionStrategy(FusionStrategy):
     }
 
     _HS_IDENT_RE = re.compile(r"\b[a-z_][A-Za-z0-9_']*\b")
+
+    LANGUAGE = "haskell"
 
     def __init__(self, project_root="projects/haskell", type_match: bool = False,
                  lightweight: bool = False):
@@ -4809,7 +4868,7 @@ class HaskellFusionStrategy(FusionStrategy):
             main_body = (
                 "main :: IO ()\n"
                 "main = do\n"
-                f"  {write_src}\n"
+                f"  {write_src}  {self._tag('dataflow')}\n"
                 f"  r1 <- (try ({src_name}) :: IO (Either SomeException ()))\n"
                 "  case r1 of\n"
                 "    Left e -> putStrLn (\"A: \" ++ show (e :: SomeException))\n"
@@ -4932,7 +4991,8 @@ class HaskellStateFusionStrategy(HaskellFusionStrategy):
             lines = body_host.splitlines()
             host_point = StatePoint(max(len(lines) - 1, 0), "fallback", "", "")
 
-        fused_body = graft_continuation(body_host, body_donor, host_point, donor_point)
+        fused_body = graft_continuation(body_host, body_donor, host_point, donor_point,
+                                         tag_comment=self._tag("state"))
 
         pragmas = sorted(set(proc_host['pragmas']) | set(proc_donor['pragmas']))
         seed_imports = sorted(set(proc_host['imports']) | set(proc_donor['imports']))
@@ -5012,6 +5072,7 @@ class HaskellDeclarationFusionStrategy(HaskellFusionStrategy):
         else:
             insert_pos = m.start('name')
             new_code = code[:insert_pos] + f"{donor_class_name} {tyvar} => " + code[insert_pos:]
+        new_code = self._tag_after(new_code, m.start(), 'declaration')
         return new_code, True
 
     def _build_declaration_fused_test(self, host: Seed, donor: Seed, direction: str) -> Seed:
@@ -5120,6 +5181,8 @@ class ClangFusionStrategy(GenericDataflowStrategy):
         r'\s*(\*{0,2})\s*([A-Za-z_]\w*)\s*(?:\[[^\]]*\])?\s*(?:=(?!=)|;|,|\))'
     )
 
+    LANGUAGE = "clang"
+
     def __init__(self, project_root="projects/clang", type_match: bool = False,
                  lightweight: bool = False):
         super().__init__(mutator=BaseMutator(), lightweight=lightweight)
@@ -5210,7 +5273,7 @@ class ClangFusionStrategy(GenericDataflowStrategy):
                 group2 = random.choice(dataflow2)
                 var2 = self._pick_var2(var1, code1, code2, dataflow2, lambda: random.choice(group2))
                 bridge_stmt = self.format_assignment(bridge, var1)
-                code1 += f"\n{bridge_stmt}\n"
+                code1 += f"\n{bridge_stmt}  {self._tag('dataflow')}\n"
                 code2 = self._replace_random_occurrence_word(code2, var2, bridge)
             except IndexError:
                 pass
@@ -5223,7 +5286,7 @@ class ClangFusionStrategy(GenericDataflowStrategy):
             var1 = random.choice(max_df1)
             var2 = self._pick_var2(var1, code1, code2, dataflow2, lambda: random.choice(max_df2))
             bridge_stmt = self.format_assignment(bridge, var1)
-            code1 += f"\n{bridge_stmt}\n"
+            code1 += f"\n{bridge_stmt}  {self._tag('dataflow')}\n"
             code2 = self._replace_random_occurrence_word(code2, var2, bridge)
 
         return code1, code2
@@ -5851,6 +5914,7 @@ class ClangDeclarationFusionStrategy(ClangFusionStrategy):
             new_stmt = stmt[:brace_pos].rstrip() + f", public {donor_name} " + stmt[brace_pos:]
         else:
             new_stmt = stmt[:brace_pos].rstrip() + f" : public {donor_name} " + stmt[brace_pos:]
+        new_stmt = self._tag_after(new_stmt, m.start(), 'declaration')
         return new_stmt, True
 
     # ── Primitive 2: template parameter injection ────────────────────
@@ -5867,6 +5931,7 @@ class ClangDeclarationFusionStrategy(ClangFusionStrategy):
         insert_at = m.start('template') + close_rel
         new_param = f", typename _FflDeclT = {donor_name}"
         new_stmt = stmt[:insert_at] + new_param + stmt[insert_at:]
+        new_stmt = self._tag_after(new_stmt, m.start('template'), 'declaration')
         return new_stmt, True
 
     # ── Primitive 3: item nesting ─────────────────────────────────────
@@ -5882,7 +5947,8 @@ class ClangDeclarationFusionStrategy(ClangFusionStrategy):
             return host_stmts, False
         idx, (body_start, body_end) = random.choice(candidates)
         target = host_stmts[idx]
-        new_stmt = target[:body_end] + "\n" + donor_item + "\n" + target[body_end:]
+        tagged_item = self._tag_after(donor_item, 0, 'declaration')
+        new_stmt = target[:body_end] + "\n" + tagged_item + "\n" + target[body_end:]
         result = list(host_stmts)
         result[idx] = new_stmt
         return result, True
@@ -6014,7 +6080,8 @@ class ClangStateFusionStrategy(ClangFusionStrategy):
         end_idx = truncate_to_balanced(donor_body, start_idx, "clang")
         truncated_donor = "\n".join(donor_lines[:end_idx])
 
-        fused_body = graft_continuation(host_body, truncated_donor, host_point, donor_point)
+        fused_body = graft_continuation(host_body, truncated_donor, host_point, donor_point,
+                                         tag_comment=self._tag("state"))
         fused = "\n".join(all_includes) + "\n" + fused_body
 
         cxx_exts = ('.cpp', '.cc', '.cxx', '.mm')
@@ -6082,6 +6149,8 @@ class FlangFusionStrategy(GenericDataflowStrategy):
         r'\s*(\([^)]*\)|\*\d+)?\s*(?:,[^:]*)?::\s*([A-Za-z_]\w*(?:\s*,\s*[A-Za-z_]\w*)*)',
         re.IGNORECASE,
     )
+
+    LANGUAGE = "flang"
 
     def __init__(self, project_root="projects/flang", type_match: bool = False,
                  lightweight: bool = False):
@@ -6674,7 +6743,8 @@ class FlangFusionStrategy(GenericDataflowStrategy):
         var1 = random.choice(vars1)
         var2 = random.choice(vars2)
         bridge = self.bridge_var_name
-        code1 = self._insert_before_last_unit_end(code1, self.format_assignment(bridge, var1))
+        code1 = self._insert_before_last_unit_end(
+            code1, f"{self.format_assignment(bridge, var1)}  {self._tag('dataflow')}")
         code2 = self._lightweight_replace(code2, var2, bridge)
         return code1, code2
 
@@ -6703,7 +6773,8 @@ class FlangFusionStrategy(GenericDataflowStrategy):
                 group2 = random.choice(dataflow2)
                 var2 = self._pick_var2(var1, code1, code2, dataflow2, lambda: random.choice(group2))
                 bridge_stmt = self.format_assignment(bridge, var1)
-                code1 = self._insert_before_last_unit_end(code1, bridge_stmt)
+                code1 = self._insert_before_last_unit_end(
+                    code1, f"{bridge_stmt}  {self._tag('dataflow')}")
                 code2 = self._replace_random_occurrence_word(code2, var2, bridge)
             except IndexError:
                 pass
@@ -6716,7 +6787,8 @@ class FlangFusionStrategy(GenericDataflowStrategy):
             var1 = random.choice(max_df1)
             var2 = self._pick_var2(var1, code1, code2, dataflow2, lambda: random.choice(max_df2))
             bridge_stmt = self.format_assignment(bridge, var1)
-            code1 = self._insert_before_last_unit_end(code1, bridge_stmt)
+            code1 = self._insert_before_last_unit_end(
+                code1, f"{bridge_stmt}  {self._tag('dataflow')}")
             code2 = self._replace_random_occurrence_word(code2, var2, bridge)
 
         return code1, code2
@@ -6883,7 +6955,8 @@ class FlangStateFusionStrategy(FlangFusionStrategy):
         end_idx = self._truncate_before_unit_boundary(donor_lines, start_idx)
         truncated_donor = "\n".join(donor_lines[:end_idx])
 
-        fused = graft_continuation(host_code, truncated_donor, host_point, donor_point)
+        fused = graft_continuation(host_code, truncated_donor, host_point, donor_point,
+                                    tag_comment=self._tag("state"))
 
         ext = host.metadata.get('extension', '.f90')
         seed_type = host.metadata.get('type', 'fortran')
@@ -6931,6 +7004,7 @@ class FlangDeclarationFusionStrategy(FlangFusionStrategy):
             new_code = code[:m.end('attrs')] + f", extends({donor_name})" + code[m.end('attrs'):]
         else:
             new_code = code[:m.end('kw')] + f", extends({donor_name})" + code[m.end('kw'):]
+        new_code = self._tag_after(new_code, m.start(), 'declaration')
         return new_code, True
 
     def _build_declaration_fused_test(self, host: Seed, donor: Seed, direction: str) -> Seed:
