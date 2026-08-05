@@ -1,5 +1,6 @@
 import os
 import shutil
+import sqlite3
 import subprocess
 import sys
 import multiprocessing
@@ -189,6 +190,55 @@ def _setup_shared_fortran_corpus(project_root):
         print(f"Shared Fortran seed corpus ready at {seed_dir}")
 
 
+def _collect_flang_project_seeds(project_root):
+    """
+    LFortran and Flang are both Fortran frontends parsing the same shared
+    seed source with the same dataflow logic (lfortran/parser.py is a
+    verbatim copy of flang/parser.py's analysis), so any seeds flang has
+    already collected into its corpus.db are valid, ready-to-use seeds for
+    lfortran too — pre-merge them here instead of making main.py's Step 2
+    re-parse the shared tree from scratch. Safe to run before or after
+    flang's own setup: if projects/flang/corpus.db doesn't exist yet, this
+    is a no-op and lfortran's own seed collection (main.py --setup) still
+    populates its corpus.db from the shared source directory as usual.
+    """
+    flang_corpus_db = os.path.join(project_root, "..", "flang", "corpus.db")
+    if not os.path.exists(flang_corpus_db):
+        print(f"No flang corpus.db yet at {flang_corpus_db} — skipping seed merge "
+              "(lfortran's own seed collection will still cover the shared source tree).")
+        return
+
+    lfortran_corpus_db = os.path.join(project_root, "corpus.db")
+    print(f"Merging flang's collected seeds ({flang_corpus_db}) → {lfortran_corpus_db}")
+
+    src_conn = sqlite3.connect(flang_corpus_db)
+    rows = src_conn.execute("SELECT identifier, content, metadata FROM seeds").fetchall()
+    src_conn.close()
+
+    dst_conn = sqlite3.connect(lfortran_corpus_db)
+    dst_conn.execute("""
+        CREATE TABLE IF NOT EXISTS seeds (
+            id         INTEGER PRIMARY KEY AUTOINCREMENT,
+            identifier TEXT UNIQUE,
+            content    TEXT,
+            metadata   TEXT
+        )
+    """)
+    added = skipped = 0
+    for identifier, content, metadata in rows:
+        try:
+            dst_conn.execute(
+                "INSERT INTO seeds (identifier, content, metadata) VALUES (?, ?, ?)",
+                (identifier, content, metadata),
+            )
+            added += 1
+        except sqlite3.IntegrityError:
+            skipped += 1
+    dst_conn.commit()
+    dst_conn.close()
+    print(f"Flang seed merge: {added} seeds added, {skipped} already present")
+
+
 def setup(project_root):
     """
     Sets up the LFortran fuzzing environment (runs inside the ffl-lfortran
@@ -201,6 +251,10 @@ def setup(project_root):
     2. Ensures the shared Fortran seed corpus (projects/flang's sparse
        llvm-project/flang/test checkout) exists, so both projects/flang
        and projects/lfortran fuzz off identical seed sources.
+    3. Merges any seeds flang has already collected into its own corpus.db
+       into lfortran's corpus.db (both parse the same Fortran source with
+       the same dataflow logic, so these are directly reusable — see
+       _collect_flang_project_seeds).
     """
     print(f"Setting up LFortran in: {project_root}")
 
@@ -218,5 +272,6 @@ def setup(project_root):
     print(f"lfortran available: {(result.stdout + result.stderr).strip()}")
 
     _setup_shared_fortran_corpus(project_root)
+    _collect_flang_project_seeds(project_root)
 
     print("LFortran setup complete.")

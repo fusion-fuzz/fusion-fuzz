@@ -60,6 +60,7 @@ RUN apt update && apt install -y \
     python3-yaml \
     re2c \
     bison \
+    pandoc \
     # Cleanup
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
