@@ -336,13 +336,13 @@ class FusionFuzzLoop:
         """
         # 1. Sanitize signature for folder name
         safe_sig = re.sub(r'[^a-zA-Z0-9_\-\.]', '_', signature)
-        if len(safe_sig) > 100:
+        if len(safe_sig) > 300:
             # Truncating alone can make two distinct signatures collide on the
             # same folder name (their differing suffix falls past the cut),
             # silently overwriting one crash's saved bundle with another's.
             # Append a short hash of the full signature to keep them distinct.
             sig_hash = hashlib.sha1(signature.encode("utf-8", errors="ignore")).hexdigest()[:8]
-            safe_sig = f"{safe_sig[:91]}_{sig_hash}"
+            safe_sig = f"{safe_sig[:291]}_{sig_hash}"
 
         # Use the sanitized signature as the folder name — no seed-ID suffix.
         # The signature is already unique per distinct crash; appending the ID
