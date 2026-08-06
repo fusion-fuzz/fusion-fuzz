@@ -7085,8 +7085,9 @@ def get_strategies(project_name=None, dataflow_fusion=False,
     matching strategy (where the project has one) to the pool.
     core/orchestrator.py's process_iteration then *combines* techniques
     from that pool on the same parent pair instead of picking just one:
-    one technique always applies, a second layers on top 50% of the
-    time, and a third layers on top of that 25% of the time. Pass any
+    each technique in the pool independently has an 80% chance of being
+    applied (falling back to one uniformly-random technique if every draw
+    comes up empty, so a pair is never left untouched). Pass any
     subset of the flags to restrict the pool (e.g. --dataflow-fusion
     alone always yields a chain of length 1, same as before); pass none
     to get the default, which is now every technique the project

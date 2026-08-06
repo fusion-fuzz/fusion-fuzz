@@ -53,9 +53,10 @@ def _extract_display_code(content: str, ext: str) -> tuple[str, str]:
 
 class FusionFuzzLoop:
     def __init__(self, config, strategies, initial_corpus, pre_analysis_enabled=True,
-                 guided_fusion_enabled=False):
+                 guided_fusion_enabled=False, fusion_rate=0.8):
         self.config = config
         self.strategies = strategies
+        self.fusion_rate = fusion_rate
 
         # Sanitize corpus: Ensure everything is a Seed object
         self.corpus = []
@@ -145,34 +146,24 @@ class FusionFuzzLoop:
         """Select two parents from the corpus, preferring unfused pairs."""
         return self.coverage.select_parents(self.corpus)
 
-    # Chain-layering odds for process_iteration's technique combining: the
-    # first technique in the chain always applies; each subsequent slot
-    # applies only with its own probability, and only if the slot before
-    # it was filled (so a third technique never appears without a second).
-    _CHAIN_LAYER_ODDS = [0.5, 0.25]
-
     def _pick_strategy_chain(self, pool: List) -> List:
         """
-        Choose 1-3 distinct strategies from `pool` to combine on the same
-        parent pair: the first is always used, a second (distinct) strategy
-        layers on top 50% of the time, and — only if a second was picked —
-        a third (distinct) strategy layers on top of that 25% of the time.
-        With a pool of size 1 (e.g. --dataflow-fusion passed alone) this
-        always degenerates to a chain of length 1, matching the old
-        single-strategy behavior.
+        Choose a subset of `pool` to combine on the same parent pair: each
+        strategy is included independently with probability
+        self.fusion_rate (--fusion-rate, default 0.8). If every draw comes
+        up empty, one strategy is picked uniformly at random so every
+        iteration still applies at least one technique. The resulting
+        chain is shuffled — any included strategy can end up last (only
+        the last strategy in the chain runs bidirectionally; see
+        process_iteration). With a pool of size 1 (e.g. --dataflow-fusion
+        passed alone) this always degenerates to a chain of length 1,
+        matching the old single-strategy behavior, regardless of
+        fusion_rate.
         """
-        remaining = list(pool)
-        first = random.choice(remaining)
-        chain = [first]
-        remaining.remove(first)
-
-        for odds in self._CHAIN_LAYER_ODDS:
-            if not remaining or random.random() >= odds:
-                break
-            nxt = random.choice(remaining)
-            chain.append(nxt)
-            remaining.remove(nxt)
-
+        chain = [s for s in pool if random.random() < self.fusion_rate]
+        if not chain:
+            chain = [random.choice(pool)]
+        random.shuffle(chain)
         return chain
 
     def process_iteration(self) -> List[Tuple[Optional[Seed], Optional[object]]]:
