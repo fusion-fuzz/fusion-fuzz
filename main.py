@@ -94,7 +94,10 @@ if __name__ == "__main__":
                         help="Enable dataflow fusion: bridge variable linking via def-use graph. "
                              "Each fusion randomly picks A->B or B->A direction. Combinable with "
                              "--state-fusion/--declaration-fusion — every technique you enable is "
-                             "added to the same pool and one is picked at random per iteration. "
+                             "added to the same pool, and each pool member independently has a "
+                             "--fusion-rate chance (default 80%%) of being applied per iteration "
+                             "(never zero — one is picked at random as a fallback if every draw "
+                             "comes up empty). "
                              "If none of --dataflow-fusion/--state-fusion/--declaration-fusion are "
                              "given, dataflow fusion is enabled by default. Without --pre-analysis, "
                              "falls back to a lightweight on-the-fly rule for every project: scan "
@@ -114,7 +117,10 @@ if __name__ == "__main__":
                              "then grafts one seed's continuation into the other's state at that "
                              "point instead of only bridging a single value. Combinable with "
                              "--dataflow-fusion/--declaration-fusion — every technique you enable is "
-                             "added to the same pool and one is picked at random per iteration. "
+                             "added to the same pool, and each pool member independently has a "
+                             "--fusion-rate chance (default 80%%) of being applied per iteration "
+                             "(never zero — one is picked at random as a fallback if every draw "
+                             "comes up empty). "
                              "Without --pre-analysis, falls back to picking any random line as the "
                              "splice point instead. "
                              "[haskell] always picks a random line regardless of --pre-analysis — "
@@ -129,8 +135,11 @@ if __name__ == "__main__":
                              "bound, operand type constraint) refer to a declaration in the other "
                              "seed. Triggers on declare/compile alone, no runtime dataflow needed. "
                              "Combinable with --dataflow-fusion/--state-fusion — every technique "
-                             "you enable is added to the same pool and one is picked at random per "
-                             "iteration. Requires --pre-analysis (disabled otherwise, with a "
+                             "you enable is added to the same pool, and each pool member "
+                             "independently has a --fusion-rate chance (default 80%%) of being "
+                             "applied per iteration (never zero — one is picked at random as a "
+                             "fallback if every draw comes up empty). Requires --pre-analysis "
+                             "(disabled otherwise, with a "
                              "warning — not considered feasible without its richer per-seed "
                              "metadata). "
                              "[rust] alias of --struct-fusion (item nesting, supertrait/impl/"
@@ -142,6 +151,14 @@ if __name__ == "__main__":
                              "lfortran] derived-type EXTENDS() injection. [mlir] function-signature "
                              "operand/result type swap (verified structurally only, no compiler in "
                              "this repo's dev environment for haskell/flang/swift/mlir/php).")
+    parser.add_argument("--fusion-rate", type=float, default=0.8, metavar="P",
+                        help="Probability (0.0-1.0) that each enabled fusion technique in the "
+                             "pool is independently applied to a given parent pair per iteration "
+                             "(core/orchestrator.py's FusionFuzzLoop._pick_strategy_chain). If "
+                             "every draw comes up empty, one technique is picked uniformly at "
+                             "random as a fallback, so an iteration is never left untouched. "
+                             "Has no effect with a pool of size 1 (e.g. --dataflow-fusion passed "
+                             "alone), which always applies that one technique. Default: 0.8.")
     parser.add_argument("--dataflow-type-match", action="store_true", default=False,
                         help="[clang/swift/mlir/rust/haskell/flang/lfortran] For dataflow "
                              "fusion's bridge substitution: 90%% of the time, prefer a "
@@ -490,6 +507,7 @@ if __name__ == "__main__":
         initial_corpus=_valid_corpus,
         pre_analysis_enabled=args.pre_analysis,
         guided_fusion_enabled=args.guided_fusion,
+        fusion_rate=args.fusion_rate,
     )
     
     # === GCOV RESET (before fuzzing) ===
