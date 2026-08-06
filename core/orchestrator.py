@@ -3,6 +3,7 @@ import random
 import time
 import re
 import os
+import hashlib
 import shutil
 import tempfile
 import glob
@@ -335,7 +336,13 @@ class FusionFuzzLoop:
         """
         # 1. Sanitize signature for folder name
         safe_sig = re.sub(r'[^a-zA-Z0-9_\-\.]', '_', signature)
-        safe_sig = safe_sig[:100] if len(safe_sig) > 100 else safe_sig
+        if len(safe_sig) > 100:
+            # Truncating alone can make two distinct signatures collide on the
+            # same folder name (their differing suffix falls past the cut),
+            # silently overwriting one crash's saved bundle with another's.
+            # Append a short hash of the full signature to keep them distinct.
+            sig_hash = hashlib.sha1(signature.encode("utf-8", errors="ignore")).hexdigest()[:8]
+            safe_sig = f"{safe_sig[:91]}_{sig_hash}"
 
         # Use the sanitized signature as the folder name — no seed-ID suffix.
         # The signature is already unique per distinct crash; appending the ID
@@ -833,6 +840,7 @@ class FusionFuzzLoop:
                                                 pass
                                         else:
                                             fallback_sig = f"NoSig_{int(time.time())}"
+                                            self.unique_crashes.add(fallback_sig)
                                             sys.stdout.write("\n")
                                             logger.error(f"CRASH FOUND! ID: {child.id} (No Sig - Saving)")
                                             self._save_crash_bundle(child, result, fallback_sig)
