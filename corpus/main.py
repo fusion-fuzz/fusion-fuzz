@@ -19,6 +19,7 @@ import re
 import sqlite3
 import sys
 import time
+from collections import Counter, defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
@@ -625,16 +626,63 @@ def cmd_translate_llm(args, conn: sqlite3.Connection):
 # ---------------------------------------------------------------------------
 
 def cmd_stats(args, conn: sqlite3.Connection):
-    rows = conn.execute(
+    proj_rows = conn.execute(
         "SELECT project, COUNT(*) as cnt FROM corpus GROUP BY project ORDER BY cnt DESC"
     ).fetchall()
-    total = sum(r["cnt"] for r in rows)
+    total = sum(r["cnt"] for r in proj_rows)
+    proj_order = [r["project"] for r in proj_rows]
+    proj_counts = {r["project"]: r["cnt"] for r in proj_rows}
+
     print(f"{'PROJECT':<20} {'COUNT':>8}")
     print("-" * 30)
-    for r in rows:
+    for r in proj_rows:
         print(f"{r['project']:<20} {r['cnt']:>8}")
     print("-" * 30)
     print(f"{'TOTAL':<20} {total:>8}")
+
+    # Build a target-language x source-project translation matrix.
+    matrix: dict[str, dict[str, int]] = defaultdict(lambda: defaultdict(int))
+    target_totals: Counter = Counter()
+    for row in conn.execute("SELECT project, translations FROM corpus"):
+        translations = json.loads(row["translations"]) if row["translations"] else {}
+        for lang in translations:
+            matrix[lang][row["project"]] += 1
+            target_totals[lang] += 1
+
+    if not matrix:
+        return
+
+    targets = sorted(matrix, key=lambda t: target_totals[t], reverse=True)
+    # Abbreviate source-project column headers so the matrix stays narrow.
+    abbrev = {p: p.replace("inferredbugs-", "ib-") for p in proj_order}
+    abbrev = {p: (a if len(a) <= 8 else a[:7] + "…") for p, a in abbrev.items()}
+    col_w = max(6, max(len(a) for a in abbrev.values())) + 1
+
+    print()
+    print("Translations by target language (rows) x source project (columns):")
+    header = f"{'TARGET':<10}" + "".join(f"{abbrev[p]:>{col_w}}" for p in proj_order) + f"{'TOTAL':>{col_w+2}}" + f"{'%ALL':>7}"
+    print(header)
+    print("-" * len(header))
+    for lang in targets:
+        counts = [matrix[lang].get(p, 0) for p in proj_order]
+        row_total = sum(counts)
+        pct = 100.0 * row_total / total if total else 0.0
+        line = f"{lang:<10}" + "".join(f"{c:>{col_w}}" for c in counts) + f"{row_total:>{col_w+2}}" + f"{pct:>6.1f}%"
+        print(line)
+    print("  (columns: " + ", ".join(f"{abbrev[p]}={p}" for p in proj_order if abbrev[p] != p) + ")"
+          if any(abbrev[p] != p for p in proj_order) else "", end="")
+    if any(abbrev[p] != p for p in proj_order):
+        print()
+
+    print()
+    print("Coverage by source project (translated entries / total entries for that project):")
+    for p in proj_order:
+        translated_langs = {lang: matrix[lang].get(p, 0) for lang in targets if matrix[lang].get(p, 0)}
+        if not translated_langs:
+            print(f"  {p}: no translations")
+            continue
+        detail = ", ".join(f"{lang}={c}/{proj_counts[p]}" for lang, c in translated_langs.items())
+        print(f"  {p}: {detail}")
 
 
 # ---------------------------------------------------------------------------

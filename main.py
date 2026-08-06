@@ -410,6 +410,16 @@ if __name__ == "__main__":
 
         raw_seeds = module.load_corpus(project_corpus_path)
 
+        if not args.bug_corpus:
+            _before = len(raw_seeds)
+            raw_seeds = [s for s in raw_seeds if s["metadata"].get("type") != "bug_corpus"]
+            _skipped = _before - len(raw_seeds)
+            if _skipped:
+                logger.info(
+                    f"Excluding {_skipped} previously-injected bug corpus seeds "
+                    f"from {project_corpus_path} (pass --bug-corpus to include them)."
+                )
+
         initial_corpus = [
             Seed(content=s["content"], metadata={**s["metadata"], "filename": s["filename"]})
             for s in raw_seeds
