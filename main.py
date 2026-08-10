@@ -194,6 +194,15 @@ if __name__ == "__main__":
                              "parents and the strategies applied. Compatible with --pre-analysis/"
                              "--dry-run/--corpus-size, which still run beforehand; --gcov/"
                              "--sample-log are ignored.")
+    parser.add_argument("--execute", type=str, default=None, metavar="PROGRAM_DIR",
+                        help="Replay mode: don't fuse or generate anything — just run every "
+                             "program in PROGRAM_DIR (recursively; manifest.jsonl and hidden "
+                             "files skipped) through the project driver and report bugs, with "
+                             "the same crash triage, deduplication and output/bugs/<project>/ "
+                             "bundles as fuzzing. Pairs with --save-to: generate once, execute "
+                             "the folder later. Only --project is required; --concurrency and "
+                             "--sample-log also apply, every other flag is ignored. "
+                             "Example: python3 main.py --project php --execute ./test100")
     parser.add_argument("--no-self-fusion", action="store_true", default=False,
                         help="With --save-to, skip the (a,a) self-fusion pairs, giving "
                              "N*(N-1) programs instead of N*N.")
@@ -226,6 +235,15 @@ if __name__ == "__main__":
             config["execution"] = {}
         config["execution"]["concurrency"] = args.concurrency
         logger.info(f"Overriding execution concurrency to {args.concurrency}")
+
+    # === REPLAY MODE (--execute): run pre-generated programs, no fusion ===
+    # Handled before any corpus/setup work — replay needs neither a corpus
+    # nor fusion strategies, just the project's driver.
+    if args.execute:
+        sample_log = args.sample_log.replace("{project}", args.project) if args.sample_log else None
+        replayer = FusionFuzzLoop(config=config, strategies=[], initial_corpus=[])
+        replayer.execute_folder(args.execute, sample_log=sample_log)
+        sys.exit(0)
 
     # === BUG CORPUS MODE ===
     # Maps project name to canonical language key stored in corpus translations JSON

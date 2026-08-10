@@ -2775,7 +2775,7 @@ class SwiftStateFusionStrategy(SwiftFusionStrategy):
     """
 
     def _build_state_fused(self, host: Seed, donor: Seed, direction: str) -> Seed:
-        from .state_analysis import pick_state_point, graft_continuation, StatePoint, truncate_to_balanced
+        from .state_analysis import pick_state_point, graft_continuation, StatePoint
 
         host_src, donor_src = host.content, donor.content
 
@@ -3364,15 +3364,202 @@ class MLIRStateFusionStrategy(MLIRFusionStrategy):
     # (or two terminators) once grafted into the host's block.
     _MLIR_TERMINATOR_RE = re.compile(r'^\s*(?:func\.return|return|cf\.br|cf\.cond_br|scf\.yield)\b')
 
+    # A `^bb1(...):` label starts a new block, which is only legal after the
+    # previous block's terminator — and terminators are exactly what the cut
+    # below removes. So a continuation must stop before any label too, or it
+    # grafts a block header onto a host block that just falls into it.
+    _MLIR_BLOCK_LABEL_RE = re.compile(r'^\s*\^[A-Za-z0-9_$.]+')
+
     @classmethod
     def _truncate_before_terminator(cls, lines: List[str], start_idx: int, end_idx: int) -> int:
         for i in range(start_idx, end_idx):
-            if cls._MLIR_TERMINATOR_RE.match(lines[i]):
+            if (cls._MLIR_TERMINATOR_RE.match(lines[i])
+                    or cls._MLIR_BLOCK_LABEL_RE.match(lines[i])):
                 return i
         return end_idx
 
+    @staticmethod
+    def _leading_indent(line: str) -> str:
+        return re.match(r"[ \t]*", line).group(0)
+
+    def _continuation_bounds(self, donor_body: str, donor_lines: List[str], line_idx: int):
+        """(start, end) line bounds of the donor continuation that splicing
+        at `line_idx` would yield, or None if that point leaves nothing
+        graftable — the continuation is empty once cut to balanced braces
+        and before the donor's own terminator, or holds only blanks and
+        comments."""
+        from .state_analysis import truncate_to_balanced
+
+        start = line_idx + 1
+        if start >= len(donor_lines):
+            return None
+        end = truncate_to_balanced(donor_body, start, "mlir")
+        end = self._truncate_before_terminator(donor_lines, start, end)
+        if end <= start:
+            return None
+        if not any(ln.strip() and not ln.strip().startswith("//")
+                   for ln in donor_lines[start:end]):
+            return None
+        return start, end
+
+    def _pick_donor_point(self, donor_body: str, donor_lines: List[str], cached):
+        """Pick a donor splice point that actually leaves ops to graft.
+
+        MLIR is SSA, so a value's scope only ever grows inside a region:
+        core/state_analysis.py's live-variable count is monotonic here and
+        find_most_complex_state therefore returns the *last* lines of a
+        block. Cutting the continuation before the donor's terminator then
+        leaves nothing at all — taking the top-scoring point blindly makes
+        state fusion emit the host verbatim. So consider every candidate
+        point in random order and take the first with a non-empty
+        continuation; if none has one, fall back to scanning the donor's
+        own lines latest-first, which keeps the "most state accumulated"
+        spirit while guaranteeing something is grafted.
+
+        Returns (StatePoint, start, end) or None when the donor has no
+        graftable region at all (e.g. a body that is just a terminator).
+        """
+        from .state_analysis import StatePoint, find_most_complex_state
+
+        if self.lightweight:
+            candidates = [StatePoint(i, "random", "", self._leading_indent(donor_lines[i]))
+                          for i in range(len(donor_lines))]
+        elif cached is not None:
+            candidates = [StatePoint.from_dict(d) for d in cached]
+        else:
+            candidates = find_most_complex_state(donor_body, "mlir", self.project_root)
+
+        candidates = list(candidates)
+        random.shuffle(candidates)
+        for point in candidates:
+            bounds = self._continuation_bounds(donor_body, donor_lines, point.line_idx)
+            if bounds:
+                return point, bounds[0], bounds[1]
+
+        for idx in range(len(donor_lines) - 2, -1, -1):
+            bounds = self._continuation_bounds(donor_body, donor_lines, idx)
+            if bounds:
+                point = StatePoint(idx, "scan", "", self._leading_indent(donor_lines[idx]))
+                return point, bounds[0], bounds[1]
+
+        return None
+
+    # SSA value references. MLIR local names (%0, %c0, %arg0) are per-region,
+    # so the same handful of names appears in nearly every test file — a
+    # grafted continuation reusing one the host already defines is a
+    # redefinition the parser rejects outright, before any pass runs.
+    _MLIR_SSA_RE = re.compile(r'%[A-Za-z0-9_$.]+')
+    _MLIR_SSA_DEF_RE = re.compile(r'^\s*(%[A-Za-z0-9_$.]+)\s*(?:,\s*%[A-Za-z0-9_$.]+\s*)*=')
+    _MLIR_FUNC_LINE_RE = re.compile(r'\bfunc\.func\s+@')
+
+    def _host_values_in_scope(self, host_lines: List[str], insert_at: int) -> List[str]:
+        """SSA values the host has live at the graft point: block arguments
+        of the enclosing func plus every value defined above it, from the
+        last `func.func` line onward (values from an earlier function are
+        in a different region, hence out of scope)."""
+        func_start = 0
+        for i in range(min(insert_at, len(host_lines)) - 1, -1, -1):
+            if self._MLIR_FUNC_LINE_RE.search(host_lines[i]):
+                func_start = i
+                break
+
+        values = []
+        depth = 0
+        # Values defined by a region-opening op (`%r = scf.for ... {`) are not
+        # available *inside* that region — only once it closes. Hold them
+        # until then, so a graft inside the loop body can't reference the
+        # loop's own result (a dominance error that isn't the seeds' fault).
+        pending = []
+        for i in range(func_start, min(insert_at, len(host_lines))):
+            line = host_lines[i].split('//')[0]
+            if i == func_start:
+                # Signature line: block args are `%name: type`
+                values += re.findall(r'(%[A-Za-z0-9_$.]+)\s*:', line)
+            m = self._MLIR_SSA_DEF_RE.match(line)
+            defined_here = self._MLIR_SSA_RE.findall(line[:line.index('=')]) if m else []
+
+            delta = line.count('{') - line.count('}')
+            if defined_here and delta > 0:
+                pending.append((defined_here, depth))
+            elif defined_here:
+                values += defined_here
+            depth += delta
+            while pending and depth <= pending[-1][1]:
+                values += pending.pop()[0]
+        # dict.fromkeys: dedupe, keep definition order
+        return list(dict.fromkeys(values))
+
+    def _clamp_host_point(self, host_point, host_lines: List[str]):
+        """Move the host splice point back to the last line that ops can
+        legally follow.
+
+        The host's live-variable maximum sits at the end of its block (SSA
+        values never leave scope), so pick_state_point lands on the
+        terminator or the closing brace — and grafting after either
+        produces ops after a terminator, a parse error that says nothing
+        about the two seeds. Walk back over terminators, closing braces and
+        blanks to the last real op. Returns None when the host has no such
+        line."""
+        from .state_analysis import StatePoint
+
+        idx = min(host_point.line_idx, len(host_lines) - 1)
+        while idx >= 0:
+            stripped = host_lines[idx].strip()
+            if (stripped and not stripped.startswith('//')
+                    and not self._MLIR_TERMINATOR_RE.match(host_lines[idx])
+                    and not stripped.startswith('}')
+                    and not stripped.startswith(')')):
+                return StatePoint(idx, host_point.category, host_point.matched_text,
+                                  self._leading_indent(host_lines[idx]))
+            idx -= 1
+        return None
+
+    def _rewire_continuation(self, continuation: List[str], host_values: List[str],
+                             prefix: str) -> List[str]:
+        """Rename the donor continuation's SSA values so it composes with the
+        host instead of colliding with it.
+
+        Values the continuation itself defines get a donor-unique prefix, so
+        they can't redefine a host value (`%0`, `%c0` and friends collide
+        constantly across MLIR tests). Operands the continuation does *not*
+        define — its references back to donor values left behind above the
+        splice point — are rebound to a host value live at that point. That
+        rebinding is the actual fusion edge: host state flows into the
+        donor's ops, and the verifier has to reconcile the two seeds' types
+        rather than reject an undefined name. Types aren't checked (MLIR
+        type syntax is op-specific and not regex-recoverable), so a rebound
+        operand is often ill-typed — the same deliberate tolerance the clang
+        dataflow bridge already takes. With no host value in scope, the
+        reference just gets the prefix and stays undefined."""
+        defined = set()
+        for line in continuation:
+            code = line.split('//')[0]
+            m = self._MLIR_SSA_DEF_RE.match(code)
+            if m:
+                defined.update(self._MLIR_SSA_RE.findall(code[:code.index('=')]))
+            # Block headers (`^bb1(%a: i32, %b: f32):`) bind values too, with
+            # no `=` for the def regex to see. Missing them would rebind a
+            # block argument to a host value — redefining it inside the host
+            # region rather than declaring the block's own parameter.
+            if code.lstrip().startswith('^'):
+                defined.update(re.findall(r'(%[A-Za-z0-9_$.]+)\s*:', code))
+
+        def _sub(match):
+            name = match.group(0)
+            if name in defined:
+                return f"%{prefix}{name[1:]}"
+            if host_values:
+                return random.choice(host_values)
+            return f"%{prefix}{name[1:]}"
+
+        rewired = []
+        for line in continuation:
+            code, sep, comment = line.partition('//')
+            rewired.append(self._MLIR_SSA_RE.sub(_sub, code) + sep + comment)
+        return rewired
+
     def _build_state_fused(self, host: Seed, donor: Seed, direction: str) -> Seed:
-        from .state_analysis import pick_state_point, graft_continuation, StatePoint, truncate_to_balanced
+        from .state_analysis import pick_state_point, graft_continuation, StatePoint
 
         host_src = mlir_strip_directives(host.content)
         donor_src = mlir_strip_directives(donor.content)
@@ -3399,18 +3586,46 @@ class MLIRStateFusionStrategy(MLIRFusionStrategy):
         host_point = pick_state_point(host_body, "mlir", self.project_root,
                                        cached=(host.metadata or {}).get("most_complex_states"),
                                        lightweight=self.lightweight)
-        donor_point = pick_state_point(donor_body, "mlir", self.project_root,
-                                        cached=(donor.metadata or {}).get("most_complex_states"),
-                                        lightweight=self.lightweight)
+        host_lines = host_body.splitlines()
         if host_point is None:
-            lines = host_body.splitlines()
-            host_point = StatePoint(max(len(lines) - 1, 0), "fallback", "", "")
+            host_point = StatePoint(max(len(host_lines) - 1, 0), "fallback", "", "")
+
+        host_point = self._clamp_host_point(host_point, host_lines)
+        if host_point is None:
+            # No line in the host that ops can legally follow (e.g. a body
+            # that is only a terminator) — nothing to graft into.
+            return Seed(content=f"module {{\n{host_body}\n}}\n", metadata={
+                "parents": [host.id, donor.id], "type": "mlir",
+                "mode": f"state_nohostpoint_{direction}",
+                "description": f"State-fused (no host splice point) {host.id} <- {donor.id}",
+            })
 
         donor_lines = donor_body.splitlines()
-        start_idx = (donor_point.line_idx + 1) if donor_point else 0
-        end_idx = truncate_to_balanced(donor_body, start_idx, "mlir")
-        end_idx = self._truncate_before_terminator(donor_lines, start_idx, end_idx)
-        truncated_donor = "\n".join(donor_lines[:end_idx])
+        picked = self._pick_donor_point(
+            donor_body, donor_lines,
+            cached=(donor.metadata or {}).get("most_complex_states"))
+
+        if picked is None:
+            # Donor has no graftable region (e.g. its block is just a
+            # terminator) — emit the host alone rather than a child that
+            # silently contains no fusion at all.
+            return Seed(content=f"module {{\n{host_body}\n}}\n", metadata={
+                "parents": [host.id, donor.id], "type": "mlir",
+                "mode": f"state_nocontinuation_{direction}",
+                "description": f"State-fused (no donor continuation) {host.id} <- {donor.id}",
+            })
+
+        donor_point, start_idx, end_idx = picked
+
+        # Rewire the continuation's SSA names against the host state it is
+        # about to be spliced into, then hand graft_continuation a donor
+        # text whose line numbering is unchanged (it re-slices from
+        # donor_point itself), so only the grafted region differs.
+        insert_at = min(host_point.line_idx + 1, len(host_lines))
+        host_values = self._host_values_in_scope(host_lines, insert_at)
+        rewired = self._rewire_continuation(
+            donor_lines[start_idx:end_idx], host_values, f"d{donor.id}_")
+        truncated_donor = "\n".join(donor_lines[:start_idx] + rewired)
 
         fused_body = graft_continuation(host_body, truncated_donor, host_point, donor_point,
                                          tag_comment=self._tag("state"))
@@ -3420,6 +3635,7 @@ class MLIRStateFusionStrategy(MLIRFusionStrategy):
             "parents": [host.id, donor.id],
             "type": "mlir",
             "mode": f"state_{host_point.category}_{direction}",
+            "donor_point": f"{donor_point.category}@{donor_point.line_idx}",
             "description": f"State-fused {host.id} <- {donor.id} ({direction})",
         })
 
@@ -6049,7 +6265,7 @@ class ClangStateFusionStrategy(ClangFusionStrategy):
         return body, includes
 
     def _build_state_fused(self, host: Seed, donor: Seed, direction: str) -> Seed:
-        from .state_analysis import pick_state_point, graft_continuation, StatePoint, truncate_to_balanced
+        from .state_analysis import pick_state_point, graft_continuation, StatePoint
 
         host_code, donor_code = host.content, donor.content
         if self.mutation:
