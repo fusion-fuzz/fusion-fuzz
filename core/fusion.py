@@ -275,6 +275,51 @@ def mlir_rename_symbols(src: str, prefix: str):
         out = re.sub(r'@' + re.escape(name) + r'\b', '@' + prefix + name, out)
     return out
 
+# File-level attribute (`#map0 = affine_map<...>`) and type (`!ty = ...`)
+# alias definitions. Both seeds land in one module now, and `#map0` / `#map`
+# are near-universal names in MLIR tests, so their aliases must be renamed
+# the way mlir_rename_symbols renames @symbols or the second definition is a
+# redefinition error.
+MLIR_ALIAS_DEF = re.compile(r'^\s*([#!])([A-Za-z_][A-Za-z0-9_.$]*)\s*=', re.M)
+
+# A defined (not merely declared) function: `func.func @name(args) -> ret {`.
+# Requires the trailing `{` so bodiless declarations, which can't be the
+# producer/consumer of a call bridge, don't match.
+MLIR_FUNC_SIG_RE = re.compile(
+    r'func\.func\s+(?:private\s+)?@(?P<name>[A-Za-z_][\w.$-]*)\s*'
+    r'\((?P<args>[^)]*)\)\s*(?:->\s*(?P<ret>[^\{]+?))?\s*\{'
+)
+
+
+def mlir_split_top_level(text: str):
+    """Split a signature's argument list on commas that aren't nested inside
+    <>, () or {} — MLIR types (`memref<4x?xf32, strided<[1], offset: 0>>`)
+    contain commas of their own."""
+    parts, depth, cur = [], 0, []
+    for ch in text:
+        if ch in '<({[':
+            depth += 1
+        elif ch in '>)}]':
+            depth -= 1
+        if ch == ',' and depth == 0:
+            parts.append(''.join(cur).strip())
+            cur = []
+        else:
+            cur.append(ch)
+    if ''.join(cur).strip():
+        parts.append(''.join(cur).strip())
+    return parts
+
+
+def mlir_rename_aliases(src: str, prefix: str) -> str:
+    names = [(m.group(1), m.group(2)) for m in MLIR_ALIAS_DEF.finditer(src)]
+    out = src
+    # Longest first: renaming `#map` before `#map0` would corrupt `#map0`.
+    for sigil, name in sorted(set(names), key=lambda p: len(p[1]), reverse=True):
+        out = re.sub(re.escape(sigil) + name + r'\b', f'{sigil}{prefix}{name}', out)
+    return out
+
+
 def mlir_extract_constants(src: str):
     out = []
     for m in MLIR_CONST_RE.finditer(src):
@@ -3175,6 +3220,151 @@ class MLIRFusionStrategy(FusionStrategy):
         lines.append("}")
         return "\n".join(lines)
 
+    _MLIR_SCALAR_TY_RE = re.compile(r'i\d+|index|f(?:16|32|64|80|128)')
+
+    def _parse_signatures(self, body: str):
+        """Defined functions in `body` as {name, args, ret}, where args is the
+        list of declared argument types and ret the single result type (None
+        when the function returns nothing or multiple values — a multi-result
+        call needs result names this bridge doesn't try to synthesize)."""
+        sigs = []
+        for m in MLIR_FUNC_SIG_RE.finditer(body):
+            arg_types = []
+            for arg in mlir_split_top_level(m.group('args') or ''):
+                # `%name: type` in a definition; a bare `type` shouldn't
+                # appear here but is tolerated.
+                arg_types.append(arg.split(':', 1)[1].strip() if ':' in arg else arg.strip())
+            ret = (m.group('ret') or '').strip()
+            # Trailing `attributes {...}` isn't part of the result type.
+            ret = re.split(r'\battributes\b', ret)[0].strip()
+            if ret.startswith('(') or ',' in ret:
+                ret = None  # zero or multiple results
+            sigs.append({"name": m.group('name'), "args": arg_types, "ret": ret or None})
+        return sigs
+
+    def _default_value(self, ty: str, name: str):
+        """An op materializing a value of type `ty`, or None when this bridge
+        can't safely build one (tensors and dynamic memrefs need shaped
+        literals or allocation sizes that aren't recoverable from the type
+        alone)."""
+        if re.fullmatch(r'i\d+|index', ty):
+            return f"{name} = arith.constant 0 : {ty}"
+        if re.fullmatch(r'f(?:16|32|64|80|128)', ty):
+            return f"{name} = arith.constant 0.0 : {ty}"
+        if ty.startswith('memref<') and '?' not in ty:
+            return f"{name} = memref.alloc() : {ty}"
+        # Statically-shaped tensors/vectors take a splat constant; the literal
+        # has to match the element type (`dense<0>` vs `dense<0.0>`), and a
+        # dynamic dimension has no size to splat over.
+        m = re.fullmatch(r'(?:tensor|vector)<([0-9x]*)([a-z]\w*)>', ty)
+        if m and '?' not in ty:
+            elem = m.group(2)
+            if re.fullmatch(r'i\d+|index', elem):
+                return f"{name} = arith.constant dense<0> : {ty}"
+            if re.fullmatch(r'f(?:16|32|64|80|128)', elem):
+                return f"{name} = arith.constant dense<0.0> : {ty}"
+        return None
+
+    def _make_call_bridge(self, a_body: str, b_body: str, uid: str):
+        """Build a bridge function that calls a function from seed A and feeds
+        its result into a function from seed B.
+
+        This is the actual cross-seed dataflow edge: a value produced by one
+        seed's code is consumed as an argument by the other's, so the two
+        seeds' types and symbols have to be reconciled by the compiler
+        instead of being verified in isolation. Direction (which seed
+        produces) is chosen at random per call.
+
+        --dataflow-type-match (self.type_match): 90% of the time prefer a
+        consumer argument slot whose declared type matches the producer's
+        result type, 10% of the time deliberately pick a mismatched slot.
+        With the flag off, the slot is picked uniformly at random — the
+        type-agnostic behavior the other projects' dataflow fusion has.
+
+        Returns '' when no producer/consumer pair can be wired (no function
+        with a single result, none taking an argument, or argument types
+        this bridge can't materialize).
+        """
+        # Try both directions rather than committing to one coin flip: when
+        # only one side has a function that returns a value, giving up half
+        # the time would fall back to the constant bridge for no reason.
+        orders = [(a_body, b_body), (b_body, a_body)]
+        random.shuffle(orders)
+        for producers_src, consumers_src in orders:
+            bridge = self._build_call_bridge(producers_src, consumers_src, uid)
+            if bridge:
+                return bridge
+        return ""
+
+    def _build_call_bridge(self, producers_src: str, consumers_src: str, uid: str):
+        """One direction of _make_call_bridge: a producer from `producers_src`
+        feeding a consumer from `consumers_src`."""
+        producers = [s for s in self._parse_signatures(producers_src) if s["ret"]]
+        consumers = [s for s in self._parse_signatures(consumers_src) if s["args"]]
+        if not producers or not consumers:
+            return ""
+
+        random.shuffle(producers)
+        random.shuffle(consumers)
+
+        for producer in producers:
+            prod_args = []
+            ok = True
+            for i, ty in enumerate(producer["args"]):
+                line = self._default_value(ty, f"%_p{i}")
+                if line is None:
+                    ok = False
+                    break
+                prod_args.append((f"%_p{i}", ty, line))
+            if not ok:
+                continue
+
+            for consumer in consumers:
+                slots = list(range(len(consumer["args"])))
+                if self.type_match and random.random() < 0.90:
+                    matching = [i for i in slots if consumer["args"][i] == producer["ret"]]
+                    slots = matching or slots
+                random.shuffle(slots)
+
+                for slot in slots:
+                    cons_args = []
+                    ok = True
+                    for i, ty in enumerate(consumer["args"]):
+                        if i == slot:
+                            cons_args.append((None, ty, None))
+                            continue
+                        line = self._default_value(ty, f"%_c{i}")
+                        if line is None:
+                            ok = False
+                            break
+                        cons_args.append((f"%_c{i}", ty, line))
+                    if not ok:
+                        continue
+
+                    lines = [f"func.func @_ffl_bridge_{uid}() {{  {self._tag('dataflow')}"]
+                    for _, _, line in prod_args:
+                        lines.append(f"  {line}")
+                    prod_ty = ", ".join(ty for _, ty, _ in prod_args)
+                    prod_names = ", ".join(n for n, _, _ in prod_args)
+                    lines.append(
+                        f"  %_bridge = func.call @{producer['name']}({prod_names}) : "
+                        f"({prod_ty}) -> {producer['ret']}"
+                    )
+                    for name, _, line in cons_args:
+                        if line is not None:
+                            lines.append(f"  {line}")
+                    cons_ty = ", ".join(ty for _, ty, _ in cons_args)
+                    cons_names = ", ".join(
+                        "%_bridge" if name is None else name for name, _, _ in cons_args)
+                    ret = consumer["ret"]
+                    call = (f"func.call @{consumer['name']}({cons_names}) : "
+                            f"({cons_ty}) -> {ret if ret else '()'}")
+                    lines.append(f"  %_sink = {call}" if ret else f"  {call}")
+                    lines.append("  return")
+                    lines.append("}")
+                    return "\n".join(lines)
+        return ""
+
     # Patterns that indicate obviously non-MLIR content (LLM pseudo-code or old std dialect).
     _NON_MLIR_PATTERNS = [
         re.compile(r':\s*string\b'),                  # `string` is not an MLIR type
@@ -3235,9 +3425,25 @@ class MLIRFusionStrategy(FusionStrategy):
         a_src = _MLIR_BARE_FUNC_RE.sub('func.func @', a_src)
         b_src = _MLIR_BARE_FUNC_RE.sub('func.func @', b_src)
 
-        # 2) Rename symbols to avoid collisions
-        a_ren = mlir_rename_symbols(a_src, f"A_{a_id}_")
-        b_ren = mlir_rename_symbols(b_src, f"B_{b_id}_")
+        # 2) Rename symbols and file-level aliases to avoid collisions. Both
+        #    seeds share one module now, so `#map0` colliding is as fatal as
+        #    `@main` colliding.
+        a_ren = mlir_rename_aliases(mlir_rename_symbols(a_src, f"A_{a_id}_"), f"A_{a_id}_")
+        b_ren = mlir_rename_aliases(mlir_rename_symbols(b_src, f"B_{b_id}_"), f"B_{b_id}_")
+
+        # 2b) Lift alias definitions out before anything else touches the
+        #     source: they are only legal at file scope, and
+        #     mlir_strip_outer_module walks past them on its way to the
+        #     module wrapper, which would drop them while the body still
+        #     refers to them.
+        def _split_aliases(src: str):
+            alias_lines, rest_lines = [], []
+            for line in src.splitlines():
+                (alias_lines if MLIR_ALIAS_DEF.match(line) else rest_lines).append(line)
+            return "\n".join(alias_lines), "\n".join(rest_lines)
+
+        a_alias_defs, a_ren = _split_aliases(a_ren)
+        b_alias_defs, b_ren = _split_aliases(b_ren)
 
         # 3) Strip outer module wrappers (now reliably works after directive strip)
         a_body = mlir_strip_outer_module(a_ren).strip()
@@ -3256,11 +3462,19 @@ class MLIRFusionStrategy(FusionStrategy):
         if not self._is_plausible_mlir(b_body):
             b_body = "// (seed B not plausible MLIR — omitted)"
 
-        # 4) Build standalone bridge from constants in both bodies.
-        a_consts = mlir_extract_constants(a_body)
-        b_consts = mlir_extract_constants(b_body)
+        # 4) Bridge the two seeds. A call bridge — one seed's function result
+        #    feeding the other's argument — is the real dataflow edge, so try
+        #    it first; fall back to the constant bridge (constants copied from
+        #    both sides into one arithmetic chain) only when no callable
+        #    producer/consumer pair exists.
         uid = f"{a_id}_{b_id}"
-        bridge_code = self._make_bridge(a_consts, b_consts, uid)
+        bridge_code = self._make_call_bridge(a_body, b_body, uid)
+        bridge_kind = "call"
+        if not bridge_code:
+            a_consts = mlir_extract_constants(a_body)
+            b_consts = mlir_extract_constants(b_body)
+            bridge_code = self._make_bridge(a_consts, b_consts, uid)
+            bridge_kind = "constant" if bridge_code else "none"
 
         # 5) Bug primitives
         bug_prims = self._bug_primitives()
@@ -3285,44 +3499,38 @@ class MLIRFusionStrategy(FusionStrategy):
                     body_lines.append(line)
             return "\n".join(alias_lines), "\n".join(body_lines).strip()
 
-        def _wrap_section(body: str, section_comment: str):
-            """Return lines for one // ----- section, handling alias hoisting and
-            bodies that already contain a top-level module {} wrapper."""
+        def _unwrap(body: str) -> str:
+            """Body content ready to sit inside the shared module: aliases
+            split off (they must stay at file scope) and any surviving
+            `module { }` wrapper's contents lifted out, since nesting a
+            module here would put the seed's symbols in a separate symbol
+            table where the bridge couldn't call them."""
             aliases, inner = _hoist_aliases(body)
-            parts = [section_comment]
-            if aliases:
-                parts.append(aliases)
-            # If inner already starts with 'module' it was not stripped — emit directly.
-            inner_stripped = inner.lstrip()
-            if inner_stripped.startswith("module"):
-                parts.append(inner)
-            else:
-                parts.append("module {")
-                parts.append(_indent(inner))
-                parts.append("}")
-            return "\n".join(parts)
+            stripped = inner.lstrip()
+            if stripped.startswith("module"):
+                inner = mlir_strip_outer_module(inner).strip()
+            return aliases, inner
 
-        # Output three independent modules separated by // ----- so that
-        # --split-input-file evaluates each section on its own.  If seed A is
-        # individually valid and seed B is individually valid, the fused file
-        # passes as a whole, dramatically increasing the zero-rate.
-        # The bridge + bug-primitives section is always syntactically correct
-        # (self-contained arith ops) so it never pulls the return code to 1.
-        fused_parts = [
-            f"// FUSED MLIR (FFL)  A: {a_id}  B: {b_id}",
-            "",
-            _wrap_section(a_body, "// ===== Section A ====="),
-            "",
-            "// -----",
-            "",
-            _wrap_section(b_body, "// ===== Section B ====="),
-            "",
-            "// -----",
-            "",
-            "// ===== FFL Bridge + Bug Primitives =====",
-            "module {",
-        ]
+        a_aliases, a_inner = _unwrap(a_body)
+        b_aliases, b_inner = _unwrap(b_body)
+        a_aliases = "\n".join(x for x in (a_alias_defs, a_aliases) if x.strip())
+        b_aliases = "\n".join(x for x in (b_alias_defs, b_aliases) if x.strip())
+
+        # One shared module: both seeds' symbols live in the same symbol
+        # table, which is what lets the bridge call across them. This
+        # deliberately replaces the older three-`// -----`-section layout
+        # (A alone, B alone, bridge alone), which scored a high validity
+        # rate precisely because --split-input-file verified each seed in
+        # isolation — the two halves never interacted, so nothing about the
+        # pair was ever tested.
+        fused_parts = [f"// FUSED MLIR (FFL)  A: {a_id}  B: {b_id}  bridge: {bridge_kind}"]
+        for aliases in (a_aliases, b_aliases):
+            if aliases.strip():
+                fused_parts.append(aliases)
+        fused_parts += ["", "module {", "  // ===== Seed A =====", _indent(a_inner), "",
+                        "  // ===== Seed B =====", _indent(b_inner), ""]
         if bridge_code:
+            fused_parts.append("  // ===== FFL Bridge (A <-> B dataflow) =====")
             fused_parts.append(_indent(bridge_code))
             fused_parts.append("")
         fused_parts.append(bug_prims)
@@ -3335,6 +3543,7 @@ class MLIRFusionStrategy(FusionStrategy):
             metadata={
                 "parents": [parent_a.id, parent_b.id],
                 "type": "mlir",
+                "mode": f"dataflow_{bridge_kind}",
                 "description": f"Fused {parent_a.id} + {parent_b.id}"
             }
         )
