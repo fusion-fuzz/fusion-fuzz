@@ -77,7 +77,9 @@ class FusionFuzzLoop:
                 else:
                     logger.warning(f"Skipping unknown corpus item type: {type(item)}")
         
-        if not self.corpus:
+        # Replay mode (--execute) constructs the loop with no corpus and no
+        # strategies on purpose — only warn when fusion actually needs one.
+        if not self.corpus and strategies:
             logger.warning("Corpus is empty after initialization!")
 
         # Initialize the specific driver (e.g., PHPDriver) via factory
@@ -901,6 +903,208 @@ class FusionFuzzLoop:
         except Exception as e:
             logger.warning(f"Failed to write sample log: {e}")
 
+    def _process_result(self, child, result) -> bool:
+        """
+        Post-execution handling shared by fuzzing (run) and replay
+        (execute_folder): sample logging, syntax/validity stats, crash
+        deduplication + bundle saving, corpus feedback, output truncation.
+
+        Returns True when this result was a newly-seen crash.
+        """
+        # Log sample details
+        self._log_sample(child, result)
+
+        # Check Syntax Stats
+        self.sample_count += 1
+        if self._is_syntax_error(result):
+            self.syntax_error_count += 1
+
+        new_crash = False
+        if result.crashed:
+            # Deduplication logic
+            signature = self._extract_crash_signature(result)
+
+            if signature:
+                if signature not in self.unique_crashes:
+                    self.unique_crashes.add(signature)
+                    sys.stdout.write("\n")
+                    logger.error(f"CRASH FOUND! ID: {child.id} (Sig: {signature})")
+                    self._save_crash_bundle(child, result, signature)
+                    new_crash = True
+                else:
+                    # logger.info(f"Duplicate crash ignored.")
+                    pass
+            else:
+                fallback_sig = f"NoSig_{int(time.time())}"
+                self.unique_crashes.add(fallback_sig)
+                sys.stdout.write("\n")
+                logger.error(f"CRASH FOUND! ID: {child.id} (No Sig - Saving)")
+                self._save_crash_bundle(child, result, fallback_sig)
+                new_crash = True
+
+        if self.is_interesting(result):
+            self.corpus.append(child)
+
+        # Truncate large outputs to save memory, keeping content around
+        # the crash signature.
+        if len(result.stdout or "") > 50000:
+            result.stdout = smart_truncate(result.stdout or "", max_chars=50000)
+        if len(result.stderr or "") > 50000:
+            result.stderr = smart_truncate(result.stderr or "", max_chars=50000)
+
+        return new_crash
+
+    def execute_folder(self, folder, sample_log=None):
+        """
+        Replay mode (--execute): run every program in `folder` through the
+        project driver and report bugs. No fusion, no generation, no
+        corpus — just execution plus the same crash triage, deduplication
+        (against output/bugs/<project>/ from previous runs too) and bug
+        bundle saving that fuzzing does.
+
+        Programs are read recursively; manifest.jsonl and hidden files are
+        skipped. Each program keeps its own file extension, so a folder
+        written by --save-to can be replayed as-is.
+        """
+        folder = os.path.abspath(folder)
+        if not os.path.isdir(folder):
+            logger.error(f"--execute: {folder} is not a directory")
+            return 0
+
+        skip_names = {"manifest.jsonl"}
+        files = []
+        for root, dirs, names in os.walk(folder):
+            dirs[:] = sorted(d for d in dirs if not d.startswith("."))
+            for name in sorted(names):
+                if name.startswith(".") or name in skip_names:
+                    continue
+                files.append(os.path.join(root, name))
+
+        if not files:
+            logger.error(f"--execute: no programs found in {folder}")
+            return 0
+
+        programs = []
+        for path in files:
+            try:
+                with open(path, "r", encoding="utf-8", errors="replace") as f:
+                    content = f.read()
+            except Exception as e:
+                logger.warning(f"Skipping {path}: {e}")
+                continue
+            if not content.strip():
+                continue
+            rel = os.path.relpath(path, folder)
+            programs.append(Seed(content=content, metadata={
+                "type": "replay",
+                "filename": rel,
+                "source_path": path,
+                "extension": os.path.splitext(path)[1] or None,
+            }))
+
+        if not programs:
+            logger.error(f"--execute: no readable, non-empty programs in {folder}")
+            return 0
+
+        logger.info(f"Replay mode: executing {len(programs)} program(s) from {folder}")
+        self.start_time = time.time()
+        self.driver.prepare_environment()
+
+        # Open sample log file
+        if sample_log:
+            self.sample_log_path = sample_log
+            try:
+                os.makedirs(os.path.dirname(os.path.abspath(sample_log)), exist_ok=True)
+                self._sample_log_file = open(sample_log, "a", encoding="utf-8")
+                start_ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                self._sample_log_file.write(
+                    f"\n{'#'*60}\n# FFL Replay Log | Project: {self.project_name} | "
+                    f"Started: {start_ts}\n{'#'*60}\n")
+                self._sample_log_file.flush()
+                logger.info(f"Sample log: {sample_log}")
+            except Exception as e:
+                logger.warning(f"Could not open sample log file {sample_log}: {e}")
+
+        self.original_cwd = os.getcwd()
+        self.current_workspace = self._setup_workspace()
+        os.chdir(self.current_workspace)
+
+        max_workers = self.config.get("execution", {}).get("concurrency", 4)
+        logger.info(f"ThreadPoolExecutor initialized with {max_workers} workers.")
+
+        crashes_before = len(self.unique_crashes)
+        executed = 0
+        executor = ThreadPoolExecutor(max_workers=max_workers)
+
+        def _exec(seed):
+            try:
+                return seed, self.driver.execute(seed)
+            except Exception as e:
+                logger.error(f"Execution driver error on {seed.metadata.get('filename')}: {e}")
+                return seed, None
+
+        try:
+            pending = iter(programs)
+            active = set()
+            while True:
+                while len(active) < max_workers:
+                    nxt = next(pending, None)
+                    if nxt is None:
+                        break
+                    active.add(executor.submit(_exec, nxt))
+                if not active:
+                    break
+
+                done, active = wait(active, return_when=FIRST_COMPLETED, timeout=30)
+                for future in done:
+                    try:
+                        seed, result = future.result()
+                    except Exception as e:
+                        logger.error(f"Error extracting result: {e}")
+                        continue
+                    if result is None:
+                        continue
+                    executed += 1
+                    self._process_result(seed, result)
+
+                    if executed % 10 == 0 or executed == len(programs):
+                        elapsed = time.time() - self.start_time
+                        rate = executed / elapsed if elapsed > 0 else 0.0
+                        sys.stdout.write(
+                            f"\r[ {int(elapsed)//60:d}:{int(elapsed)%60:02d} ] "
+                            f"Executed: {executed}/{len(programs)} | "
+                            f"{rate:.1f} tests/s | "
+                            f"Bugs: {len(self.unique_crashes)} | "
+                            f"ValidRate: {self._fused_valid_rate():.1f}%"
+                        )
+                        sys.stdout.flush()
+        except KeyboardInterrupt:
+            sys.stdout.write("\n")
+            logger.info(f"Replay interrupted by user after {executed} program(s).")
+        finally:
+            executor.shutdown(wait=False)
+            if self._sample_log_file:
+                try:
+                    self._sample_log_file.close()
+                except Exception:
+                    pass
+            self._cleanup_stale_processes()
+            os.chdir(self.original_cwd)
+            try:
+                shutil.rmtree(self.current_workspace, onerror=self._force_remove)
+            except Exception:
+                pass
+
+        sys.stdout.write("\n")
+        new_crashes = len(self.unique_crashes) - crashes_before
+        logger.info(
+            f"Replay finished: {executed}/{len(programs)} program(s) executed, "
+            f"valid rate {self._fused_valid_rate():.1f}%, "
+            f"{new_crashes} new unique bug(s) "
+            f"(saved under output/bugs/{self.project_name}/)."
+        )
+        return new_crashes
+
     def run(self, max_iterations, sample_log=None):
         logger.info(f"Starting FFL for {self.project_name} with parallel execution...")
         self.start_time = time.time() # Reset start time
@@ -1012,44 +1216,8 @@ class FusionFuzzLoop:
                                 for child, result in pairs:
                                     if not child or not result:
                                         continue
-                                    # Log sample details
-                                    self._log_sample(child, result)
+                                    self._process_result(child, result)
 
-                                    # Check Syntax Stats
-                                    self.sample_count += 1
-                                    if self._is_syntax_error(result):
-                                        self.syntax_error_count += 1
-
-                                    if result.crashed:
-                                        # Deduplication logic
-                                        signature = self._extract_crash_signature(result)
-
-                                        if signature:
-                                            if signature not in self.unique_crashes:
-                                                self.unique_crashes.add(signature)
-                                                sys.stdout.write("\n")
-                                                logger.error(f"CRASH FOUND! ID: {child.id} (Sig: {signature})")
-                                                self._save_crash_bundle(child, result, signature)
-                                            else:
-                                                # logger.info(f"Duplicate crash ignored.")
-                                                pass
-                                        else:
-                                            fallback_sig = f"NoSig_{int(time.time())}"
-                                            self.unique_crashes.add(fallback_sig)
-                                            sys.stdout.write("\n")
-                                            logger.error(f"CRASH FOUND! ID: {child.id} (No Sig - Saving)")
-                                            self._save_crash_bundle(child, result, fallback_sig)
-
-                                    if self.is_interesting(result):
-                                        self.corpus.append(child)
-
-                                    # Truncate large outputs to save memory,
-                                    # keeping content around the crash signature.
-                                    if len(result.stdout or "") > 50000:
-                                        result.stdout = smart_truncate(result.stdout or "", max_chars=50000)
-                                    if len(result.stderr or "") > 50000:
-                                        result.stderr = smart_truncate(result.stderr or "", max_chars=50000)
-                                    
                             except Exception as e:
                                 logger.error(f"Error extracting future result: {e}")
                             
