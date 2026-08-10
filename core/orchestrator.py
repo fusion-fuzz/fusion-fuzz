@@ -167,10 +167,15 @@ class FusionFuzzLoop:
         random.shuffle(chain)
         return chain
 
-    def process_iteration(self) -> List[Tuple[Optional[Seed], Optional[object]]]:
+    def _fuse_once(self) -> Tuple[List[Seed], List, Tuple[Optional[Seed], Optional[Seed]]]:
         """
-        Worker function to handle Selection, Fusion, and Execution.
-        Executed in a separate thread.
+        Selection + fusion for one iteration, without execution.
+
+        Returns (children, strategy_chain, (parent_a, parent_b)); children
+        is empty when the selected pair had no viable strategy or fusion
+        raised. The parents returned are the two corpus seeds picked for
+        this iteration — a child's own metadata["parents"] may instead
+        name an intermediate seed produced earlier in the chain.
 
         Fusion combines techniques rather than picking a single one:
         _pick_strategy_chain layers 1-3 of the pool's strategies onto the
@@ -183,7 +188,7 @@ class FusionFuzzLoop:
         parent_a, parent_b = self.select_parents()
 
         if not parent_a or not parent_b:
-            return [(None, None)]
+            return [], [], (parent_a, parent_b)
 
         # Drop strategies that would just be a no-op on this specific pair
         # (e.g. clang declaration fusion when one side has nothing to
@@ -194,7 +199,7 @@ class FusionFuzzLoop:
         # iteration rather than force an unviable technique.
         usable = [s for s in self.strategies if s.is_viable_pair(parent_a, parent_b)]
         if not usable:
-            return [(None, None)]
+            return [], [], (parent_a, parent_b)
 
         try:
             chain = self._pick_strategy_chain(usable)
@@ -209,6 +214,17 @@ class FusionFuzzLoop:
                 children = [final_strategy.fuse(host, parent_b)]
         except Exception as e:
             logger.warning(f"Fusion error: {e}")
+            return [], [], (parent_a, parent_b)
+
+        return [c for c in children if c], chain, (parent_a, parent_b)
+
+    def process_iteration(self) -> List[Tuple[Optional[Seed], Optional[object]]]:
+        """
+        Worker function to handle Selection, Fusion, and Execution.
+        Executed in a separate thread.
+        """
+        children, _chain, _parents = self._fuse_once()
+        if not children:
             return [(None, None)]
 
         # 3. Execute
@@ -323,6 +339,199 @@ class FusionFuzzLoop:
 
 
 
+    def _seed_extension(self, seed=None) -> str:
+        """File extension to use when writing `seed` out for this project."""
+        meta = getattr(seed, "metadata", None) or {}
+        ext = ".txt"
+        if "php" in self.project_name: ext = ".phpt"
+        elif "cpython" in self.project_name or "python" in self.project_name: ext = ".py"
+        elif "mlir" in self.project_name: ext = ".mlir"
+        elif "swift" in self.project_name: ext = ".swift"
+        elif "rust" in self.project_name: ext = ".rs"
+        elif "clang" in self.project_name or "gcc" in self.project_name:
+            # C/C++/Obj-C are all valid here — a blanket ".c" mislabels C++
+            # seeds (test.sh still records the real "clang++ ... -std=c++20"
+            # invocation against a file that no longer exists under that
+            # name, so the saved reproducer silently can't be re-run).
+            ext = meta.get("extension") or ".c"
+        elif "flang" in self.project_name or "fortran" in self.project_name:
+            ext = meta.get("extension") or ".f90"
+        elif "haskell" in self.project_name: ext = ".hs"
+        return ext
+
+    def _fuse_pair(self, host_seed, donor_seed):
+        """
+        Fuse one ordered pair (host <- donor) with a strategy chain, no
+        execution. Returns (child, chain); child is None when no strategy
+        is viable for the pair or fusion raised. Single-direction only —
+        the caller enumerates the reverse pair separately.
+        """
+        usable = [s for s in self.strategies
+                  if s.is_viable_pair(host_seed, donor_seed)]
+        if not usable:
+            return None, []
+        chain = self._pick_strategy_chain(usable)
+        try:
+            host = host_seed
+            for strategy in chain:
+                host = strategy.fuse(host, donor_seed)
+        except Exception as e:
+            logger.warning(f"Fusion error: {e}")
+            return None, chain
+        return host, chain
+
+    def generate_only(self, output_dir, max_programs=-1, self_fusion=True):
+        """
+        Fusion-only mode (--save-to): run the same strategy-chain fusion as
+        fuzzing, but write each fused program to `output_dir` instead of
+        executing it. No driver, no workspace, no crash triage.
+
+        Every ordered pair of corpus seeds is fused exactly once — (a, b)
+        and (b, a) are separate programs, and (a, a) too unless
+        self_fusion is False — so an N-seed corpus yields exactly N*N
+        files (N*(N-1) without self-fusion), with no duplicated or missing
+        pairs. Pair order is shuffled so a run cut short by max_programs
+        (--iterations) or Ctrl-C still samples the whole corpus rather
+        than just its first seeds.
+
+        max_programs caps how many programs are written (-1 = all pairs).
+        Alongside the programs a manifest.jsonl records, per file, the
+        child seed id, the ordered (host, donor) parents and the fusion
+        strategies applied.
+        """
+        import json
+
+        output_dir = os.path.abspath(output_dir)
+        os.makedirs(output_dir, exist_ok=True)
+        manifest_path = os.path.join(output_dir, "manifest.jsonl")
+
+        n = len(self.corpus)
+        if n == 0:
+            logger.error("Corpus is empty — nothing to fuse.")
+            return 0
+
+        total_pairs = n * n if self_fusion else n * (n - 1)
+        planned = total_pairs if max_programs == -1 else min(max_programs, total_pairs)
+
+        logger.info(
+            f"Fusion-only mode: {n} seeds -> {total_pairs} ordered pair(s)"
+            + ("" if self_fusion else " (self-fusion excluded)")
+            + f"; writing {planned} fused program(s) for {self.project_name} "
+              f"to {output_dir}"
+        )
+        if max_programs != -1 and max_programs > total_pairs:
+            logger.warning(
+                f"--iterations {max_programs} exceeds the {total_pairs} "
+                f"available ordered pairs; writing {total_pairs}."
+            )
+
+        # Materializing the pair list costs ~16 bytes/pair; at 100 seeds
+        # that is nothing, but a full project corpus (tens of thousands of
+        # seeds) would be hundreds of millions of pairs. Refuse rather than
+        # exhaust memory — the user can narrow with --corpus-size.
+        if total_pairs > 20_000_000:
+            logger.error(
+                f"{total_pairs} ordered pairs from {n} seeds is too many to "
+                "enumerate. Narrow the corpus with --corpus-size (e.g. "
+                "--corpus-size 100 --diverse) and re-run."
+            )
+            return 0
+
+        pairs = [(i, j) for i in range(n) for j in range(n)
+                 if self_fusion or i != j]
+        random.shuffle(pairs)
+        if max_programs != -1:
+            pairs = pairs[:max_programs]
+
+        # fused_* files are written from index 0 every run, so a previous
+        # run's manifest would no longer describe what's on disk — start it
+        # fresh and say so when we're overwriting an earlier batch.
+        stale = glob.glob(os.path.join(output_dir, "fused_*"))
+        if stale:
+            logger.warning(
+                f"{len(stale)} fused_* file(s) already in {output_dir} — "
+                "they will be overwritten and manifest.jsonl reset."
+            )
+
+        self.start_time = time.time()
+        saved = 0
+        failed = 0
+        manifest = open(manifest_path, "w", encoding="utf-8")
+
+        try:
+            for idx, (i, j) in enumerate(pairs):
+                host_seed, donor_seed = self.corpus[i], self.corpus[j]
+                self.iterations += 1
+                self.coverage.record(host_seed.id, donor_seed.id)
+
+                child, chain = self._fuse_pair(host_seed, donor_seed)
+                if child is None or not (child.content or "").strip():
+                    failed += 1
+                    manifest.write(json.dumps({
+                        "file": None,
+                        "error": "no viable strategy or fusion failed",
+                        "strategies": [type(s).__name__ for s in chain],
+                        "parents": [
+                            {"id": host_seed.id,
+                             "filename": host_seed.metadata.get("filename"),
+                             "role": "host"},
+                            {"id": donor_seed.id,
+                             "filename": donor_seed.metadata.get("filename"),
+                             "role": "donor"},
+                        ],
+                    }) + "\n")
+                    continue
+
+                ext = self._seed_extension(child)
+                filename = f"fused_{idx:06d}{ext}"
+                try:
+                    with open(os.path.join(output_dir, filename), "w", encoding="utf-8") as f:
+                        f.write(child.content)
+                except Exception as e:
+                    logger.error(f"Failed to write {filename}: {e}")
+                    failed += 1
+                    continue
+
+                manifest.write(json.dumps({
+                    "file": filename,
+                    "id": child.id,
+                    "strategies": [type(s).__name__ for s in chain],
+                    # Ordered: the first parent hosts, the second donates.
+                    "parents": [
+                        {"id": host_seed.id,
+                         "filename": host_seed.metadata.get("filename"),
+                         "role": "host"},
+                        {"id": donor_seed.id,
+                         "filename": donor_seed.metadata.get("filename"),
+                         "role": "donor"},
+                    ],
+                    "self_fusion": i == j,
+                }) + "\n")
+                saved += 1
+
+                if saved % 100 == 0:
+                    manifest.flush()
+                    elapsed = time.time() - self.start_time
+                    sys.stdout.write(
+                        f"\rGenerated: {saved}/{len(pairs)} | failed: {failed} | "
+                        f"{elapsed:.0f}s"
+                    )
+                    sys.stdout.flush()
+        except KeyboardInterrupt:
+            sys.stdout.write("\n")
+            logger.info("Generation interrupted by user.")
+        finally:
+            manifest.close()
+
+        sys.stdout.write("\n")
+        logger.info(
+            f"Wrote {saved} fused program(s) to {output_dir} "
+            f"(of {len(pairs)} ordered pairs attempted"
+            + (f", {failed} produced no program" if failed else "")
+            + f"); manifest: {manifest_path}"
+        )
+        return saved
+
     def _save_crash_bundle(self, seed, result, signature):
         """
         Creates a dedicated folder for the crash and saves:
@@ -357,21 +566,7 @@ class FusionFuzzLoop:
             os.makedirs(crash_dir, exist_ok=True)
 
         # 2. Determine file extension
-        ext = ".txt"
-        if "php" in self.project_name: ext = ".phpt"
-        elif "cpython" in self.project_name or "python" in self.project_name: ext = ".py"
-        elif "mlir" in self.project_name: ext = ".mlir"
-        elif "swift" in self.project_name: ext = ".swift"
-        elif "rust" in self.project_name: ext = ".rs"
-        elif "clang" in self.project_name or "gcc" in self.project_name:
-            # C/C++/Obj-C are all valid here — a blanket ".c" mislabels C++
-            # seeds (test.sh still records the real "clang++ ... -std=c++20"
-            # invocation against a file that no longer exists under that
-            # name, so the saved reproducer silently can't be re-run).
-            ext = seed.metadata.get("extension") or ".c"
-        elif "flang" in self.project_name or "fortran" in self.project_name:
-            ext = seed.metadata.get("extension") or ".f90"
-        elif "haskell" in self.project_name: ext = ".hs"
+        ext = self._seed_extension(seed)
 
         test_filename = f"test{ext}"
 

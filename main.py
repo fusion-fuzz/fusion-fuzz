@@ -179,6 +179,24 @@ if __name__ == "__main__":
     parser.add_argument("--save-subset", type=str, default=None, metavar="PATH",
                         help="Save the selected corpus subset (after --corpus-size/--diverse) "
                              "to PATH for reuse via --load-subset")
+    parser.add_argument("--save-to", type=str, default=None, metavar="OUTPUT_DIR",
+                        help="Fusion-only mode: don't fuzz. Run program fusion exactly as "
+                             "fuzzing would (same corpus, same parent selection, same "
+                             "--dataflow-fusion/--state-fusion/--declaration-fusion pool and "
+                             "--fusion-rate), but write each fused program to OUTPUT_DIR as "
+                             "fused_<n>.<ext> instead of executing it. Every ordered pair of "
+                             "corpus seeds is fused exactly once — (a,b) and (b,a) are separate "
+                             "programs, and (a,a) too unless --no-self-fusion — so N seeds give "
+                             "exactly N*N files (e.g. --corpus-size 100 -> 10000). --iterations N "
+                             "caps how many are written (default -1: all pairs), taken from a "
+                             "shuffled pair order so a capped run still spans the whole corpus. "
+                             "OUTPUT_DIR/manifest.jsonl records each program's ordered host/donor "
+                             "parents and the strategies applied. Compatible with --pre-analysis/"
+                             "--dry-run/--corpus-size, which still run beforehand; --gcov/"
+                             "--sample-log are ignored.")
+    parser.add_argument("--no-self-fusion", action="store_true", default=False,
+                        help="With --save-to, skip the (a,a) self-fusion pairs, giving "
+                             "N*(N-1) programs instead of N*N.")
     parser.add_argument("--load-subset", type=str, default=None, metavar="PATH",
                         help="Load a previously saved corpus subset from PATH instead of "
                              "the project corpus (skips --corpus-size/--diverse selection)")
@@ -520,6 +538,12 @@ if __name__ == "__main__":
         fusion_rate=args.fusion_rate,
     )
     
+    # === FUSION-ONLY MODE (--save-to): generate and save, never execute ===
+    if args.save_to:
+        fuzzer.generate_only(args.save_to, max_programs=args.iterations,
+                             self_fusion=not args.no_self_fusion)
+        sys.exit(0)
+
     # === GCOV RESET (before fuzzing) ===
     if args.gcov:
         php_src_dir = os.path.join("projects", args.project, "php-src")
