@@ -2820,7 +2820,7 @@ class SwiftStateFusionStrategy(SwiftFusionStrategy):
     """
 
     def _build_state_fused(self, host: Seed, donor: Seed, direction: str) -> Seed:
-        from .state_analysis import pick_state_point, graft_continuation, StatePoint
+        from .state_analysis import pick_state_point, graft_continuation, StatePoint, truncate_to_balanced
 
         host_src, donor_src = host.content, donor.content
 
@@ -6474,7 +6474,7 @@ class ClangStateFusionStrategy(ClangFusionStrategy):
         return body, includes
 
     def _build_state_fused(self, host: Seed, donor: Seed, direction: str) -> Seed:
-        from .state_analysis import pick_state_point, graft_continuation, StatePoint
+        from .state_analysis import pick_state_point, graft_continuation, StatePoint, truncate_to_balanced
 
         host_code, donor_code = host.content, donor.content
         if self.mutation:
