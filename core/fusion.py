@@ -30,6 +30,7 @@ class FusionStrategy(abc.ABC):
     LINE_COMMENT_TOKENS: Dict[str, str] = {
         "php": "//", "cpython": "#", "clang": "//", "flang": "!",
         "swift": "//", "mlir": "//", "rust": "//", "haskell": "--",
+        "naga": "//", "wgsl": "//",
     }
 
     def _tag(self, kind: str) -> str:
@@ -6536,6 +6537,253 @@ class ClangStateFusionStrategy(ClangFusionStrategy):
 
 
 # ==========================================
+# Naga / WGSL Specific Fusion Strategy
+# ==========================================
+
+class NagaFusionStrategy(ClangFusionStrategy):
+    """
+    WGSL fusion for Naga. Reuses ClangFusionStrategy's literal/comment-aware
+    statement splitter and dependency interleaver, but swaps in WGSL syntax
+    for identifiers, declarations, bridge variables, and top-level symbols.
+    """
+
+    LANGUAGE = "naga"
+
+    _C_KEYWORDS = frozenset({
+        "alias", "array", "atomic", "bitcast", "bool", "break", "case",
+        "const", "const_assert", "continue", "continuing", "default",
+        "diagnostic", "discard", "else", "enable", "false", "fn", "for",
+        "function", "if", "let", "loop", "override", "private", "ptr",
+        "requires", "return", "select", "storage", "struct", "switch",
+        "true", "type", "var", "while", "workgroup", "read", "write",
+        "read_write", "i32", "u32", "f32", "f16", "bool",
+    })
+    _C_CONTROL_KW = frozenset({"if", "for", "while", "switch", "loop"})
+    _C_VAR_ASSIGN_RE = re.compile(r'\b([A-Za-z_]\w*)\s*=(?!=)')
+    _C_FUNC_DEF_RE = re.compile(r'\bfn\s+([A-Za-z_]\w*)\s*\([^)]*\)\s*(?:->\s*[^{]+)?\{')
+    _C_TYPE_DEF_RE = re.compile(r'\b(?:struct|alias)\s+([A-Za-z_]\w*)')
+    _C_IDENT_RE = re.compile(r'\b([A-Za-z_]\w*)\b')
+    _C_BLOCK_HEAD_RE = re.compile(
+        r'^\s*(?:@[\w(),\s]*\s*)*(?:fn\s+\w+\s*\(|struct\s+\w+\s*\{|'
+        r'if\s*\(|for\s*\(|while\s*\(|loop\s*\{|switch\s*\()'
+    )
+    _CONTINUATION_RE = re.compile(r'^\s*(?:else\b|continuing\b)')
+    _C_VAR_DECL_RE = re.compile(
+        r'\b(?:var(?:\s*<[^>]+>)?|let|const|override)\s+([A-Za-z_]\w*)'
+        r'\s*(?::\s*([^=;]+))?'
+    )
+    _WGSL_TOPLEVEL_NAME_RE = re.compile(
+        r'\b(?:fn|struct|alias)\s+([A-Za-z_]\w*)'
+        r'|\b(?:var(?:\s*<[^>]+>)?|const|override)\s+([A-Za-z_]\w*)'
+    )
+
+    def __init__(self, project_root="projects/naga", type_match: bool = False,
+                 lightweight: bool = False):
+        super().__init__(project_root=project_root, type_match=type_match,
+                         lightweight=lightweight)
+        self.bridge_var_name = "ffl_fusion"
+
+    def format_assignment(self, lhs: str, rhs: str) -> str:
+        return f"var<private> {lhs} : i32 = i32({rhs});"
+
+    def _infer_c_var_types(self, code: str) -> Dict[str, str]:
+        types = {}
+        for m in self._C_VAR_DECL_RE.finditer(code):
+            name, ty = m.group(1), m.group(2)
+            types[name] = re.sub(r'\s+', ' ', ty.strip()) if ty else ""
+        return types
+
+    def _extract_top_level_names(self, code: str):
+        names = set()
+        for m in self._WGSL_TOPLEVEL_NAME_RE.finditer(code):
+            name = m.group(1) or m.group(2)
+            if name and name not in self._C_KEYWORDS:
+                names.add(name)
+        return names
+
+    def _resolve_name_conflicts(self, code_a: str, code_b: str) -> str:
+        conflicts = self._extract_top_level_names(code_a) & self._extract_top_level_names(code_b)
+        result = code_b
+        for name in sorted(conflicts, key=len, reverse=True):
+            result = re.sub(rf'\b{re.escape(name)}\b', name + "_ffl", result)
+        return result
+
+    def _metadata(self, parent_a: Seed, parent_b: Seed, mode: str) -> Dict[str, Any]:
+        return {
+            "parents": [parent_a.id, parent_b.id],
+            "type": "wgsl",
+            "extension": ".wgsl",
+            "mode": mode,
+            "description": f"Fused {parent_a.id} + {parent_b.id} ({mode})",
+        }
+
+    def _build_fused_test(self, parent_a: Seed, parent_b: Seed, mode: str) -> Seed:
+        seed = super()._build_fused_test(parent_a, parent_b, mode)
+        seed.metadata.update(self._metadata(parent_a, parent_b, mode))
+        return seed
+
+
+class NagaStateFusionStrategy(NagaFusionStrategy):
+    """State fusion for WGSL: graft one shader's continuation into another."""
+
+    def _build_state_fused(self, host: Seed, donor: Seed, direction: str) -> Seed:
+        from .state_analysis import pick_state_point, graft_continuation, StatePoint, truncate_to_balanced
+
+        host_code, donor_code = host.content, donor.content
+        if self.mutation:
+            host_code = self.mut.mutate(host_code)
+            donor_code = self.mut.mutate(donor_code)
+        donor_code = self._resolve_name_conflicts(host_code, donor_code)
+
+        host_point = pick_state_point(host_code, "naga", self.project_root,
+                                       cached=(host.metadata or {}).get("most_complex_states"),
+                                       lightweight=self.lightweight)
+        donor_point = pick_state_point(donor_code, "naga", self.project_root,
+                                        cached=(donor.metadata or {}).get("most_complex_states"),
+                                        lightweight=self.lightweight)
+        if host_point is None:
+            lines = host_code.splitlines()
+            host_point = StatePoint(max(len(lines) - 1, 0), "fallback", "", "")
+
+        donor_lines = donor_code.splitlines()
+        start_idx = (donor_point.line_idx + 1) if donor_point else 0
+        end_idx = truncate_to_balanced(donor_code, start_idx, "naga")
+        truncated_donor = "\n".join(donor_lines[:end_idx])
+        fused = graft_continuation(host_code, truncated_donor, host_point, donor_point,
+                                    tag_comment=self._tag("state"))
+
+        return Seed(content=fused, metadata={
+            "parents": [host.id, donor.id],
+            "type": "wgsl",
+            "extension": ".wgsl",
+            "mode": f"state_{host_point.category}_{direction}",
+            "description": f"State-fused {host.id} <- {donor.id} ({direction})",
+        })
+
+    def fuse(self, parent_a: Seed, parent_b: Seed) -> Seed:
+        return self._build_state_fused(parent_a, parent_b, "ab")
+
+    def fuse_bidirectional(self, parent_a: Seed, parent_b: Seed) -> List[Seed]:
+        return [
+            self._build_state_fused(parent_a, parent_b, "ab"),
+            self._build_state_fused(parent_b, parent_a, "ba"),
+        ]
+
+
+class NagaDeclarationFusionStrategy(NagaFusionStrategy):
+    """
+    Declaration fusion for WGSL: inject donor struct/type declarations or
+    donor type references into host structs/functions.
+    """
+
+    _STRUCT_HEADER_RE = re.compile(r'\bstruct\s+([A-Za-z_]\w*)\s*\{')
+    _ALIAS_RE = re.compile(r'\balias\s+([A-Za-z_]\w*)\s*=')
+    _FN_SIG_RE = re.compile(r'\bfn\s+([A-Za-z_]\w*)\s*\(([^)]*)\)')
+
+    @classmethod
+    def _extract_type_names(cls, code: str):
+        return set(cls._STRUCT_HEADER_RE.findall(code)) | set(cls._ALIAS_RE.findall(code))
+
+    @classmethod
+    def has_injectable_declaration(cls, code: str) -> bool:
+        return bool(cls._extract_type_names(code) or cls._donor_type_items(code))
+
+    def is_viable_pair(self, parent_a: Seed, parent_b: Seed) -> bool:
+        meta_a, meta_b = parent_a.metadata or {}, parent_b.metadata or {}
+        if "has_declaration" in meta_a and "has_declaration" in meta_b:
+            return bool(meta_a["has_declaration"]) and bool(meta_b["has_declaration"])
+        return self.has_injectable_declaration(parent_a.content) and self.has_injectable_declaration(parent_b.content)
+
+    @classmethod
+    def _donor_type_items(cls, code: str):
+        items = []
+        for stmt in cls._split_statements(code):
+            head = stmt.lstrip()[:120]
+            if re.match(r'(?:alias|struct)\b', head):
+                fixed = stmt if stmt.rstrip().endswith(';') or head.startswith("struct") else stmt.rstrip() + ";"
+                items.append(fixed)
+        return items
+
+    def _inject_struct_member(self, stmt: str, donor_type: str):
+        matches = list(self._STRUCT_HEADER_RE.finditer(stmt))
+        if not matches:
+            return stmt, False
+        m = random.choice(matches)
+        span = self._find_outermost_brace_body(stmt)
+        if not span:
+            return stmt, False
+        _, body_end = span
+        member = f"\n  ffl_decl_{random.randrange(1_000_000)} : {donor_type},"
+        new_stmt = stmt[:body_end] + member + "\n" + stmt[body_end:]
+        return self._tag_after(new_stmt, m.start(), "declaration"), True
+
+    def _inject_fn_param(self, stmt: str, donor_type: str):
+        matches = list(self._FN_SIG_RE.finditer(stmt))
+        if not matches:
+            return stmt, False
+        m = random.choice(matches)
+        params = m.group(2).strip()
+        insert_at = m.end(2)
+        prefix = ", " if params else ""
+        new_stmt = stmt[:insert_at] + f"{prefix}ffl_decl_{random.randrange(1_000_000)} : {donor_type}" + stmt[insert_at:]
+        return self._tag_after(new_stmt, m.start(), "declaration"), True
+
+    def _nest_declaration(self, host_stmts: List[str], donor_item: str):
+        tagged = self._tag_after(donor_item, 0, "declaration")
+        return [tagged] + host_stmts, True
+
+    def _build_declaration_fused_test(self, host: Seed, donor: Seed, direction: str) -> Seed:
+        host_code, donor_code = host.content, donor.content
+        if self.mutation:
+            host_code = self.mut.mutate(host_code)
+            donor_code = self.mut.mutate(donor_code)
+        donor_code = self._resolve_name_conflicts(host_code, donor_code)
+
+        donor_types = list(self._extract_type_names(donor_code))
+        host_stmts = self._split_statements(host_code)
+        technique = random.choice(["struct_member", "fn_param", "item_nest"])
+        applied = False
+
+        if donor_types and technique in ("struct_member", "fn_param"):
+            donor_type = random.choice(donor_types)
+            targets = list(range(len(host_stmts)))
+            random.shuffle(targets)
+            for idx in targets:
+                if technique == "struct_member":
+                    new_stmt, ok = self._inject_struct_member(host_stmts[idx], donor_type)
+                else:
+                    new_stmt, ok = self._inject_fn_param(host_stmts[idx], donor_type)
+                if ok:
+                    host_stmts[idx] = new_stmt
+                    applied = True
+                    break
+
+        if not applied:
+            donor_items = self._donor_type_items(donor_code)
+            if donor_items:
+                host_stmts, applied = self._nest_declaration(host_stmts, random.choice(donor_items))
+                technique = "item_nest"
+
+        fused = donor_code + "\n" + "\n".join(host_stmts)
+        return Seed(content=fused, metadata={
+            "parents": [host.id, donor.id],
+            "type": "wgsl",
+            "extension": ".wgsl",
+            "mode": f"decl_{technique}_{direction}",
+            "description": f"Declaration-fused {host.id} <- {donor.id} ({direction})",
+        })
+
+    def fuse(self, parent_a: Seed, parent_b: Seed) -> Seed:
+        return self._build_declaration_fused_test(parent_a, parent_b, "ab")
+
+    def fuse_bidirectional(self, parent_a: Seed, parent_b: Seed) -> List[Seed]:
+        return [
+            self._build_declaration_fused_test(parent_a, parent_b, "ab"),
+            self._build_declaration_fused_test(parent_b, parent_a, "ba"),
+        ]
+
+
+# ==========================================
 # Flang / Fortran Specific Fusion Strategy
 # ==========================================
 
@@ -7520,7 +7768,7 @@ def get_strategies(project_name=None, dataflow_fusion=False,
     fusion alone.
 
     dataflow_type_match only affects statically-typed-language dataflow
-    strategies (clang, swift, mlir, rust, haskell, flang, lfortran): 90% of
+    strategies (clang, swift, mlir, rust, haskell, flang, lfortran, naga): 90% of
     the time it biases the bridge substitution toward a same-declared-type
     pair (falling back to random/type-agnostic when none exists), 10% of
     the time it deliberately picks a type-mismatched pair — each language's
@@ -7689,6 +7937,19 @@ def get_strategies(project_name=None, dataflow_fusion=False,
             if state_fusion:
                 strategies.append(SwiftStateFusionStrategy(project_root="projects/swift",
                                                             lightweight=lightweight))
+        return strategies
+
+    if project_name == "naga":
+        if os.path.exists("projects/naga"):
+            if dataflow_fusion:
+                strategies.append(NagaFusionStrategy(project_root="projects/naga",
+                                                     type_match=dataflow_type_match,
+                                                     lightweight=lightweight))
+            if declaration_fusion:
+                strategies.append(NagaDeclarationFusionStrategy(project_root="projects/naga"))
+            if state_fusion:
+                strategies.append(NagaStateFusionStrategy(project_root="projects/naga",
+                                                          lightweight=lightweight))
         return strategies
 
     # Fallback / Legacy behavior — only for the "no project specified" case;

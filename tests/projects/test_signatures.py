@@ -188,6 +188,26 @@ class TestSwiftSignatures(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
+# Naga
+# ---------------------------------------------------------------------------
+
+class TestNagaSignatures(unittest.TestCase):
+
+    @classmethod
+    def setUpClass(cls):
+        cls.driver = _load_driver("naga", "NagaDriver")
+
+    def test_rust_panic(self):
+        stderr = "thread 'main' panicked at naga/src/valid/mod.rs:123: impossible\n"
+        sig = self.driver.extract_crash_signature("", stderr, 101)
+        self.assertIn("Rust panic", sig)
+
+    def test_parse_error_is_not_signature(self):
+        sig = self.driver.extract_crash_signature("", "Could not parse WGSL:\nerror: expected `;`\n", 1)
+        self.assertIsNone(sig)
+
+
+# ---------------------------------------------------------------------------
 # Haskell
 # ---------------------------------------------------------------------------
 

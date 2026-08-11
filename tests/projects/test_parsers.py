@@ -133,6 +133,34 @@ class TestMLIRParser(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
+# Naga / WGSL
+# ---------------------------------------------------------------------------
+
+class TestNagaParser(unittest.TestCase):
+
+    @classmethod
+    def setUpClass(cls):
+        from projects.naga.parser import _parser
+        cls.parser = _parser
+
+    def test_wgsl_symbols_and_dataflow(self):
+        code = (
+            "struct Payload { value : i32 }\n"
+            "alias MyInt = i32;\n"
+            "var<private> counter : i32 = 0;\n"
+            "fn main() { let next : i32 = counter + 1; }\n"
+        )
+        meta = self.parser.parse_content(code, filename="shader.wgsl")
+        self.assertEqual(meta["type"], "wgsl")
+        self.assertIn("Payload", meta["structs"])
+        self.assertIn("MyInt", meta["aliases"])
+        self.assertIn("main", meta["functions"])
+        self.assertIn("counter", meta["variables"])
+        self.assertEqual(meta["var_types"]["counter"], "i32")
+        self.assertTrue(meta["has_declaration"])
+
+
+# ---------------------------------------------------------------------------
 # Haskell
 # ---------------------------------------------------------------------------
 

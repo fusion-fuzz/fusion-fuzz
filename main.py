@@ -111,7 +111,7 @@ if __name__ == "__main__":
                              "Alias of --declaration-fusion for rust. Requires --pre-analysis "
                              "(disabled otherwise, with a warning).")
     parser.add_argument("--state-fusion", action="store_true", default=False,
-                        help="[php/cpython/clang/flang/lfortran/swift/haskell/mlir] Enable the state-of-"
+                        help="[php/cpython/clang/flang/lfortran/swift/haskell/mlir/naga] Enable the state-of-"
                              "interest-driven fusion strategy (core/state_analysis.py): profiles "
                              "each seed for the point with the most live, still-in-scope variables, "
                              "then grafts one seed's continuation into the other's state at that "
@@ -149,8 +149,9 @@ if __name__ == "__main__":
                              "injection (MRO/metaclass conflicts at class-statement time). "
                              "[haskell] typeclass superclass constraint injection. [flang/"
                              "lfortran] derived-type EXTENDS() injection. [mlir] function-signature "
-                             "operand/result type swap (verified structurally only, no compiler in "
-                             "this repo's dev environment for haskell/flang/swift/mlir/php).")
+                             "operand/result type swap. [naga] WGSL struct/member/function type "
+                             "reference injection (verified structurally only, no compiler in "
+                             "this repo's dev environment for haskell/flang/swift/mlir/php/naga).")
     parser.add_argument("--fusion-rate", type=float, default=0.8, metavar="P",
                         help="Probability (0.0-1.0) that each enabled fusion technique in the "
                              "pool is independently applied to a given parent pair per iteration "
@@ -160,7 +161,7 @@ if __name__ == "__main__":
                              "Has no effect with a pool of size 1 (e.g. --dataflow-fusion passed "
                              "alone), which always applies that one technique. Default: 0.8.")
     parser.add_argument("--dataflow-type-match", action="store_true", default=False,
-                        help="[clang/swift/mlir/rust/haskell/flang/lfortran] For dataflow "
+                        help="[clang/swift/mlir/rust/haskell/flang/lfortran/naga] For dataflow "
                              "fusion's bridge substitution: 90%% of the time, prefer a "
                              "same-declared-type bridge pair (falling back to a random/"
                              "type-agnostic pair when none of matching type exists), 10%% "

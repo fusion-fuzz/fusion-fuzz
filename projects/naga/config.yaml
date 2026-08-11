@@ -1,0 +1,34 @@
+project_name: "naga"
+
+execution:
+  command: "naga {seed_path}"
+  timeout: 10
+  concurrency: 16
+
+analysis:
+  crash_patterns:
+    - "panicked at"
+    - "thread 'main' panicked"
+    - "internal compiler error"
+    - "Segmentation fault"
+    - "core dumped"
+    - "Aborted"
+    - "AddressSanitizer"
+    - "UndefinedBehaviorSanitizer"
+  syntax_patterns:
+    - "Could not parse WGSL"
+    - "error:"
+    - "Validation Error"
+    - "Entry point"
+
+paths:
+  seed_source: "projects/naga/wgpu/naga/tests"
+  seed_corpus: "projects/naga/corpus.db"
+  seed_blacklist:
+    - "enable subgroups;"
+
+llm:
+  provider: "openai"
+  model: "gpt-4o-mini"
+  api_key: ""
+  timeout: 30

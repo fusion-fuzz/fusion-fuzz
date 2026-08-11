@@ -53,6 +53,7 @@ LANGUAGE_ALIASES: Dict[str, str] = {
     "haskell": "haskell", "hs": "haskell", "ghc": "haskell",
     "flang": "flang", "fortran": "flang", "f90": "flang",
     "mlir": "mlir",
+    "naga": "naga", "wgsl": "naga",
 }
 
 
@@ -145,6 +146,13 @@ LIVE_VAR_CONFIGS: Dict[str, LiveVarConfig] = {
         mode="brace",
         declare=[r'(%[A-Za-z0-9_$.]+)\s*='],
     ),
+    "naga": LiveVarConfig(
+        mode="brace",
+        declare=[
+            r'\b(?:var(?:\s*<[^>]+>)?|let|const|override)\s+([A-Za-z_]\w*)',
+            r'\bfn\s+\w+\s*\([^)]*\b([A-Za-z_]\w*)\s*:',
+        ],
+    ),
 }
 
 # ---------------------------------------------------------------------------
@@ -165,6 +173,7 @@ _LEXICON = {
     # a doubled escape would), not exact — fine for a heuristic safety gate.
     "flang":   {"line": ["!"], "block": [], "quotes": ['"', "'"]},
     "mlir":    {"line": ["//"], "block": [], "quotes": ['"']},
+    "naga":    {"line": ["//"], "block": [("/*", "*/")], "quotes": ['"']},
 }
 
 

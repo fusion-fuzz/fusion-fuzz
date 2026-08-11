@@ -571,6 +571,7 @@ class WGSLMetadataCollector(BaseMetadataCollector):
     )
 
     def static_collect(self, content: str, filename: str = "") -> dict:
+        from .fusion import NagaDeclarationFusionStrategy
         meta: dict = {}
         meta["functions"]  = self._FN_RE.findall(content)
         meta["structs"]    = self._STRUCT_RE.findall(content)
@@ -579,6 +580,7 @@ class WGSLMetadataCollector(BaseMetadataCollector):
             var_types[m.group(1)] = m.group(2).strip()
         meta["var_types"]  = var_types
         meta["line_count"] = len(content.splitlines())
+        meta["has_declaration"] = NagaDeclarationFusionStrategy.has_injectable_declaration(content)
         return meta
 
 
