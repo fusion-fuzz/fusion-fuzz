@@ -67,7 +67,7 @@ class ClangDriver(BaseDriver):
         flags.append(random.choice(self.OPT_LEVELS))
         if stds and random.random() > 0.3:
             flags.append(f"-std={random.choice(stds)}")
-        if ext == ".m":
+        if ext in (".m", ".mm"):  # Objective-C and Objective-C++
             flags.append("-fobjc-arc" if random.random() > 0.5 else "-fno-objc-arc")
         flags.extend(random.sample(self.MISC_FLAGS, random.randint(0, 3)))
         return binname, " ".join(flags)

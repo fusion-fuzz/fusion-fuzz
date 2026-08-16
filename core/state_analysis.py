@@ -49,6 +49,7 @@ LANGUAGE_ALIASES: Dict[str, str] = {
     "php": "php", "phpt": "php",
     "go": "go",
     "c": "clang", "cpp": "clang", "cxx": "clang", "clang": "clang",
+    "objc": "clang", "objcpp": "clang", "m": "clang", "mm": "clang",
     "swift": "swift",
     "haskell": "haskell", "hs": "haskell", "ghc": "haskell",
     "flang": "flang", "fortran": "flang", "f90": "flang",

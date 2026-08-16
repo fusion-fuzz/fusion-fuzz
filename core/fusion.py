@@ -5610,9 +5610,13 @@ class ClangFusionStrategy(GenericDataflowStrategy):
     LANGUAGE = "clang"
 
     def __init__(self, project_root="projects/clang", type_match: bool = False,
-                 lightweight: bool = False):
+                 lightweight: bool = False, langs=None):
         super().__init__(mutator=BaseMutator(), lightweight=lightweight)
         self.project_root = project_root
+        # --c/--cpp/--m: which of clang's input languages this run may emit.
+        # None/empty = unrestricted (every language), the pre-flag behavior.
+        self.langs = set(langs) if langs else None
+        self.cpp_enabled = (self.langs is None) or ('cpp' in self.langs)
         self.bridge_var_name = "ffl_fusion"
         self.mutation = True
         self.stmt_fusion = False
@@ -5623,6 +5627,32 @@ class ClangFusionStrategy(GenericDataflowStrategy):
         # when no match exists), and pick purely at random the other 10%.
         # Off by default — behavior is unchanged from before this flag existed.
         self.type_match = type_match
+
+    # Extension/type of a fused program. C++ and Objective-C are each a
+    # superset of C, and Objective-C++ (.mm) is the superset of both, so a
+    # program fused from two dialects has to be labelled with whichever
+    # dialect can still compile every construct both parents contributed —
+    # otherwise a C++ (or Obj-C) fragment lands in a .c file and dies on a
+    # syntax error instead of reaching the frontend paths we're stressing.
+    _CXX_ONLY_EXTS = ('.cpp', '.cc', '.cxx')
+    _OBJC_ONLY_EXTS = ('.m',)
+
+    def _result_lang(self, meta_a, meta_b, cxx_required: bool = False):
+        ext_a = (meta_a.get('extension') or '').lower()
+        ext_b = (meta_b.get('extension') or '').lower()
+        exts = (ext_a, ext_b)
+        objc = any(e in self._OBJC_ONLY_EXTS or e == '.mm' for e in exts)
+        cxx = cxx_required or any(e in self._CXX_ONLY_EXTS or e == '.mm' for e in exts)
+        if objc and cxx:
+            return '.mm', 'objcpp'
+        if objc:
+            return '.m', 'objc'
+        if cxx:
+            for e in exts:
+                if e in self._CXX_ONLY_EXTS:
+                    return e, 'cpp'
+            return '.cpp', 'cpp'
+        return (ext_a or ext_b or '.c'), (meta_a.get('type') or 'c')
 
     def format_assignment(self, lhs: str, rhs: str) -> str:
         # Top-level declaration — valid C/C++ syntax even when `rhs` turns out
@@ -6180,13 +6210,8 @@ class ClangFusionStrategy(GenericDataflowStrategy):
             raise ValueError(f"Unknown mode: {mode}")
 
         # Prefer C++/Obj-C metadata from either parent so the driver picks
-        # clang++ when either side actually needs it.
-        cxx_exts = ('.cpp', '.cc', '.cxx', '.mm')
-        ext = meta1.get('extension', '.c')
-        seed_type = meta1.get('type', 'c')
-        if meta2.get('extension') in cxx_exts:
-            ext = meta2.get('extension')
-            seed_type = meta2.get('type', 'cpp')
+        # clang++ (and the right dialect) when either side actually needs it.
+        ext, seed_type = self._result_lang(meta1, meta2)
 
         return Seed(content=fused, metadata={
             "parents": [parent_a.id, parent_b.id],
@@ -6255,8 +6280,8 @@ class ClangDeclarationFusionStrategy(ClangFusionStrategy):
         r'\s*\{'
     )
 
-    def __init__(self, project_root="projects/clang"):
-        super().__init__(project_root=project_root)
+    def __init__(self, project_root="projects/clang", langs=None):
+        super().__init__(project_root=project_root, langs=langs)
 
     # ── Declaration-site discovery ──────────────────────────────────
 
@@ -6393,7 +6418,14 @@ class ClangDeclarationFusionStrategy(ClangFusionStrategy):
         donor_types = self._extract_type_names(donor_code)
         host_stmts = self._split_statements(host_code)
 
-        technique = random.choice(['base_class', 'template_param', 'item_nest'])
+        # base_class/template_param emit C++-only syntax and force the result
+        # to be compiled as C++. With --cpp off (e.g. --c alone), that would
+        # smuggle C++ programs into a run the user restricted to C/Obj-C, so
+        # only item_nest — a nested struct/enum declaration, valid in every
+        # dialect — is available there.
+        techniques = (['base_class', 'template_param', 'item_nest']
+                      if self.cpp_enabled else ['item_nest'])
+        technique = random.choice(techniques)
         applied = False
 
         if technique in ('base_class', 'template_param') and donor_types:
@@ -6427,16 +6459,13 @@ class ClangDeclarationFusionStrategy(ClangFusionStrategy):
         # surface for redeclaration/ODR diagnostics.)
         fused = f"{donor_code}\n{fused_host}"
 
-        cxx_exts = ('.cpp', '.cc', '.cxx', '.mm')
-        meta_a, meta_b = host.metadata, donor.metadata
-        ext = meta_a.get('extension', '.cpp')
-        seed_type = meta_a.get('type', 'cpp')
-        if meta_b.get('extension') in cxx_exts:
-            ext = meta_b.get('extension')
-            seed_type = meta_b.get('type', 'cpp')
-        if ext not in cxx_exts:
-            # Base-class/template injection is C++-only syntax
-            ext, seed_type = '.cpp', 'cpp'
+        # Base-class/template injection is C++-only syntax, so those two
+        # techniques force a C++ result even from two C parents; item_nest
+        # stays in whatever dialect the parents already were.
+        ext, seed_type = self._result_lang(
+            host.metadata, donor.metadata,
+            cxx_required=(technique in ('base_class', 'template_param')),
+        )
 
         return Seed(content=fused, metadata={
             "parents": [host.id, donor.id],
@@ -6510,13 +6539,7 @@ class ClangStateFusionStrategy(ClangFusionStrategy):
                                          tag_comment=self._tag("state"))
         fused = "\n".join(all_includes) + "\n" + fused_body
 
-        cxx_exts = ('.cpp', '.cc', '.cxx', '.mm')
-        meta_a, meta_b = host.metadata, donor.metadata
-        ext = meta_a.get('extension', '.c')
-        seed_type = meta_a.get('type', 'c')
-        if meta_b.get('extension') in cxx_exts:
-            ext = meta_b.get('extension')
-            seed_type = meta_b.get('type', 'cpp')
+        ext, seed_type = self._result_lang(host.metadata, donor.metadata)
 
         return Seed(content=fused, metadata={
             "parents": [host.id, donor.id],
@@ -7751,7 +7774,8 @@ class LFortranDeclarationFusionStrategy(FlangDeclarationFusionStrategy):
 
 def get_strategies(project_name=None, dataflow_fusion=False,
                     struct_fusion=False, declaration_fusion=False, state_fusion=False,
-                    dataflow_type_match=False, pre_analysis_enabled=True):
+                    dataflow_type_match=False, pre_analysis_enabled=True,
+                    clang_langs=None):
     """
     Build the pool of fusion strategies for `project_name`. Each of
     dataflow_fusion/state_fusion/declaration_fusion independently adds its
@@ -7780,6 +7804,15 @@ def get_strategies(project_name=None, dataflow_fusion=False,
     of them. Dynamically-typed languages (cpython, php) always pick the
     bridge pair uniformly at random and ignore this flag — a "same type"
     preference isn't meaningful for them.
+
+    clang_langs (--c/--cpp/--m, clang only) restricts which of clang's input
+    languages may be emitted: a set drawn from {'c', 'cpp', 'objc'}, or None
+    for "no restriction" (every language, the behavior from before the flags
+    existed). Only the clang strategies read it — the corpus is already
+    filtered to matching seeds in main.py, so this exists to stop a strategy
+    from *promoting* a fused program into a language the user excluded (e.g.
+    declaration fusion's C++-only base-class/template injection when only
+    --c was passed).
 
     pre_analysis_enabled (--pre-analysis) gates the richer per-seed
     metadata every strategy would otherwise prefer to consume. When False:
@@ -7852,12 +7885,15 @@ def get_strategies(project_name=None, dataflow_fusion=False,
             if dataflow_fusion:
                 strategies.append(ClangFusionStrategy(project_root="projects/clang",
                                                        type_match=dataflow_type_match,
-                                                       lightweight=lightweight))
+                                                       lightweight=lightweight,
+                                                       langs=clang_langs))
             if declaration_fusion:
-                strategies.append(ClangDeclarationFusionStrategy(project_root="projects/clang"))
+                strategies.append(ClangDeclarationFusionStrategy(project_root="projects/clang",
+                                                                  langs=clang_langs))
             if state_fusion:
                 strategies.append(ClangStateFusionStrategy(project_root="projects/clang",
-                                                            lightweight=lightweight))
+                                                            lightweight=lightweight,
+                                                            langs=clang_langs))
         return strategies
 
     if project_name == "flang":

@@ -81,15 +81,61 @@ class CFastDataflow:
         return merged
 
 
+# --c / --cpp / --m (main.py) select which of clang's input languages this
+# project fuzzes. Each language owns its own source extensions; .mm is
+# Objective-C++, so it only belongs in the corpus when *both* C++ and
+# Objective-C are enabled — a .mm seed is not compilable as either one
+# alone.
+LANG_EXTENSIONS = {
+    'c':    ['.c'],
+    'cpp':  ['.cpp', '.cc', '.cxx'],
+    'objc': ['.m'],
+}
+ALL_EXTENSIONS = ['.c', '.cpp', '.cc', '.cxx', '.m', '.mm']
+
+
+def allowed_extensions(langs=None):
+    """Source extensions for a set of language keys ('c'/'cpp'/'objc').
+    An empty/None set means "no restriction" — every extension, which is
+    the behavior from before the flags existed."""
+    if not langs:
+        return list(ALL_EXTENSIONS)
+    exts = []
+    for lang in ('c', 'cpp', 'objc'):
+        if lang in langs:
+            exts.extend(LANG_EXTENSIONS[lang])
+    if 'cpp' in langs and 'objc' in langs:
+        exts.append('.mm')
+    return exts
+
+
 class ClangParser(BaseParser):
-    extensions = ['.c', '.cpp', '.cc', '.cxx', '.m', '.mm']
+    extensions = list(ALL_EXTENSIONS)
     seed_type = 'c'
 
     _CXX_EXTS = ('.cpp', '.cc', '.cxx', '.mm')
 
+    def set_languages(self, langs=None):
+        """Restrict both seed collection (which files are parsed) and
+        corpus loading (which stored seeds are used) to `langs`."""
+        self.extensions = allowed_extensions(langs)
+
+    def load_corpus(self, db_path: str) -> list:
+        seeds = super().load_corpus(db_path)
+        if set(self.extensions) == set(ALL_EXTENSIONS):
+            return seeds
+        # A corpus.db built by an earlier (or unrestricted) run holds every
+        # language, so filter on load too rather than assuming the DB was
+        # collected with the same flags.
+        allowed = set(self.extensions)
+        return [s for s in seeds
+                if (s["metadata"].get("extension") or ".c").lower() in allowed]
+
     def parse_content(self, content, filename=""):
         ext = os.path.splitext(filename)[1].lower()
-        if ext in self._CXX_EXTS:
+        if ext == '.mm':
+            seed_type = 'objcpp'
+        elif ext in self._CXX_EXTS:
             seed_type = 'cpp'
         elif ext == '.m':
             seed_type = 'objc'
@@ -107,6 +153,10 @@ class ClangParser(BaseParser):
 
 
 _parser = ClangParser(__file__)
+
+
+def set_languages(langs=None):
+    _parser.set_languages(langs)
 
 
 def collect_seeds(source_path, blacklist=None):

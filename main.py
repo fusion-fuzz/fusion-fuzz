@@ -207,6 +207,19 @@ if __name__ == "__main__":
     parser.add_argument("--no-self-fusion", action="store_true", default=False,
                         help="With --save-to, skip the (a,a) self-fusion pairs, giving "
                              "N*(N-1) programs instead of N*N.")
+    parser.add_argument("--c", dest="lang_c", action="store_true", default=False,
+                        help="[clang only] Enable C. Combinable with --cpp/--m; pass none of "
+                             "the three to get every language (the default, unchanged). "
+                             "The selection restricts BOTH which seed files are parsed into "
+                             "the corpus (--setup) / loaded from it, and which languages fused "
+                             "programs may be written in. Example: --c --cpp parses .c/.cpp/.cc/"
+                             ".cxx seeds and emits .c and .cpp programs.")
+    parser.add_argument("--cpp", dest="lang_cpp", action="store_true", default=False,
+                        help="[clang only] Enable C++ (.cpp/.cc/.cxx). See --c.")
+    parser.add_argument("--m", dest="lang_objc", action="store_true", default=False,
+                        help="[clang only] Enable Objective-C (.m). See --c. Objective-C++ "
+                             "(.mm) is only used when --cpp and --m are both given, since a "
+                             ".mm program is compilable as neither language alone.")
     parser.add_argument("--load-subset", type=str, default=None, metavar="PATH",
                         help="Load a previously saved corpus subset from PATH instead of "
                              "the project corpus (skips --corpus-size/--diverse selection)")
@@ -230,6 +243,35 @@ if __name__ == "__main__":
         logger.error(e)
         sys.exit(1)
         
+    # --- Language selection (--c/--cpp/--m, clang only) ---------------
+    # Empty set == no restriction (every language), so the default
+    # behavior is exactly what it was before these flags existed.
+    clang_langs = set()
+    if args.lang_c:
+        clang_langs.add("c")
+    if args.lang_cpp:
+        clang_langs.add("cpp")
+    if args.lang_objc:
+        clang_langs.add("objc")
+    if clang_langs and args.project != "clang":
+        logger.warning(
+            f"--c/--cpp/--m only apply to --project clang; ignoring them for "
+            f"--project {args.project}."
+        )
+        clang_langs = set()
+
+    def _load_parser_module(project):
+        parser_path = os.path.join("projects", project, "parser.py")
+        spec = importlib.util.spec_from_file_location("project_parser", parser_path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        if clang_langs and hasattr(module, "set_languages"):
+            module.set_languages(clang_langs)
+        return module
+
+    if clang_langs:
+        logger.info(f"Languages restricted to: {', '.join(sorted(clang_langs))}")
+
     # Apply command-line config overrides
     if args.concurrency is not None:
         if "execution" not in config or not isinstance(config.get("execution"), dict):
@@ -391,10 +433,8 @@ if __name__ == "__main__":
             logger.error(f"Parser not found at {parser_path}")
             sys.exit(1)
             
-        spec = importlib.util.spec_from_file_location("project_parser", parser_path)
-        module = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(module)
-        
+        module = _load_parser_module(args.project)
+
         logger.info(f"Collecting seeds from {config['paths']['seed_source']}...")
         seed_blacklist = config.get("paths", {}).get("seed_blacklist", [])
         corpus_path = module.collect_seeds(config["paths"]["seed_source"], blacklist=seed_blacklist)
@@ -437,13 +477,25 @@ if __name__ == "__main__":
         logger.info(f"Loading saved corpus subset from {args.load_subset}...")
         initial_corpus = load_subset(args.load_subset)
         logger.info(f"Loaded {len(initial_corpus)} seeds from subset (skipping --corpus-size/--diverse).")
+        if clang_langs:
+            # A saved subset may have been sampled with a different (or no)
+            # language selection, so apply the filter here too.
+            _mod = _load_parser_module(args.project)
+            _allowed = set(_mod.allowed_extensions(clang_langs))
+            _before = len(initial_corpus)
+            initial_corpus = [
+                s for s in initial_corpus
+                if (s.metadata.get("extension") or ".c").lower() in _allowed
+            ]
+            if len(initial_corpus) != _before:
+                logger.info(
+                    f"Kept {len(initial_corpus)}/{_before} subset seeds matching "
+                    f"{', '.join(sorted(clang_langs))}."
+                )
     else:
         logger.info(f"Loading corpus from {project_corpus_path}...")
 
-        parser_path = os.path.join("projects", args.project, "parser.py")
-        spec = importlib.util.spec_from_file_location("project_parser", parser_path)
-        module = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(module)
+        module = _load_parser_module(args.project)
 
         raw_seeds = module.load_corpus(project_corpus_path)
 
@@ -493,6 +545,14 @@ if __name__ == "__main__":
     #    metadata (--pre-analysis), persisting either to the project corpus
     #    DB. Only runs when at least one of the two flags is passed;
     #    otherwise all loaded seeds are used as-is.
+    if not initial_corpus:
+        logger.error(
+            "Corpus is empty after loading"
+            + (f" (no seeds match --c/--cpp/--m selection: "
+               f"{', '.join(sorted(clang_langs))})." if clang_langs else ".")
+        )
+        sys.exit(1)
+
     _max_workers = config.get("execution", {}).get("concurrency", 4)
 
     if args.dry_run or args.pre_analysis:
@@ -533,7 +593,8 @@ if __name__ == "__main__":
                                  declaration_fusion=args.declaration_fusion,
                                  state_fusion=args.state_fusion,
                                  dataflow_type_match=args.dataflow_type_match,
-                                 pre_analysis_enabled=args.pre_analysis)
+                                 pre_analysis_enabled=args.pre_analysis,
+                                 clang_langs=clang_langs or None)
     if not _strategies:
         requested = [name for flag, name in [
             (args.dataflow_fusion, "--dataflow-fusion"),
