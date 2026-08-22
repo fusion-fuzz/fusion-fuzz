@@ -37,6 +37,15 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Fusion Fuzz Loop (FFL)")
     parser.add_argument("--project", type=str, default=None, help="Project name (folder in projects/)")
     parser.add_argument("--iterations", type=int, default=-1, help="Fuzzing iterations")
+    parser.add_argument("--time", type=float, default=None, metavar="SECONDS",
+                        help="Wall-clock budget in seconds: stop after SECONDS instead of "
+                             "running until --iterations / pairwise saturation / Ctrl-C. "
+                             "Example: --time 3600 fuzzes for one hour. Combine with "
+                             "--iterations and whichever limit is hit first stops the run. "
+                             "The budget is checked when work is scheduled, so executions "
+                             "already in flight are allowed to finish — a run can overshoot "
+                             "by up to one execution timeout. Also applies to --save-to "
+                             "(stops generating) and --execute (stops replaying).")
     parser.add_argument("--setup", action="store_true", default=False, help="Force project setup/seed parsing")
     parser.add_argument("--preprocessing", action="store_true", default=False,
                         help="[cpython only] Run projects/cpython/preprocessing.py's dynamic "
@@ -226,6 +235,9 @@ if __name__ == "__main__":
 
     args = parser.parse_args()
 
+    if args.time is not None and args.time <= 0:
+        parser.error(f"--time must be positive (got {args.time})")
+
     # --reduce: standalone mode, project inferred from path
     if args.reduce:
         from core.reducer import reduce_command
@@ -285,7 +297,7 @@ if __name__ == "__main__":
     if args.execute:
         sample_log = args.sample_log.replace("{project}", args.project) if args.sample_log else None
         replayer = FusionFuzzLoop(config=config, strategies=[], initial_corpus=[])
-        replayer.execute_folder(args.execute, sample_log=sample_log)
+        replayer.execute_folder(args.execute, sample_log=sample_log, max_seconds=args.time)
         sys.exit(0)
 
     # === BUG CORPUS MODE ===
@@ -621,7 +633,8 @@ if __name__ == "__main__":
     # === FUSION-ONLY MODE (--save-to): generate and save, never execute ===
     if args.save_to:
         fuzzer.generate_only(args.save_to, max_programs=args.iterations,
-                             self_fusion=not args.no_self_fusion)
+                             self_fusion=not args.no_self_fusion,
+                             max_seconds=args.time)
         sys.exit(0)
 
     # === GCOV RESET (before fuzzing) ===
@@ -635,7 +648,7 @@ if __name__ == "__main__":
             )
 
     sample_log = args.sample_log.replace("{project}", args.project) if args.sample_log else None
-    fuzzer.run(max_iterations=args.iterations, sample_log=sample_log)
+    fuzzer.run(max_iterations=args.iterations, sample_log=sample_log, max_seconds=args.time)
 
     # === GCOV COVERAGE COLLECTION ===
     if args.gcov:

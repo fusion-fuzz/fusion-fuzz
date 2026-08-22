@@ -111,6 +111,10 @@ class FusionFuzzLoop:
         self.sample_log_path = None
         self._sample_log_file = None
 
+        # --time wall-clock budget (set by run/generate_only/execute_folder)
+        self.time_limit = None
+        self.deadline = None
+
     def _load_existing_crashes(self):
         """
         Scans the output directory for existing crash reports and loads their signatures
@@ -144,6 +148,22 @@ class FusionFuzzLoop:
         
         if loaded_count > 0:
             logger.info(f"Loaded {loaded_count} existing crash signatures from disk.")
+
+    @staticmethod
+    def _format_duration(seconds) -> str:
+        """`3600` -> `1:00:00`. Used in the --time log lines and status bar."""
+        return str(datetime.timedelta(seconds=int(seconds or 0)))
+
+    def _out_of_time(self) -> bool:
+        """True once the --time budget is spent. Always False when no budget
+        was given, so the untimed behavior is unchanged."""
+        return self.deadline is not None and time.time() >= self.deadline
+
+    def _start_clock(self, max_seconds):
+        """Reset the run clock and arm the --time deadline (if any)."""
+        self.start_time = time.time()
+        self.time_limit = max_seconds
+        self.deadline = (self.start_time + max_seconds) if max_seconds else None
 
     def select_parents(self):
         """Select two parents from the corpus, preferring unfused pairs."""
@@ -382,7 +402,7 @@ class FusionFuzzLoop:
             return None, chain
         return host, chain
 
-    def generate_only(self, output_dir, max_programs=-1, self_fusion=True):
+    def generate_only(self, output_dir, max_programs=-1, self_fusion=True, max_seconds=None):
         """
         Fusion-only mode (--save-to): run the same strategy-chain fusion as
         fuzzing, but write each fused program to `output_dir` instead of
@@ -396,9 +416,10 @@ class FusionFuzzLoop:
         (--iterations) or Ctrl-C still samples the whole corpus rather
         than just its first seeds.
 
-        max_programs caps how many programs are written (-1 = all pairs).
-        Alongside the programs a manifest.jsonl records, per file, the
-        child seed id, the ordered (host, donor) parents and the fusion
+        max_programs caps how many programs are written (-1 = all pairs);
+        max_seconds (--time) caps how long generation runs, whichever comes
+        first. Alongside the programs a manifest.jsonl records, per file,
+        the child seed id, the ordered (host, donor) parents and the fusion
         strategies applied.
         """
         import json
@@ -455,13 +476,24 @@ class FusionFuzzLoop:
                 "they will be overwritten and manifest.jsonl reset."
             )
 
-        self.start_time = time.time()
+        self._start_clock(max_seconds)
+        if max_seconds:
+            logger.info(f"Time budget: {self._format_duration(max_seconds)} (--time {max_seconds:g})")
         saved = 0
         failed = 0
+        attempted = len(pairs)   # lowered by the --time break below
         manifest = open(manifest_path, "w", encoding="utf-8")
 
         try:
             for idx, (i, j) in enumerate(pairs):
+                attempted = idx
+                if self._out_of_time():
+                    sys.stdout.write("\n")
+                    logger.info(
+                        f"Time budget of {self._format_duration(self.time_limit)} reached "
+                        f"after {saved} program(s) — stopping generation."
+                    )
+                    break
                 host_seed, donor_seed = self.corpus[i], self.corpus[j]
                 self.iterations += 1
                 self.coverage.record(host_seed.id, donor_seed.id)
@@ -528,7 +560,7 @@ class FusionFuzzLoop:
         sys.stdout.write("\n")
         logger.info(
             f"Wrote {saved} fused program(s) to {output_dir} "
-            f"(of {len(pairs)} ordered pairs attempted"
+            f"(of {attempted} ordered pairs attempted, {len(pairs)} planned"
             + (f", {failed} produced no program" if failed else "")
             + f"); manifest: {manifest_path}"
         )
@@ -808,8 +840,11 @@ class FusionFuzzLoop:
         covered = self.coverage.covered_count()
         cov_pct = (covered / total_pairs * 100.0) if total_pairs > 0 else 100.0
         pairs_per_sec = covered / elapsed
+        clock = str(datetime.timedelta(seconds=int(elapsed)))
+        if self.time_limit:
+            clock += f"/{self._format_duration(self.time_limit)}"
         status = (
-            f"\r[ {str(datetime.timedelta(seconds=int(elapsed)))} ] "
+            f"\r[ {clock} ] "
             f"Throughput: {throughput:.1f} tests/s | "
             f"Bugs: {len(self.unique_crashes)} | "
             f"FuseValidRate: {valid_rate:.1f}% | "
@@ -954,7 +989,7 @@ class FusionFuzzLoop:
 
         return new_crash
 
-    def execute_folder(self, folder, sample_log=None):
+    def execute_folder(self, folder, sample_log=None, max_seconds=None):
         """
         Replay mode (--execute): run every program in `folder` through the
         project driver and report bugs. No fusion, no generation, no
@@ -964,7 +999,8 @@ class FusionFuzzLoop:
 
         Programs are read recursively; manifest.jsonl and hidden files are
         skipped. Each program keeps its own file extension, so a folder
-        written by --save-to can be replayed as-is.
+        written by --save-to can be replayed as-is. max_seconds (--time)
+        stops the replay early once the wall-clock budget is spent.
         """
         folder = os.path.abspath(folder)
         if not os.path.isdir(folder):
@@ -1007,7 +1043,9 @@ class FusionFuzzLoop:
             return 0
 
         logger.info(f"Replay mode: executing {len(programs)} program(s) from {folder}")
-        self.start_time = time.time()
+        self._start_clock(max_seconds)
+        if max_seconds:
+            logger.info(f"Time budget: {self._format_duration(max_seconds)} (--time {max_seconds:g})")
         self.driver.prepare_environment()
 
         # Open sample log file
@@ -1046,12 +1084,20 @@ class FusionFuzzLoop:
         try:
             pending = iter(programs)
             active = set()
+            timed_out = False
             while True:
-                while len(active) < max_workers:
+                while len(active) < max_workers and not self._out_of_time():
                     nxt = next(pending, None)
                     if nxt is None:
                         break
                     active.add(executor.submit(_exec, nxt))
+                if self._out_of_time() and not timed_out:
+                    timed_out = True
+                    sys.stdout.write("\n")
+                    logger.info(
+                        f"Time budget of {self._format_duration(self.time_limit)} reached "
+                        f"after {executed} program(s) — draining in-flight executions."
+                    )
                 if not active:
                     break
 
@@ -1105,9 +1151,13 @@ class FusionFuzzLoop:
         )
         return new_crashes
 
-    def run(self, max_iterations, sample_log=None):
+    def run(self, max_iterations, sample_log=None, max_seconds=None):
         logger.info(f"Starting FFL for {self.project_name} with parallel execution...")
-        self.start_time = time.time() # Reset start time
+        # --time: wall-clock budget. Enforced at task-submission time, so
+        # iterations already in flight when the budget runs out are allowed
+        # to finish rather than being killed mid-execution — the run can
+        # overshoot by up to one seed timeout.
+        self._start_clock(max_seconds)
         self.driver.prepare_environment()
 
         # Open sample log file
@@ -1132,7 +1182,13 @@ class FusionFuzzLoop:
         max_workers = self.config.get("execution", {}).get("concurrency", 4)
         logger.info(f"ThreadPoolExecutor initialized with {max_workers} workers.")
         
-        if max_iterations == -1:
+        if self.time_limit:
+            logger.info(
+                f"Time budget: {self._format_duration(self.time_limit)} "
+                f"(--time {self.time_limit:g}); stops at whichever comes first, "
+                f"time budget or {'pair saturation' if max_iterations == -1 else f'{max_iterations} iterations'}."
+            )
+        if max_iterations == -1 and not self.time_limit:
             logger.info("Mode: Continuous Fuzzing (Press Ctrl-C to stop)")
 
         submitted_count = 0
@@ -1144,6 +1200,8 @@ class FusionFuzzLoop:
         try:
             # Helper to check if we should continue submitting tasks
             def should_submit():
+                if self._out_of_time():
+                    return False
                 if self.coverage.is_saturated(self.corpus):
                     return False
                 if max_iterations == -1: return True
@@ -1235,12 +1293,28 @@ class FusionFuzzLoop:
                             pass
                 elif not should_submit():
                     # No active futures and shouldn't submit -> Done
-                    if self.coverage.is_saturated(self.corpus):
-                        sys.stdout.write("\n")
-                        logger.info(
-                            f"All {self.coverage.covered_count()} pairs covered — stopping fuzzing."
-                        )
                     break
+
+            # Report why the loop ended. This has to happen *after* the loop:
+            # the usual exit is the `while` condition going false once the
+            # last in-flight future drains, which never re-enters the body,
+            # so a message emitted from inside the loop almost never fires
+            # (the saturation notice has been silently unreachable for that
+            # reason).
+            if self._out_of_time():
+                sys.stdout.write("\n")
+                logger.info(
+                    f"Time budget of {self._format_duration(self.time_limit)} reached after "
+                    f"{self.iterations} iterations ({self.sample_count} samples) — stopping fuzzing."
+                )
+            elif self.coverage.is_saturated(self.corpus):
+                sys.stdout.write("\n")
+                logger.info(
+                    f"All {self.coverage.covered_count()} pairs covered — stopping fuzzing."
+                )
+            elif max_iterations != -1 and submitted_count >= max_iterations:
+                sys.stdout.write("\n")
+                logger.info(f"Completed {self.iterations} iterations — stopping fuzzing.")
 
         except KeyboardInterrupt:
             sys.stdout.write("\n")
