@@ -33,6 +33,61 @@ def get_db_content(db_path, identifier):
         return None
 
 
+def filter_excluded_seeds(seeds, config):
+    """Drop seeds matching any regex in config's paths.seed_exclude_patterns.
+
+    A seed that cannot compile in *this* environment (a header the local
+    toolchain never built, a target triple it lacks) or that is a negative
+    test by construction (clang's `-verify` tests, whose code is
+    deliberately ill-formed) can only ever produce invalid children, so
+    every execution spent on it is wasted and it drags the fused-valid rate
+    down without contributing reachable compiler paths.
+
+    Entirely config-driven and off by default: a project with no
+    seed_exclude_patterns key keeps every seed, exactly as before.
+    """
+    raw_patterns = (config.get("paths", {}) or {}).get("seed_exclude_patterns") or []
+    if not raw_patterns:
+        return seeds
+
+    compiled = []
+    for entry in raw_patterns:
+        if isinstance(entry, dict):   # {pattern: ..., reason: ...}
+            pattern, reason = entry.get("pattern"), entry.get("reason", "")
+        else:
+            pattern, reason = entry, ""
+        if not pattern:
+            continue
+        try:
+            compiled.append((re.compile(pattern), pattern, reason))
+        except re.error as e:
+            logger.warning(f"Ignoring invalid seed_exclude_pattern {pattern!r}: {e}")
+
+    if not compiled:
+        return seeds
+
+    kept, dropped = [], {}
+    for seed in seeds:
+        content = seed.content or ""
+        for rx, pattern, reason in compiled:
+            if rx.search(content):
+                key = reason or pattern
+                dropped[key] = dropped.get(key, 0) + 1
+                break
+        else:
+            kept.append(seed)
+
+    if dropped:
+        total = sum(dropped.values())
+        logger.info(
+            f"Excluded {total}/{len(seeds)} seeds via paths.seed_exclude_patterns "
+            f"(remove them from {config.get('project_name')}'s config.yaml to keep these seeds):"
+        )
+        for key, count in sorted(dropped.items(), key=lambda kv: -kv[1]):
+            logger.info(f"    {count:6d}  {key}")
+    return kept
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Fusion Fuzz Loop (FFL)")
     parser.add_argument("--project", type=str, default=None, help="Project name (folder in projects/)")
@@ -161,6 +216,16 @@ if __name__ == "__main__":
                              "operand/result type swap. [naga] WGSL struct/member/function type "
                              "reference injection (verified structurally only, no compiler in "
                              "this repo's dev environment for haskell/flang/swift/mlir/php/naga).")
+    parser.add_argument("--children-per-pair", type=int, default=2, metavar="N",
+                        help="How many fused programs to produce from each selected parent "
+                             "pair per iteration (default 2 = one bidirectional draw, the "
+                             "original behaviour). Higher values amortise parent selection "
+                             "and the strategy chain's prefix over more children, so the "
+                             "per-child fusion cost drops (measured on clang: 2.39 ms at "
+                             "N=2, 1.70 ms at N=8). The children of one pair share that "
+                             "prefix and are therefore correlated — raising N buys raw "
+                             "throughput at the cost of sample diversity and slower pairwise "
+                             "coverage, so measure new-bug rate, not just tests/s.")
     parser.add_argument("--fusion-rate", type=float, default=0.8, metavar="P",
                         help="Probability (0.0-1.0) that each enabled fusion technique in the "
                              "pool is independently applied to a given parent pair per iteration "
@@ -489,6 +554,7 @@ if __name__ == "__main__":
         logger.info(f"Loading saved corpus subset from {args.load_subset}...")
         initial_corpus = load_subset(args.load_subset)
         logger.info(f"Loaded {len(initial_corpus)} seeds from subset (skipping --corpus-size/--diverse).")
+        initial_corpus = filter_excluded_seeds(initial_corpus, config)
         if clang_langs:
             # A saved subset may have been sampled with a different (or no)
             # language selection, so apply the filter here too.
@@ -527,6 +593,8 @@ if __name__ == "__main__":
         ]
 
         logger.info(f"Loaded {len(initial_corpus)} seeds into memory.")
+
+        initial_corpus = filter_excluded_seeds(initial_corpus, config)
 
         # 4.5. Optionally sample down to a fixed corpus size
         if args.corpus_size is not None:
@@ -628,6 +696,7 @@ if __name__ == "__main__":
         pre_analysis_enabled=args.pre_analysis,
         guided_fusion_enabled=args.guided_fusion,
         fusion_rate=args.fusion_rate,
+        children_per_pair=args.children_per_pair,
     )
     
     # === FUSION-ONLY MODE (--save-to): generate and save, never execute ===

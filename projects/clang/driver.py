@@ -14,7 +14,11 @@ class ClangDriver(BaseDriver):
     {ffl_root}/projects/clang/llvm-clang-install/bin/{clang,clang++}.
     """
 
-    STD_C = ["c89", "c99", "c11", "c17", "c23", "gnu99", "gnu11", "gnu17"]
+    # c89 measured markedly worse than the rest on this corpus (58.8% vs
+    # ~47-53% error) because most seeds are C99-or-later; keep it in the mix
+    # for coverage of the old parser paths, just not at equal weight.
+    STD_C = ["c99", "c11", "c17", "c23", "gnu99", "gnu11", "gnu17", "c89"]
+    STD_C_WEIGHTS = [15, 15, 15, 15, 15, 15, 15, 5]
     STD_CXX = ["c++03", "c++11", "c++14", "c++17", "c++20", "c++23", "gnu++17", "gnu++20"]
     OPT_LEVELS = ["-O0", "-O1", "-O2", "-O3", "-Os", "-Oz"]
 
@@ -32,6 +36,13 @@ class ClangDriver(BaseDriver):
     ]
 
     _CXX_EXTS = (".cpp", ".cc", ".cxx", ".mm")
+
+    # Objective-C on Linux defaults to the GCC legacy runtime, which does not
+    # support ARC: passing -fobjc-arc alone makes clang bail out with
+    # "error: -fobjc-arc is not supported on platforms using the legacy
+    # runtime" before parsing a single line of the seed. Any of these
+    # runtimes enables the non-fragile ABI that ARC requires.
+    OBJC_ARC_RUNTIMES = ["gnustep-2.0", "ios-7", "macosx-10.14"]
 
     # Fuzzer-generated inputs routinely hit clang's classic memory-blowup
     # bug classes (exponential template instantiation, runaway constexpr
@@ -61,15 +72,89 @@ class ClangDriver(BaseDriver):
             return self.clang_bin, None  # Objective-C
         return self.clang_bin, self.STD_C
 
-    def _get_random_flags(self, ext):
+    # Since clang 16, implicit function declarations and implicit int are
+    # errors by default in C mode. A large share of the C seed corpus is
+    # pre-C99 style (`foo(x) { ... }`, calls to undeclared functions), so
+    # without these two the seed is rejected on K&R syntax before any of
+    # the frontend work we are fuzzing happens. They only downgrade those
+    # two diagnostics back to warnings; nothing else changes. Not passed
+    # for C++, which has no such constructs.
+    C_LEGACY_FLAGS = ["-Wno-implicit-function-declaration", "-Wno-implicit-int"]
+
+    # Triple the seed's own RUN line asks for. Most of clang/test is written
+    # against a specific backend, and compiling it for the host instead
+    # leaves every target builtin and type undeclared. Honouring the triple
+    # took standalone validity on that part of the corpus from 46.8% to
+    # 50.8% and is the only way these seeds reach the AArch64/RISCV/PowerPC
+    # frontends at all.
+    _TRIPLE_RE = re.compile(
+        r'(?m)^\s*(?://|/\*|#)\s*RUN:.*?(?:-triple[= ]\s*|--target=)([\w.]+(?:-[\w.]+)*)')
+    # Architectures this build actually registers (setup.py:
+    # LLVM_TARGETS_TO_BUILD). An unregistered arch would just error out.
+    _SUPPORTED_ARCH = (
+        "x86_64", "i386", "i686", "i586", "x86",
+        "aarch64", "aarch64_be", "aarch64_32", "arm64", "arm64_32",
+        "arm", "armeb", "armv7", "armv7a", "armv6", "armv8", "thumb", "thumbv7", "thumbv8",
+        "thumbv8.1m", "riscv32", "riscv64",
+        "powerpc", "powerpc64", "powerpc64le", "ppc32", "ppc64", "ppc64le", "ppc32le",
+    )
+    # Intrinsic headers that need their extension switched on explicitly.
+    _FEATURE_BY_HEADER = [
+        (re.compile(r'#\s*include\s*[<"](?:riscv_vector|sifive_vector|andes_vector)\.h'),
+         ("riscv", "-march=rv64gcv")),
+        (re.compile(r'#\s*include\s*[<"]arm_sme\.h'), ("aarch64", "-march=armv9-a+sve2+sme")),
+        (re.compile(r'#\s*include\s*[<"]arm_sve\.h'), ("aarch64", "-march=armv8-a+sve")),
+        (re.compile(r'#\s*include\s*[<"]arm_mve\.h'), ("thumb", "-march=armv8.1-m.main+mve")),
+    ]
+
+    def _target_flags(self, content):
+        """(-target/-march flags, is_cross) implied by the seed's RUN line."""
+        triples = [t for t in self._TRIPLE_RE.findall(content or "")
+                   if t.split("-")[0].lower() in self._SUPPORTED_ARCH]
+        if not triples:
+            return "", False
+        triple = random.choice(triples)
+        arch = triple.split("-")[0].lower()
+        # -ffreestanding: a cross target still resolves <stdint.h> to the
+        # host's glibc headers, which then fail on bits/libc-header-start.h.
+        flags = [f"-target {triple}", "-ffreestanding"]
+        for rx, (arch_prefix, march) in self._FEATURE_BY_HEADER:
+            if arch.startswith(arch_prefix) and rx.search(content or ""):
+                flags.append(march)
+                break
+        return " ".join(flags), not arch.startswith(("x86", "i3", "i5", "i6"))
+
+    def _get_random_flags(self, ext, content=""):
         binname, stds = self._lang_for(ext)
+        target_flags, cross = self._target_flags(content)
         flags = [random.choices(self.MODES, weights=self.MODE_WEIGHTS, k=1)[0]]
         flags.append(random.choice(self.OPT_LEVELS))
         if stds and random.random() > 0.3:
-            flags.append(f"-std={random.choice(stds)}")
+            weights = self.STD_C_WEIGHTS if stds is self.STD_C else None
+            std = random.choices(stds, weights=weights, k=1)[0] if weights else random.choice(stds)
+            flags.append(f"-std={std}")
+        if ext not in self._CXX_EXTS:
+            flags.extend(self.C_LEGACY_FLAGS)
+        # -fblocks for every language: blocks (^{ ... }) are a clang extension
+        # used across the C, C++ and Obj-C seeds alike and are off by default
+        # on Linux, so without it those seeds die on "blocks support disabled"
+        # before reaching the frontend paths being fuzzed.
+        flags.append("-fblocks")
         if ext in (".m", ".mm"):  # Objective-C and Objective-C++
+            # Always select a modern runtime, not just for ARC: the Linux
+            # default (GCC legacy, fragile ABI) rejects weak references and
+            # property synthesis without a matching ivar — both pervasive in
+            # the Obj-C corpus — and refuses -fobjc-arc outright.
+            flags.append(f"-fobjc-runtime={random.choice(self.OBJC_ARC_RUNTIMES)}")
             flags.append("-fobjc-arc" if random.random() > 0.5 else "-fno-objc-arc")
-        flags.extend(random.sample(self.MISC_FLAGS, random.randint(0, 3)))
+        misc = random.sample(self.MISC_FLAGS, random.randint(0, 3))
+        if cross:
+            # No sanitizer runtime is built for the cross targets, and the
+            # driver rejects the flag outright rather than just warning.
+            misc = [f for f in misc if not f.startswith("-fsanitize")]
+        flags.extend(misc)
+        if target_flags:
+            flags.append(target_flags)
         return binname, " ".join(flags)
 
     def execute(self, seed):
@@ -84,7 +169,7 @@ class ClangDriver(BaseDriver):
             with open(seed_file, "w", encoding="utf-8") as f:
                 f.write(seed.content)
 
-            binname, flags = self._get_random_flags(ext)
+            binname, flags = self._get_random_flags(ext, seed.content)
             asan_opts = "abort_on_error=1:detect_leaks=0:symbolize=1"
             ubsan_opts = "print_stacktrace=1:halt_on_error=1"
             cmd = (

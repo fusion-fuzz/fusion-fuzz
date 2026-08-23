@@ -54,10 +54,13 @@ def _extract_display_code(content: str, ext: str) -> tuple[str, str]:
 
 class FusionFuzzLoop:
     def __init__(self, config, strategies, initial_corpus, pre_analysis_enabled=True,
-                 guided_fusion_enabled=False, fusion_rate=0.8):
+                 guided_fusion_enabled=False, fusion_rate=0.8, children_per_pair=2):
         self.config = config
         self.strategies = strategies
         self.fusion_rate = fusion_rate
+        # How many children one selected parent pair yields per iteration.
+        # 2 reproduces the original behaviour (one bidirectional draw).
+        self.children_per_pair = max(1, children_per_pair)
 
         # Sanitize corpus: Ensure everything is a Seed object
         self.corpus = []
@@ -230,10 +233,21 @@ class FusionFuzzLoop:
                 host = strategy.fuse(host, parent_b)
 
             final_strategy = chain[-1]
-            if hasattr(final_strategy, 'fuse_bidirectional'):
-                children = final_strategy.fuse_bidirectional(host, parent_b)
-            else:
-                children = [final_strategy.fuse(host, parent_b)]
+            bidirectional = hasattr(final_strategy, 'fuse_bidirectional')
+            # --children-per-pair: draw the last technique repeatedly against
+            # the *same* intermediate host. Only the chain prefix is shared;
+            # each child is still a full application of the chain, and every
+            # draw re-randomises that technique's own choices (splice point,
+            # bridge variable, direction). Sharing the prefix is the only
+            # part that actually amortises — re-running the whole chain per
+            # child measured *more* expensive per child, not less.
+            draws = max(1, self.children_per_pair // 2) if bidirectional else self.children_per_pair
+            children = []
+            for _ in range(draws):
+                if bidirectional:
+                    children.extend(final_strategy.fuse_bidirectional(host, parent_b))
+                else:
+                    children.append(final_strategy.fuse(host, parent_b))
         except Exception as e:
             logger.warning(f"Fusion error: {e}")
             return [], [], (parent_a, parent_b)
