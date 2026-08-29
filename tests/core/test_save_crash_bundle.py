@@ -237,6 +237,56 @@ class TestParentFiles(unittest.TestCase):
         self.assertIn("parent_a.py", files)
         self.assertNotIn("parent_b.py", files)
 
+    # -- chained fusion: metadata["parents"] names an intermediate Seed -----
+
+    def test_chained_child_still_resolves_both_corpus_parents(self):
+        """A chain of >1 technique feeds an intermediate Seed into the last
+        one, so metadata["parents"][0] is an id no corpus contains. The
+        bundle must still carry both real parents, via root_parents."""
+        pa = self._parent("pa000001", "# parent A")
+        pb = self._parent("pb000002", "# parent B")
+        child = Seed(content="# child", metadata={
+            "parents": ["intermed", pb.id],          # intermediate host
+            "root_parents": [pa.id, pb.id],          # the corpus pair
+        })
+        child.id = "chain001"
+        ffl = _make_orchestrator("cpython", [pa, pb], self.tmp)
+        ffl._save_crash_bundle(child, _make_result(), "sig_chained")
+        d = _crash_dir(self.tmp, "cpython", "sig_chained", child.id)
+        self.assertEqual(_read(os.path.join(d, "parent_a.py")), pa.content)
+        self.assertEqual(_read(os.path.join(d, "parent_b.py")), pb.content)
+
+    def test_root_parents_fixes_the_label_order_for_ba_direction(self):
+        """State/declaration strategies record [host, donor], which swaps for
+        the "ba" direction; root_parents keeps label a on the same corpus
+        seed regardless of which way the fusion ran."""
+        pa = self._parent("pa000001", "# parent A")
+        pb = self._parent("pb000002", "# parent B")
+        child = Seed(content="# child", metadata={
+            "parents": [pb.id, pa.id],               # ba direction: host = b
+            "root_parents": [pa.id, pb.id],
+            "mode": "state_live3_ba",
+        })
+        child.id = "badir001"
+        ffl = _make_orchestrator("cpython", [pa, pb], self.tmp)
+        ffl._save_crash_bundle(child, _make_result(), "sig_badir")
+        d = _crash_dir(self.tmp, "cpython", "sig_badir", child.id)
+        self.assertEqual(_read(os.path.join(d, "parent_a.py")), pa.content)
+        self.assertEqual(_read(os.path.join(d, "parent_b.py")), pb.content)
+        readme = _read(os.path.join(d, "README.md"))
+        self.assertIn("state_live3_ba", readme)      # direction is recorded
+
+    def test_unresolved_parent_is_reported_not_silently_dropped(self):
+        pa = self._parent("real_pa", "# real A")
+        child = Seed(content="x", metadata={"root_parents": ["real_pa", "gone_pb"]})
+        child.id = "unres001"
+        ffl = _make_orchestrator("cpython", [pa], self.tmp)
+        ffl._save_crash_bundle(child, _make_result(), "sig_unres")
+        d = _crash_dir(self.tmp, "cpython", "sig_unres", child.id)
+        readme = _read(os.path.join(d, "README.md"))
+        self.assertIn("gone_pb", readme)
+        self.assertIn("Not found in the current corpus", readme)
+
 
 # ---------------------------------------------------------------------------
 # 5. README.md — content and format

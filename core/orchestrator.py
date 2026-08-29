@@ -18,6 +18,7 @@ from .driver import get_driver, DockerDriver, cleanup_stale_processes
 from .fusion import Seed
 from .utils import smart_truncate
 from .coverage import PairwiseCoverageMatrix
+from .degradation import degradations, record as record_degradation
 
 logger = logging.getLogger("FFL.Orchestrator")
 
@@ -54,7 +55,7 @@ def _extract_display_code(content: str, ext: str) -> tuple[str, str]:
 
 class FusionFuzzLoop:
     def __init__(self, config, strategies, initial_corpus, pre_analysis_enabled=True,
-                 guided_fusion_enabled=False, fusion_rate=0.8, children_per_pair=2):
+                 fusion_rate=0.8, children_per_pair=2):
         self.config = config
         self.strategies = strategies
         self.fusion_rate = fusion_rate
@@ -94,12 +95,9 @@ class FusionFuzzLoop:
         self.unique_crashes = set()
         self._load_existing_crashes()
 
-        # Pairwise conjunction coverage matrix — producer-consumer guided
-        # parent selection (--guided-fusion) only takes effect when
-        # --pre-analysis is also enabled (see PairwiseCoverageMatrix's
-        # docstring).
-        self.coverage = PairwiseCoverageMatrix(pre_analysis_enabled=pre_analysis_enabled,
-                                                guided_fusion_enabled=guided_fusion_enabled)
+        # Pairwise coverage matrix: picks a random pair that hasn't been
+        # fused yet, and tells run() when every pair has been covered.
+        self.coverage = PairwiseCoverageMatrix()
         
         self.original_cwd = os.getcwd()
         self.current_workspace = None
@@ -224,8 +222,10 @@ class FusionFuzzLoop:
         # iteration rather than force an unviable technique.
         usable = [s for s in self.strategies if s.is_viable_pair(parent_a, parent_b)]
         if not usable:
+            record_degradation("no viable strategy for the selected pair")
             return [], [], (parent_a, parent_b)
 
+        chain = []
         try:
             chain = self._pick_strategy_chain(usable)
             host = parent_a
@@ -250,9 +250,32 @@ class FusionFuzzLoop:
                     children.append(final_strategy.fuse(host, parent_b))
         except Exception as e:
             logger.warning(f"Fusion error: {e}")
+            # Name the strategy, not just the exception: a NameError inside
+            # one language's strategy is otherwise indistinguishable from a
+            # malformed seed, and that is exactly how one went unnoticed.
+            culprit = type(chain[-1]).__name__ if chain else "?"
+            record_degradation("fusion raised", f"{culprit}: {type(e).__name__}")
             return [], [], (parent_a, parent_b)
 
-        return [c for c in children if c], chain, (parent_a, parent_b)
+        children = [c for c in children if c]
+        for child in children:
+            # A chained fusion feeds chain[:-1]'s intermediate Seed into the
+            # last technique, so the child's own metadata["parents"] names
+            # that intermediate — an id that exists in no corpus — instead of
+            # the seed it ultimately came from. Strategies also disagree on
+            # ordering: clang's dataflow always records [a, b] while its
+            # state/declaration variants record [host, donor], which swaps
+            # for the "ba" direction. Record the selected corpus pair
+            # separately, in a fixed order, so crash bundles can resolve and
+            # label both parents regardless of chain length or direction.
+            child.metadata["root_parents"] = [parent_a.id, parent_b.id]
+            # A mode of the form *_none_* / *_nocontinuation_* / *_fallback_* /
+            # dataflow_none is a strategy reporting it had nothing to apply —
+            # the child came out as (near enough) the host alone.
+            mode = str(child.metadata.get("mode") or "")
+            if any(m in mode for m in ("_none", "nocontinuation", "fallback", "nohostpoint")):
+                record_degradation("fusion applied nothing (child ~= host)", mode)
+        return children, chain, (parent_a, parent_b)
 
     def process_iteration(self) -> List[Tuple[Optional[Seed], Optional[object]]]:
         """
@@ -405,6 +428,7 @@ class FusionFuzzLoop:
         usable = [s for s in self.strategies
                   if s.is_viable_pair(host_seed, donor_seed)]
         if not usable:
+            record_degradation("no viable strategy for the selected pair")
             return None, []
         chain = self._pick_strategy_chain(usable)
         try:
@@ -413,7 +437,11 @@ class FusionFuzzLoop:
                 host = strategy.fuse(host, donor_seed)
         except Exception as e:
             logger.warning(f"Fusion error: {e}")
+            record_degradation("fusion raised",
+                               f"{type(chain[-1]).__name__ if chain else '?'}: {type(e).__name__}")
             return None, chain
+        if host is not None:
+            host.metadata["root_parents"] = [host_seed.id, donor_seed.id]
         return host, chain
 
     def generate_only(self, output_dir, max_programs=-1, self_fusion=True, max_seconds=None):
@@ -510,7 +538,6 @@ class FusionFuzzLoop:
                     break
                 host_seed, donor_seed = self.corpus[i], self.corpus[j]
                 self.iterations += 1
-                self.coverage.record(host_seed.id, donor_seed.id)
 
                 child, chain = self._fuse_pair(host_seed, donor_seed)
                 if child is None or not (child.content or "").strip():
@@ -572,6 +599,7 @@ class FusionFuzzLoop:
             manifest.close()
 
         sys.stdout.write("\n")
+        degradations.report(total_iterations=self.iterations)
         logger.info(
             f"Wrote {saved} fused program(s) to {output_dir} "
             f"(of {attempted} ordered pairs attempted, {len(pairs)} planned"
@@ -664,15 +692,25 @@ class FusionFuzzLoop:
             logger.error(f"Failed to write test.out: {e}")
 
         # 6. Look up and save parent programs (parent_a.<ext>, parent_b.<ext>, …)
-        parent_ids = seed.metadata.get("parents", [])
+        #    root_parents is the corpus pair this child was fused from, in a
+        #    fixed order; metadata["parents"] is only the last fuse call's
+        #    direct inputs, which for a chained fusion is an intermediate
+        #    Seed that no corpus contains (see _fuse_once). Prefer the former
+        #    and keep the latter as the fallback for children produced
+        #    outside _fuse_once.
+        parent_ids = seed.metadata.get("root_parents") or seed.metadata.get("parents", [])
         corpus_index = {s.id: s for s in self.corpus}
         parent_labels = ["a", "b", "c", "d"]
         parent_seeds = []
+        unresolved = []
         for i, pid in enumerate(parent_ids):
+            label = parent_labels[i] if i < len(parent_labels) else str(i)
             parent = corpus_index.get(pid)
             if parent is None:
+                # Record it instead of dropping it — a bundle that silently
+                # omits parent_a looks like a one-parent bug.
+                unresolved.append((label, pid))
                 continue
-            label = parent_labels[i] if i < len(parent_labels) else str(i)
             parent_filename = f"parent_{label}{ext}"
             try:
                 with open(os.path.join(crash_dir, parent_filename), "w", encoding="utf-8") as f:
@@ -680,6 +718,13 @@ class FusionFuzzLoop:
             except Exception as e:
                 logger.error(f"Failed to write {parent_filename}: {e}")
             parent_seeds.append((label, pid, parent))
+        if unresolved:
+            record_degradation("crash bundle: parent not resolvable")
+            logger.warning(
+                f"{os.path.basename(crash_dir)}: could not resolve parent(s) "
+                + ", ".join(f"{lbl}={pid}" for lbl, pid in unresolved)
+                + " in the current corpus"
+            )
 
         # 7. Write test.sh — reproducing shell command
         cmd_template = self.config.get('execution', {}).get('command', 'unknown_cmd {seed_path}')
@@ -754,8 +799,15 @@ class FusionFuzzLoop:
                 f.write(f"```\n{repro_cmd}\n```\n\n")
 
                 # Parent provenance
-                if parent_seeds:
+                if parent_seeds or unresolved:
                     f.write("### Parents\n\n")
+                    # The labels identify the corpus pair, not the order the
+                    # two halves appear in the fused program — `mode` below
+                    # carries the direction ("..._ab" = a is the host,
+                    # "..._ba" = b is).
+                    mode = (seed.metadata or {}).get("mode")
+                    if mode:
+                        f.write(f"Fusion mode: `{mode}`\n\n")
                     f.write("| Label | ID | Source |\n")
                     f.write("|-------|----|--------|\n")
                     for label, pid, parent in parent_seeds:
@@ -770,11 +822,10 @@ class FusionFuzzLoop:
                             source_desc = (f"Project seed (`{identifier}`)"
                                            if identifier else "Project seed")
                         f.write(f"| `{label}` | `{pid}` | {source_desc} |\n")
+                    for label, pid in unresolved:
+                        f.write(f"| `{label}` | `{pid}` | **Not found in the current corpus** "
+                                f"(seed removed, or a different corpus/filter was used) |\n")
                     f.write("\n")
-                elif parent_ids:
-                    f.write("### Parents\n\n")
-                    f.write(f"Parent IDs (not in current corpus): "
-                            f"{', '.join(f'`{p}`' for p in parent_ids)}\n\n")
 
                 f.write("*This report is automatically generated by "
                         "[Fusion-Fuzz](https://github.com/0599jiangyc/FusionFuzzLoop)*\n")
@@ -849,11 +900,6 @@ class FusionFuzzLoop:
 
         valid_rate = self._fused_valid_rate()
 
-        n = len(self.corpus)
-        total_pairs = n * (n - 1) // 2
-        covered = self.coverage.covered_count()
-        cov_pct = (covered / total_pairs * 100.0) if total_pairs > 0 else 100.0
-        pairs_per_sec = covered / elapsed
         clock = str(datetime.timedelta(seconds=int(elapsed)))
         if self.time_limit:
             clock += f"/{self._format_duration(self.time_limit)}"
@@ -862,8 +908,13 @@ class FusionFuzzLoop:
             f"Throughput: {throughput:.1f} tests/s | "
             f"Bugs: {len(self.unique_crashes)} | "
             f"FuseValidRate: {valid_rate:.1f}% | "
-            f"PairCov: {covered}/{total_pairs} ({cov_pct:.1f}%, {pairs_per_sec:.1f} pairs/s)"
         )
+        n = len(self.corpus)
+        total_pairs = n * (n - 1) // 2
+        covered = self.coverage.covered_count()
+        cov_pct = (covered / total_pairs * 100.0) if total_pairs > 0 else 100.0
+        status += (f"PairCov: {covered}/{total_pairs} "
+                   f"({cov_pct:.1f}%, {covered / elapsed:.1f} pairs/s)")
 
         # Write carriage return to overwrite line
         sys.stdout.write(status)
@@ -1156,6 +1207,7 @@ class FusionFuzzLoop:
                 pass
 
         sys.stdout.write("\n")
+        degradations.report(total_iterations=executed)
         new_crashes = len(self.unique_crashes) - crashes_before
         logger.info(
             f"Replay finished: {executed}/{len(programs)} program(s) executed, "
@@ -1196,11 +1248,15 @@ class FusionFuzzLoop:
         max_workers = self.config.get("execution", {}).get("concurrency", 4)
         logger.info(f"ThreadPoolExecutor initialized with {max_workers} workers.")
         
+        logger.info("Parent selection: random unfused pair (uniform among "
+                    "pairs not yet covered)")
         if self.time_limit:
+            _other = ('pair saturation' if max_iterations == -1
+                      else f'{max_iterations} iterations')
             logger.info(
                 f"Time budget: {self._format_duration(self.time_limit)} "
                 f"(--time {self.time_limit:g}); stops at whichever comes first, "
-                f"time budget or {'pair saturation' if max_iterations == -1 else f'{max_iterations} iterations'}."
+                f"time budget or {_other}."
             )
         if max_iterations == -1 and not self.time_limit:
             logger.info("Mode: Continuous Fuzzing (Press Ctrl-C to stop)")
@@ -1343,6 +1399,7 @@ class FusionFuzzLoop:
                     pass
             if self.sample_count > 0:
                 logger.info(f"Fused valid rate: {self._fused_valid_rate():.1f}%")
+            degradations.report(total_iterations=self.iterations)
 
         # 3. Cleanup Workspace
         os.chdir(self.original_cwd)

@@ -26,6 +26,27 @@ carry so they can build valid bridge expressions (e.g. only bridge an
 Without this information the bridge is a random guess and will fail type
 checking for strict languages like Rust, Swift, or Go.
 
+Which keys are actually consumed
+------------------------------------
+Only four of these are read at fusion time; the rest are collected but
+have no consumer today (their original reader, the producer-consumer
+matcher in core/resource_matching.py, was removed):
+
+  most_complex_states  -> every *StateFusionStrategy, on every fusion
+  segment_boundaries   -> four-segment state fusion's split points
+  has_declaration      -> Clang/Naga declaration fusion's is_viable_pair
+  rc / dryrun_done     -> --dry-run's corpus filter
+
+Everything else (var_types, struct_names, functions, imports, classes,
+top_level_vars, undefined_refs, primitive_vars, cloneable_vars,
+fn_signatures, complexity_score, has_generics/lifetimes/unsafe,
+types_used, constants, structs, dynamic_types, live_vars, line_count,
+byte_size) is written and never read back. They are kept rather than
+deleted because they are cheap and plausibly useful — measured on the
+clang corpus they are 6 B/seed, 0.1% of stored metadata, against
+most_complex_states' 4.5 KB. Delete a collector's field only if you have
+first checked it is still unread *and* that it costs something.
+
 Metadata keys written per language
 ------------------------------------
 Rust:
@@ -83,7 +104,9 @@ either flag):
   pre_analysis_done  bool          marker so a later --pre-analysis run
                                     can skip re-collecting this seed
   most_complex_states list[dict]   core/state_analysis.py's StatePoint
-                                    cache, consumed by *StateFusionStrategy
+                                    cache (each entry carries live_count,
+                                    the sampling weight), consumed by
+                                    *StateFusionStrategy
 """
 
 import json
@@ -117,6 +140,33 @@ _RUST_CLONE_TYPES: frozenset = frozenset({
 # Base collector
 # ---------------------------------------------------------------------------
 
+# Metadata keys --pre-analysis leaves on *every* seed whose language
+# core/state_analysis.py knows about. Listed here so a seed analysed by an
+# older build — one that predates a key, or wrote it under a name since
+# retired — is re-analysed instead of being skipped forever on the strength
+# of its pre_analysis_done flag alone.
+PRE_ANALYSIS_KEYS = ("most_complex_states", "segment_boundaries")
+
+# Bumped whenever the *meaning* of what --pre-analysis writes changes, as
+# opposed to which keys it writes. A seed stamped with an older version is
+# re-analysed even though every key is present — without this, a change
+# like "state points are no longer capped at 25 per seed" leaves the whole
+# corpus on the old, narrower cache forever, since the key it lives under
+# never changed. History:
+#   1  state points capped at 25/seed; anchors filtered by an _is_safe gate
+#   2  cap removed (every line is a candidate anchor), _is_safe gate dropped
+#   3  cap reinstated at 100/seed — uncapped pushed corpus.db to 488 MB on
+#      the long tail (one seed cached 9230 points) for no measured gain
+PRE_ANALYSIS_VERSION = 3
+
+# Keys written by builds whose semantics no longer match what the code
+# reads. states_of_interest held only the maximum-live-variable points
+# (core/state_analysis.py now returns every safe point, each carrying the
+# live_count it is sampled by), so reading it back would silently restore
+# the maximum-only selection it was built with. Dropped on rewrite.
+OBSOLETE_METADATA_KEYS = ("states_of_interest",)
+
+
 class BaseMetadataCollector:
     """
     Collects static and optionally dynamic metadata from one seed execution.
@@ -124,9 +174,15 @@ class BaseMetadataCollector:
     Subclasses override:
         static_collect(content, filename)  → dict
         dynamic_collect(content, result)   → dict   (optional)
+        provides                           → tuple  (keys static/dynamic
+                                             _collect are expected to set,
+                                             checked for cache freshness)
 
     The result object has .return_code, .stdout, .stderr attributes.
     """
+
+    #: keys this collector guarantees to write; see PRE_ANALYSIS_KEYS
+    provides: tuple = ()
 
     language: str = "generic"
 
@@ -149,8 +205,16 @@ class BaseMetadataCollector:
         """
         return content
 
-    def collect(self, seed, result) -> dict:
-        """Combine static + dynamic metadata into one dict."""
+    def collect(self, seed, result, fallback_language: Optional[str] = None) -> dict:
+        """Combine static + dynamic metadata into one dict.
+
+        `fallback_language` is the project's own language, used when the
+        seed's `type` names none — e.g. --bug-corpus injects seeds tagged
+        `bug_corpus`, which is a provenance marker, not a language. Without
+        the fallback those seeds get no state-point or boundary cache at
+        all and every fusion re-analyses them from scratch (they are half
+        the clang corpus).
+        """
         content = seed.content or ""
         filename = (seed.metadata or {}).get("filename", "")
 
@@ -175,11 +239,20 @@ class BaseMetadataCollector:
         # language) via state_analysis.LANGUAGE_ALIASES; a no-op for
         # languages without patterns defined yet.
         try:
-            from .state_analysis import find_most_complex_state, LANGUAGE_ALIASES
+            from .state_analysis import (find_state_points, segment_boundaries,
+                                         LANGUAGE_ALIASES)
             seed_type = (seed.metadata or {}).get("type") or self.language
-            lang = LANGUAGE_ALIASES.get(str(seed_type).lower())
+            lang = (LANGUAGE_ALIASES.get(str(seed_type).lower())
+                    or LANGUAGE_ALIASES.get(str(fallback_language or "").lower()))
             if lang:
-                points = find_most_complex_state(content, lang)
+                # Where the text may be cut into independently well-formed
+                # halves (four-segment state fusion). Two O(n) character
+                # scans, measured at ~20% of the fusion loop's Python time
+                # when recomputed per fusion. Line numbering survives both
+                # mutation and include hoisting, so indices computed here
+                # stay valid for every later fusion of this seed.
+                meta["segment_boundaries"] = segment_boundaries(content, lang)
+                points = find_state_points(content, lang)
                 # Always record the result, even when empty — pick_state_point
                 # distinguishes "cached: no points" ([]) from "never analyzed"
                 # (key absent) to decide whether to recompute at fusion time.
@@ -191,6 +264,14 @@ class BaseMetadataCollector:
         except Exception as e:
             logger.debug(f"[{self.language}] most-complex-state pre-analysis error for {seed.id}: {e}")
 
+        # Both stamps belong here, next to the analysis they describe:
+        # collect() is only called when metadata is actually being
+        # collected, and a caller that had to remember to set
+        # pre_analysis_done separately made collect()'s own output fail
+        # _metadata_is_fresh — i.e. the two halves of the contract could
+        # drift apart unnoticed.
+        meta["pre_analysis_done"] = True
+        meta["pre_analysis_version"] = PRE_ANALYSIS_VERSION
         meta["dryrun_done"] = True
         if result is not None:
             meta["rc"] = result.return_code
@@ -600,6 +681,7 @@ class ClangMetadataCollector(BaseMetadataCollector):
     """
 
     language = "clang"
+    provides = ("has_declaration",)
 
     def static_collect(self, content: str, filename: str = "") -> dict:
         # Local import: avoids a module-load-time cycle (core.fusion doesn't
@@ -688,6 +770,8 @@ def update_seed_metadata_in_db(db_path: str, identifier: str, new_meta: dict) ->
                 conn.close()
                 return
             existing = json.loads(row[1]) if row[1] else {}
+            for stale in OBSOLETE_METADATA_KEYS:
+                existing.pop(stale, None)
             existing.update(new_meta)
             conn.execute(
                 "UPDATE seeds SET metadata = ? WHERE id = ?",
@@ -702,6 +786,33 @@ def update_seed_metadata_in_db(db_path: str, identifier: str, new_meta: dict) ->
 # ---------------------------------------------------------------------------
 # Main entry point
 # ---------------------------------------------------------------------------
+
+def _metadata_is_fresh(seed, fallback_language: Optional[str] = None) -> bool:
+    """True when this seed's cached metadata already has every key the
+    current --pre-analysis would write.
+
+    Checking the keys rather than the pre_analysis_done flag is what lets a
+    corpus analysed by an older build pick up fields added since — without
+    it, a seed keeps its stale metadata for its entire life and every fusion
+    recomputes from scratch what should have been cached once. Only the
+    seeds that are actually missing something are re-executed.
+    """
+    meta = seed.metadata or {}
+    if not meta.get("pre_analysis_done", False):
+        return False
+    if meta.get("pre_analysis_version", 0) != PRE_ANALYSIS_VERSION:
+        return False       # analysed by a build whose output meant something else
+
+    required = set()
+    seed_type = str(meta.get("type") or "").lower()
+    from .state_analysis import LANGUAGE_ALIASES
+    if (LANGUAGE_ALIASES.get(seed_type)
+            or LANGUAGE_ALIASES.get(str(fallback_language or "").lower())):
+        # collect() writes these for any language state_analysis knows
+        required.update(PRE_ANALYSIS_KEYS)
+    required.update(get_collector(seed_type).provides)
+    return required.issubset(meta)
+
 
 def run_dryrun_with_metadata(
     seeds: list,
@@ -792,7 +903,7 @@ def run_dryrun_with_metadata(
         needs_run = force
         if filter_valid and not meta.get("dryrun_done", False):
             needs_run = True
-        if collect_metadata and not meta.get("pre_analysis_done", False):
+        if collect_metadata and not _metadata_is_fresh(seed, project_name):
             needs_run = True
 
         if needs_run:
@@ -860,8 +971,9 @@ def run_dryrun_with_metadata(
         if collect_metadata:
             # Collect metadata using the *original* content for static
             # analysis but the execution result for dynamic analysis.
-            new_meta.update(collector.collect(seed, result))
-            new_meta["pre_analysis_done"] = True
+            new_meta.update(collector.collect(seed, result, fallback_language=project_name))
+            new_meta["pre_analysis_done"] = True    # also set by collect(); kept for the
+                                                    # collect_metadata-without-collector path
 
         return seed, result.return_code, new_meta
 

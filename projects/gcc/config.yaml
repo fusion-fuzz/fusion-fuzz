@@ -1,0 +1,88 @@
+project_name: "gcc"
+
+execution:
+  # projects/gcc/driver.py picks gcc vs g++ and the flag set per seed;
+  # this template is only BaseDriver's fallback.
+  command: "gcc -fsyntax-only {seed_path}"
+  timeout: 20          # -O3/-fanalyzer on a fused TU is slower than clang
+  concurrency: 16
+  # Address-space cap per compile, enforced with `ulimit -v` in the driver.
+  # A fused program can send GCC into runaway template instantiation; without
+  # this the host OOM killer fires and can take the orchestrator with it.
+  mem_limit_mb: 4096
+
+analysis:
+  # An ICE is the finding. GCC prints "internal compiler error:" for every
+  # one of them, including those it catches from its own SIGSEGV handler,
+  # so that string plus the sanitizer summaries is most of the oracle.
+  # driver.py::_check_crash additionally *subtracts* the resource-
+  # exhaustion shapes (Killed, out of memory) that match these patterns
+  # but are facts about the machine.
+  crash_patterns:
+    - "internal compiler error"
+    - "SUMMARY: AddressSanitizer"
+    - "SUMMARY: UndefinedBehaviorSanitizer"
+    - "runtime error:"
+    # --enable-checking=yes,extra,rtl turns a malformed tree/RTL into one
+    # of these before it can become silently wrong code.
+    - "verify_gimple failed"
+    - "verify_ssa failed"
+    - "verify_flow_info failed"
+    - "verify_cgraph"
+    - "tree check:"
+    - "GIMPLE check:"
+    - "RTL check:"
+    - "Segmentation fault"
+    - "Aborted"
+    - "core dumped"
+    - "Please submit a full bug report"
+    - "confused by earlier errors, bailing out"
+  # A fused program is very often ill-formed; an ordinary diagnostic is the
+  # expected outcome, not a bug.
+  syntax_patterns:
+    - "error: "
+    - "fatal error: "
+
+paths:
+  # Populated by setup.py from gcc/testsuite (and clang's test tree if the
+  # clang adapter already cloned it next door).
+  seed_source: "projects/gcc/seeds"
+  # Unpacked from the bundled corpus.zip: 112k FormAI C programs.
+  seed_corpus: "projects/gcc/corpus.db"
+
+  seed_exclude_patterns:
+    # NOTE: there is deliberately no exclusion for DejaGnu negative tests
+    # (`{ dg-error "..." }`), even though the clang adapter excludes its
+    # -verify equivalent. GCC's error-recovery paths are a productive bug
+    # source in their own right: the first ICE this adapter found was an
+    # ICE-on-invalid, where a diagnosed type became error_mark and a later
+    # builtin-call predicate dereferenced it. Excluding these would drop
+    # ~6,600 seeds, a third of the C++ corpus, and with them that whole
+    # class of bug. It costs FuseValidRate; it is worth it here.
+    # NOTE: seeds are deliberately NOT filtered by target architecture.
+    # An aarch64 or powerpc test compiled by this x86-64 build is rejected
+    # by the front end, not by the driver, so it still exercises GCC — and
+    # feeding target-specific constructs to the wrong backend is its own
+    # bug hypothesis (target hooks, builtin tables, and mode handling are
+    # where cross-target assumptions break). The driver still filters
+    # -m<arch> flags out of dg-options, because those fail in the *driver*
+    # rather than the compiler and buy nothing.
+
+    # Multi-file tests: the other half of the test is not in the corpus, so
+    # these can never link or even parse standalone.
+    - pattern: '(?m)^\s*(?:/\*|//)\s*\{\s*dg-additional-sources'
+      reason: "multi-file DejaGnu test; the companion source is not in the corpus"
+    # Headers that are not installed in this image.
+    - pattern: '(?m)^\s*#\s*include\s*<(?:zlib|sqlite3|mysql|pcre2?|png|jpeglib|expat|lzma|bzlib|gmp|mpfr)\.h>|^\s*#\s*include\s*<(?:libxml2?|curl|openssl|gtk|glib|Qt\w*|boost|python\d?\.\d+)/'
+      reason: "includes a third-party library header not installed in this image"
+    # Quoted includes in the testsuite resolve via the test's own -I path,
+    # which a fused child no longer sits under. Standard headers written in
+    # quoted form are kept.
+    - pattern: '(?m)^\s*#\s*include\s+"(?!(?:std(?:io|lib|def|arg|bool|int|align|noreturn|atomic)\.h|string\.h|math\.h|limits\.h|assert\.h|errno\.h|time\.h|wchar\.h|ctype\.h|float\.h|inttypes\.h)")'
+      reason: "includes a test-local header that cannot resolve outside its original directory"
+
+llm:
+  provider: "deepseek"
+  model: "deepseek-v4-flash"
+  api_key: ""
+  timeout: 30

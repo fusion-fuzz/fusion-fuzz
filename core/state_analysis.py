@@ -1,5 +1,5 @@
 """
-core/state_analysis.py — Most-Complex-State Profiling & Safe Splice
+core/state_analysis.py — State-Point Profiling & Safe Splice
 
 Implements the "state" half of state fusion: a *state* is the point in a
 seed's execution immediately following a given statement. Rather than
@@ -11,21 +11,25 @@ richer search space, deeper interactions.
 
 Two things make a point usable:
 
-1. It must be the *most complex state* — the point most likely to
-   interact meaningfully with another seed's continuation. Unified rule
-   across all supported languages except Haskell: the point(s) with the
-   most *live* variables — declared, and still in scope — is the "most
-   complex" state, offering a donor continuation the richest possible
-   surface of names to collide with (find_most_complex_state below).
-   Computed per-language via a small (declare/decrement/reset-or-brace-
+1. It should be a *complex* state — the more live variables (declared,
+   and still in scope) a point has, the richer the surface of names a
+   donor continuation can collide with, and the more likely the graft
+   interacts meaningfully. Unified rule across all supported languages
+   except Haskell: every safe point is eligible, and points are sampled
+   *proportionally to their live-variable count* (find_state_points
+   collects them, pick_state_point / weighted_order draw from them), so
+   a below-maximum point is still reachable, just less often. Counts are
+   computed per-language via a small (declare/decrement/reset-or-brace-
    scope) regex config below — a static best-effort approximation, not a
    real dataflow/liveness analysis. When no line has any live variables
-   at all, find_most_complex_state falls back to a single random *safe*
-   line instead of coming back empty, so state fusion still gets a splice
-   point. Haskell instead just picks a uniformly random line
-   (HaskellStateFusionStrategy in core/fusion.py) unconditionally — its
-   layout-based scoping doesn't fit this model, and simplicity won out
-   over trying to make it fit.
+   at all there is no count to be proportional to, so the weights fall
+   back to distance-to-centre (_center_weights: 5 points -> 1, 2, 3, 2,
+   1), preferring the middle of the program — a splice near the top has
+   almost no preceding state to interact with, one at the very bottom
+   leaves nothing to continue into. Haskell instead just
+   picks a uniformly random line (HaskellStateFusionStrategy in
+   core/fusion.py) unconditionally — its layout-based scoping doesn't fit
+   this model, and simplicity won out over trying to make it fit.
 2. It must be *safe* to splice at — inserting statements there can't
    break the enclosing syntactic/structural integrity (an unterminated
    string, a line mid-expression, wrong indentation for Python). This
@@ -40,6 +44,7 @@ Two things make a point usable:
 import random
 import re
 from dataclasses import dataclass, field
+from functools import lru_cache
 from typing import Dict, List, Optional
 
 # seed metadata "type"/language strings that map onto LIVE_VAR_CONFIGS keys.
@@ -241,11 +246,11 @@ def _paren_depth_prefix(content: str, mask: List[bool]) -> List[int]:
     """Running paren/bracket/brace depth after each prefix of `content` —
     prefix[i] is the depth after content[:i]. Built once in O(n).
 
-    Both callers (find_most_complex_state's _is_safe, and
+    Both callers (find_state_points's _is_safe, and
     truncate_to_balanced) probe the depth at O(n) increasing offsets while
     walking a file line by line. The previous approach called a
     _paren_depth_at(content, mask, upto) helper that rescanned from
-    position 0 on every probe, making a single find_most_complex_state /
+    position 0 on every probe, making a single find_state_points /
     truncate_to_balanced call O(n^2) in content length — cheap on typical
     seeds but a multi-minute stall (and, since this runs inside a
     ThreadPoolExecutor worker holding the GIL, a full stall of every
@@ -267,24 +272,38 @@ def _paren_depth_prefix(content: str, mask: List[bool]) -> List[int]:
 # State point discovery
 # ---------------------------------------------------------------------------
 
+_LIVE_CATEGORY_RE = re.compile(r"^live(\d+)$")
+
+
 @dataclass
 class StatePoint:
     line_idx: int            # 0-based line index whose END is the state
     category: str
     matched_text: str
     indent: str = ""
+    live_count: int = 0      # sampling weight: live variables at this point
 
     def to_dict(self) -> dict:
         return {"line_idx": self.line_idx, "category": self.category,
-                "matched_text": self.matched_text, "indent": self.indent}
+                "matched_text": self.matched_text, "indent": self.indent,
+                "live_count": self.live_count}
 
     @staticmethod
     def from_dict(d: dict) -> "StatePoint":
-        return StatePoint(d["line_idx"], d["category"], d.get("matched_text", ""), d.get("indent", ""))
+        live = d.get("live_count")
+        if live is None:
+            # Metadata cached before live_count existed. The count was
+            # encoded in the category ("live7"), so recover it from there
+            # and fall back to 0 (which pick_state_point treats as
+            # unweighted) only when even that is absent.
+            m = _LIVE_CATEGORY_RE.match(str(d.get("category", "")))
+            live = int(m.group(1)) if m else 0
+        return StatePoint(d["line_idx"], d["category"], d.get("matched_text", ""),
+                          d.get("indent", ""), int(live))
 
 
 # Haskell is deliberately NOT in LIVE_VAR_CONFIGS and has no dedicated
-# find_most_complex_state path: its real "many variables" equivalent
+# find_state_points path: its real "many variables" equivalent
 # (function-argument/case-alternative/do-bind pattern names, not let/
 # where) is abundant enough to count, but its layout-based scoping
 # (where/let-in/do blocks scoped by indentation, not braces) makes
@@ -380,17 +399,86 @@ def _count_live_brace(lines: List[str], line_starts: List[int], mask: List[bool]
     return counts
 
 
-def find_most_complex_state(content: str, language: str, project_root: Optional[str] = None,
-                             max_points: int = 25) -> List[StatePoint]:
-    """Scan `content` for the *most complex* state(s) — the safe-to-splice
-    line(s) with the most live (declared and still-in-scope) variables —
-    to graft a continuation into. A line is safe to splice at when it's
-    real code (not mid-string, not mid-comment) and structurally balanced
-    (non-negative running paren depth, so we're not already inside a
-    broken construct). Ties all come back so pick_state_point can still
-    pick among them at random. `project_root` is accepted for call-site
-    compatibility but unused — there's no more per-project pattern
-    override to load.
+def _center_weights(n: int) -> List[int]:
+    """Triangular weights over n positions, peaking in the middle:
+    n=5 -> [1, 2, 3, 2, 1]; n=4 -> [1, 2, 2, 1].
+
+    Used when live-variable counts give nothing to weight by. The middle
+    of a program is the better place to splice on structural grounds
+    alone: a point near the top has almost no preceding state for the
+    donor continuation to interact with, and one at the very bottom
+    leaves the host almost nothing to continue into. Weighting by
+    distance-to-centre keeps the extremes reachable while preferring the
+    middle, instead of treating every line as equally good.
+    """
+    return [min(i + 1, n - i) for i in range(n)]
+
+
+def _sampling_weights(points: List[StatePoint]) -> List[int]:
+    """Weight per point: its live-variable count, or — when no point has
+    any live variable at all — its distance-to-centre weight."""
+    weights = [max(0, p.live_count) for p in points]
+    return weights if any(weights) else _center_weights(len(points))
+
+
+def weighted_order(points: List[StatePoint],
+                   rng: Optional[random.Random] = None) -> List[StatePoint]:
+    """`points` permuted so that each point's chance of coming first is
+    proportional to its live-variable count.
+
+    Uses the Efraimidis-Spirakis key u**(1/w): sorting by that key
+    descending is exactly weighted sampling without replacement, so the
+    whole permutation — not just its head — is weighted. Callers that
+    scan for the first *usable* point (MLIR's donor-point search) get the
+    same proportional preference as callers that just take the first.
+
+    Points with no live variables keep a chance of being reached (they
+    sort last) but are never preferred; when *every* count is zero there
+    is nothing to be proportional to and _center_weights takes over, so
+    the order prefers points near the middle of the program.
+    """
+    rng = rng or random
+    if not points:
+        return []
+    weights = _sampling_weights(points)
+    keyed = []
+    for point, weight in zip(points, weights):
+        # rng.random() is in [0,1); the u==0 corner would make every
+        # positive weight tie at 0.0, so nudge it into (0,1].
+        key = (rng.random() or 1e-12) ** (1.0 / weight) if weight > 0 else -1.0
+        keyed.append((key, point))
+    keyed.sort(key=lambda kp: kp[0], reverse=True)
+    return [point for _, point in keyed]
+
+
+def find_state_points(content: str, language: str, project_root: Optional[str] = None,
+                      max_points: int = 100,
+                      rng: Optional[random.Random] = None) -> List[StatePoint]:
+    """Scan `content` for every safe-to-splice state point, each tagged
+    with its live-variable count so callers can sample *proportionally*
+    to that count (see pick_state_point / weighted_order).
+
+    Every line is a candidate — there is no up-front "is this line safe"
+    filter; where the text can actually be cut is decided separately by
+    segment_boundaries. Every line is returned — points below the file's maximum live-variable
+    count are eligible too, just less likely to be drawn, and when the
+    file has no live variables at all every safe line comes back with
+    weight 0 so the caller's distance-to-centre fallback picks among
+    them. `project_root`
+    is accepted for call-site compatibility but unused — there's no more
+    per-project pattern override to load.
+
+    At most `max_points` come back. The cap exists to bound the cached
+    metadata: without one, a 9000-line seed caches 9000 points and the
+    clang corpus.db grows to ~488 MB. 100 is comfortably above the
+    corpus's median (26 points/seed), so only the long tail is trimmed.
+
+    When there are more, the list is cut down by a *uniform* random
+    subsample rather than by keeping the highest counts or the first N.
+    Uniform is the right choice precisely because the caller weights
+    afterwards: it preserves the relative weights among the survivors,
+    whereas subsampling by weight would apply the weighting twice and
+    positional truncation would bias the cache toward the top of the file.
 
     When there's at least one safe line but none of them declare any live
     variable (best == 0 — e.g. a trivial file, or one whose declare/
@@ -406,6 +494,7 @@ def find_most_complex_state(content: str, language: str, project_root: Optional[
     pick_state_point(..., lightweight=True) instead of calling this at
     all).
     """
+    rng = rng or random
     lang = LANGUAGE_ALIASES.get(language, language)
     cfg = LIVE_VAR_CONFIGS.get(lang)
     if cfg is None:
@@ -422,42 +511,41 @@ def find_most_complex_state(content: str, language: str, project_root: Optional[
     counts = (_count_live_flat if cfg.mode == "flat" else _count_live_brace)(
         lines, line_starts, mask, cfg)
 
-    paren_prefix = _paren_depth_prefix(content, mask)
-
-    # A line is a safe anchor if it's real code (not mostly inside a
-    # string/comment) and not already structurally unbalanced.
-    def _is_safe(idx: int, line: str) -> bool:
-        start = line_starts[idx]
-        real_chars = sum(1 for k in range(start, start + len(line)) if k < len(mask) and mask[k])
-        if len(line.strip()) > 0 and real_chars < len(line.strip()) * 0.5:
-            return False
-        return paren_prefix[start + len(line)] >= 0
-
-    safe_idxs = [idx for idx, line in enumerate(lines) if _is_safe(idx, line)]
+    # Every line is a candidate anchor. There used to be an "is this line
+    # safe to anchor at" filter here (real code rather than string/comment
+    # interior, and non-negative running delimiter depth); it was dropped
+    # deliberately. Structural integrity of the *result* is enforced where
+    # the text is actually divided — segment_boundaries, which requires
+    # depth exactly zero — and an anchor landing somewhere odd produces an
+    # ill-formed child, which is a legitimate thing to feed a compiler
+    # rather than something to filter out up front.
+    safe_idxs = list(range(len(lines)))
     if not safe_idxs:
         return []
 
     best = max(counts[idx] for idx in safe_idxs)
-    if best <= 0:
-        # No safe line declares a live variable — pick one random safe
-        # line from the file's middle (skip the very first/last safe line
-        # when there's an actual middle to pick from) rather than always
-        # collapsing to the same fixed first/last-line fallback the
-        # caller uses for [].
-        middle = safe_idxs[1:-1] if len(safe_idxs) > 2 else safe_idxs
-        idx = random.choice(middle)
-        indent_m = re.match(r"[ \t]*", lines[idx])
-        return [StatePoint(idx, "random_mid", "", indent_m.group(0))]
 
     points: List[StatePoint] = []
     for idx in safe_idxs:
-        if counts[idx] != best:
-            continue
         indent_m = re.match(r"[ \t]*", lines[idx])
-        points.append(StatePoint(idx, f"live{best}", "", indent_m.group(0)))
-        if len(points) >= max_points:
-            break
+        # best <= 0: nothing in this file declares a live variable, so
+        # every safe line is returned with weight 0 and the caller's
+        # _center_weights fallback decides between them — preferring the
+        # middle of the program. (Previously this branch collapsed to a
+        # single pre-chosen line, which meant a cached seed spliced at
+        # the very same line on every fusion for the rest of its life.)
+        category = f"live{counts[idx]}" if best > 0 else "nolive"
+        points.append(StatePoint(idx, category, "",
+                                 indent_m.group(0), counts[idx]))
+    if len(points) > max_points:
+        points = sorted(rng.sample(points, max_points), key=lambda p: p.line_idx)
     return points
+
+
+# Pre-rename alias. The old name described the old behaviour (return only
+# the maximum-live-variable points); selection is proportional now, so the
+# name is kept only so out-of-tree callers don't break.
+find_most_complex_state = find_state_points
 
 
 # ---------------------------------------------------------------------------
@@ -466,19 +554,6 @@ def find_most_complex_state(content: str, language: str, project_root: Optional[
 
 _PHP_OPEN_RE = re.compile(r'^\s*<\?php\b')
 _PHP_CLOSE_RE = re.compile(r'\?>\s*$')
-
-
-def strip_donor_wrapper(content: str, language: str) -> str:
-    """Strip language-level wrapper tags a donor's *continuation* shouldn't
-    carry when it's spliced into a host that's already inside that wrapper
-    (e.g. PHP's `<?php ... ?>` — grafting a second `<?php` mid-script is a
-    structural break, not a "safe" splice)."""
-    lang = LANGUAGE_ALIASES.get(language, language)
-    if lang == "php":
-        s = _PHP_OPEN_RE.sub("", content, count=1)
-        s = _PHP_CLOSE_RE.sub("", s, count=1)
-        return s
-    return content
 
 
 def graft_continuation(host_content: str, donor_content: str,
@@ -528,6 +603,183 @@ def graft_continuation(host_content: str, donor_content: str,
     return "\n".join(fused_lines)
 
 
+@dataclass
+class FusionSegments:
+    """The four pieces a state fusion is composed from, plus where each
+    input was cut. `a_split`/`b_split` are exclusive end indices of the
+    respective prefixes, i.e. prefix == lines[:split], suffix == lines[split:].
+    """
+    a_prefix: List[str]
+    a_suffix: List[str]
+    b_prefix: List[str]
+    b_suffix: List[str]
+    a_split: int
+    b_split: int
+    a_point: int
+    b_point: int
+
+    def to_metadata(self) -> dict:
+        """Segment ranges for the fused Seed's metadata, so a saved
+        reproducer records exactly how it was assembled."""
+        return {
+            "a_point": self.a_point, "b_point": self.b_point,
+            "a_split": self.a_split, "b_split": self.b_split,
+            "segment_lines": {
+                "a_prefix": len(self.a_prefix), "b_prefix": len(self.b_prefix),
+                "a_suffix": len(self.a_suffix), "b_suffix": len(self.b_suffix),
+            },
+        }
+
+
+@lru_cache(maxsize=1024)
+def _segment_boundaries_cached(content: str, language: str) -> tuple:
+    return tuple(_compute_segment_boundaries(content, language))
+
+
+def segment_boundaries(content: str, language: str) -> List[int]:
+    """Line indices after which `content` can be cut into two independently
+    well-formed statement sequences. Memoized — see
+    _compute_segment_boundaries for the rule and the cost this avoids."""
+    return list(_segment_boundaries_cached(content, language))
+
+
+def _compute_segment_boundaries(content: str, language: str) -> List[int]:
+    """Line indices after which `content` can be cut into two independently
+    well-formed statement sequences.
+
+    A cut is legal only where the running delimiter depth is back to zero —
+    otherwise the prefix leaves an unclosed brace/paren that the suffix,
+    now separated from it by another program's text, no longer closes. For
+    indentation-scoped languages (Python) the next non-blank line must also
+    start at column zero, or the cut would separate a compound statement's
+    header from its body.
+
+    This is *additional* to find_state_points' eligibility filtering, not a
+    replacement for it: that decides which points are interesting, this
+    decides where the text can actually be divided.
+    """
+    lines = content.splitlines()
+    if not lines:
+        return []
+    mask = _lexical_mask(content, language)
+    offsets, off = [], 0
+    for ln in lines:
+        offsets.append(off)
+        off += len(ln) + 1
+    depth = _paren_depth_prefix(content, mask)
+    lang = LANGUAGE_ALIASES.get(str(language).lower(), language)
+    indentation_scoped = lang == "cpython"
+
+    def _next_nonblank(i):
+        for j in range(i + 1, len(lines)):
+            if lines[j].strip():
+                return lines[j]
+        return None
+
+    out = []
+    for i, line in enumerate(lines):
+        end = min(offsets[i] + len(line), len(depth) - 1)
+        if depth[end] != 0:
+            continue
+        if indentation_scoped:
+            nxt = _next_nonblank(i)
+            if nxt is not None and nxt[:1].isspace():
+                continue
+        out.append(i)
+    return out
+
+
+def split_at_point(content: str, point: Optional[StatePoint], language: str,
+                   boundaries: Optional[List[int]] = None):
+    """Cut `content` into (prefix, suffix, split_idx) around `point`.
+
+    The point's own line goes to the *prefix*: a StatePoint denotes the
+    state immediately **after** that line has executed (see StatePoint's
+    docstring), so the prefix is exactly the code that produced that state
+    and the suffix is the continuation from it.
+
+    When the point does not sit on a legal boundary (see
+    segment_boundaries) the cut moves to the nearest legal line at or
+    after it, so the state the point represents is still contained in the
+    prefix; failing that, to the nearest one before it. Returns None when
+    `content` has no legal boundary at all.
+    """
+    lines = content.splitlines()
+    if not lines:
+        return None
+    # `boundaries` comes from --pre-analysis when available: computing it
+    # means two O(n) character scans (_lexical_mask + _paren_depth_prefix)
+    # per seed per fusion, ~20% of the fusion loop's Python time. Line
+    # numbering survives both mutation and include hoisting (measured at
+    # 100% on the clang corpus), so an index computed once up front stays
+    # valid for every later fusion of that seed.
+    if boundaries is None:
+        boundaries = segment_boundaries(content, language)
+    if not boundaries:
+        return None
+
+    target = point.line_idx if point else len(lines) - 1
+    at_or_after = [b for b in boundaries if b >= target]
+    chosen = at_or_after[0] if at_or_after else boundaries[-1]
+
+    split = chosen + 1
+    return lines[:split], lines[split:], split
+
+
+def interleave_segments(a_content: str, b_content: str,
+                        a_point: Optional[StatePoint], b_point: Optional[StatePoint],
+                        language: str, tag_comment: Optional[str] = None,
+                        a_boundaries: Optional[List[int]] = None,
+                        b_boundaries: Optional[List[int]] = None):
+    """Four-segment state fusion: A_prefix + B_prefix + A_suffix + B_suffix.
+
+    Both programs are cut at their own fusion point and *all four* pieces
+    appear in the result, each keeping its own internal statement order.
+    A's prefix runs first, then B's prefix builds B's state on top of it,
+    then A's continuation resumes — now with B's names in scope — and
+    finally B's continuation runs against whatever A left behind. Every
+    segment therefore executes in a state the other program produced,
+    which is the point of fusing them.
+
+    This replaces the earlier suffix-grafting scheme (A_prefix + B_suffix +
+    A_suffix), which dropped B's prefix entirely: B's continuation ran
+    without the code that set up the state it expects, and B's own setup
+    never interacted with A at all.
+
+    Returns (fused_text, FusionSegments) or None when either side has no
+    legal split boundary.
+    """
+    a_split_res = split_at_point(a_content, a_point, language, a_boundaries)
+    b_split_res = split_at_point(b_content, b_point, language, b_boundaries)
+    if a_split_res is None or b_split_res is None:
+        return None
+
+    a_prefix, a_suffix, a_split = a_split_res
+    b_prefix, b_suffix, b_split = b_split_res
+
+    def _tagged(seg):
+        """Mark the first real line of a B segment, so a reader (and a
+        line-based reducer) can see which statements came from B."""
+        if not tag_comment or not seg:
+            return seg
+        seg = list(seg)
+        idx = next((i for i, ln in enumerate(seg) if ln.strip()), None)
+        if idx is not None:
+            seg[idx] = seg[idx] + f"  {tag_comment}"
+        return seg
+
+    fused_lines = (list(a_prefix) + _tagged(b_prefix)
+                   + list(a_suffix) + _tagged(b_suffix))
+    segments = FusionSegments(
+        a_prefix=a_prefix, a_suffix=a_suffix,
+        b_prefix=b_prefix, b_suffix=b_suffix,
+        a_split=a_split, b_split=b_split,
+        a_point=a_point.line_idx if a_point else -1,
+        b_point=b_point.line_idx if b_point else -1,
+    )
+    return "\n".join(fused_lines), segments
+
+
 def truncate_to_balanced(content: str, start_line_idx: int, language: str) -> int:
     """Return the exclusive end line index for a continuation starting at
     `start_line_idx` such that running paren/bracket/brace depth (relative
@@ -560,9 +812,25 @@ def truncate_to_balanced(content: str, start_line_idx: int, language: str) -> in
 
 def pick_state_point(content: str, language: str, project_root: Optional[str] = None,
                       cached: Optional[List[dict]] = None,
-                      lightweight: bool = False) -> Optional[StatePoint]:
-    """Convenience: reuse a cached points list (e.g. seed.metadata['most_complex_states']
-    written during --pre-analysis) when available, else compute fresh.
+                      lightweight: bool = False,
+                      rng: Optional[random.Random] = None) -> Optional[StatePoint]:
+    """Draw one state point, sampled *proportionally to its live-variable
+    count* among all eligible points — a point with 6 live variables is
+    drawn twice as often as one with 3, and a below-maximum point is
+    still drawn, just less often. Reuses a cached points list (e.g.
+    seed.metadata['most_complex_states'] written during --pre-analysis)
+    when available, else computes fresh.
+
+    Zero-weight fallback: when no eligible point has any live variable
+    (a trivial file, or a stale cache whose entries predate live_count
+    and carry no recoverable category), there is nothing to be
+    proportional to, so the weights come from _center_weights instead —
+    points near the middle of the program are preferred, the first and
+    last lines least (5 points -> weights 1, 2, 3, 2, 1).
+
+    `rng` defaults to the `random` module, so a caller that seeds it
+    (`random.seed(...)`) still gets deterministic selection; pass an
+    explicit random.Random for an independent stream.
 
     lightweight (no --pre-analysis): skip the live-variable-count analysis
     (and any cache) entirely and just pick a uniformly random line — no
@@ -577,16 +845,18 @@ def pick_state_point(content: str, language: str, project_root: Optional[str] = 
     force a full rescan on every fusion attempt for exactly the seeds
     that always come up empty.
     """
-    import random
+    rng = rng or random
     if lightweight:
         lines = content.splitlines()
         if not lines:
             return None
-        idx = random.randrange(len(lines))
+        idx = rng.randrange(len(lines))
         indent_m = re.match(r"[ \t]*", lines[idx])
-        return StatePoint(idx, "random", "", indent_m.group(0))
+        return StatePoint(idx, "random", "", indent_m.group(0), 0)
     if cached is not None:
         points = [StatePoint.from_dict(d) for d in cached]
     else:
-        points = find_most_complex_state(content, language, project_root)
-    return random.choice(points) if points else None
+        points = find_state_points(content, language, project_root, rng=rng)
+    if not points:
+        return None
+    return rng.choices(points, weights=_sampling_weights(points), k=1)[0]

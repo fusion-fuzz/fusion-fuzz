@@ -21,18 +21,6 @@ from core.fusion import get_strategies, Seed
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("FFL.Main")
 
-def get_db_content(db_path, identifier):
-    """Helper to fetch content by identifier from a seed DB."""
-    try:
-        conn = sqlite3.connect(db_path)
-        cursor = conn.cursor()
-        res = cursor.execute("SELECT content FROM seeds WHERE identifier = ?", (identifier,)).fetchone()
-        conn.close()
-        return res[0] if res else None
-    except Exception:
-        return None
-
-
 def filter_excluded_seeds(seeds, config):
     """Drop seeds matching any regex in config's paths.seed_exclude_patterns.
 
@@ -125,7 +113,7 @@ if __name__ == "__main__":
                              "a language needs one) and collect the metadata fusion strategies "
                              "use at runtime: dataflow graphs, declared/observed variable types, "
                              "and core/state_analysis.py's live-variable most-complex-state points "
-                             "for state fusion. Also a prerequisite for --guided-fusion (see below). "
+                             "for state fusion. "
                              "Does not filter the corpus by validity — pair with --dry-run for "
                              "that. Required for --declaration-fusion/--struct-fusion (disabled "
                              "otherwise, with a warning). Without it, --dataflow-fusion falls back "
@@ -133,14 +121,11 @@ if __name__ == "__main__":
                              "--state-fusion falls back to picking any random line, for every "
                              "project.")
     parser.add_argument("--guided-fusion", action="store_true", default=False,
-                        help="Producer-consumer guided parent selection (core/resource_matching.py, "
-                             "core/coverage.py): among unfused seed pairs, prefer one where a "
-                             "resource one seed produces (a type it instantiates, a symbol it "
-                             "defines) matches a consumption site the other exposes, instead of "
-                             "picking any unfused pair uniformly at random. Only takes effect "
-                             "together with --pre-analysis (the compatibility signal is built "
-                             "entirely from dry-run-collected metadata) — passing this alone logs "
-                             "a warning and has no effect.")
+                        help="REMOVED — accepted and ignored. Producer-consumer guided parent "
+                             "selection (prefer a pair where one seed produces a resource the "
+                             "other consumes) has been dropped: it cost throughput without a "
+                             "measured payoff. Parent selection is now always a uniformly random "
+                             "pair among those not yet fused.")
     parser.add_argument("--concurrency", type=int, default=None, help="Override the number of threads for execution (default is from config.yaml)")
     parser.add_argument("--reduce", type=str, default=None, metavar="BUG_DIR",
                         help="Minimize a crash reproducer (test.<ext>) to min.<ext> using delta "
@@ -234,17 +219,6 @@ if __name__ == "__main__":
                              "random as a fallback, so an iteration is never left untouched. "
                              "Has no effect with a pool of size 1 (e.g. --dataflow-fusion passed "
                              "alone), which always applies that one technique. Default: 0.8.")
-    parser.add_argument("--dataflow-type-match", action="store_true", default=False,
-                        help="[clang/swift/mlir/rust/haskell/flang/lfortran/naga] For dataflow "
-                             "fusion's bridge substitution: 90%% of the time, prefer a "
-                             "same-declared-type bridge pair (falling back to a random/"
-                             "type-agnostic pair when none of matching type exists), 10%% "
-                             "of the time deliberately pick a type-mismatched pair outright "
-                             "(stresses type-checker/verifier diagnostics). Off by default; "
-                             "each project's un-flagged behavior is unchanged. No effect on "
-                             "cpython/php (dynamically typed — dataflow fusion there always "
-                             "picks the bridge pair uniformly at random regardless of this "
-                             "flag).")
     parser.add_argument("--corpus-size", type=int, default=None, metavar="N",
                         help="Sample N seeds from the loaded corpus for fusion "
                              "instead of using all seed programs")
@@ -302,6 +276,12 @@ if __name__ == "__main__":
 
     if args.time is not None and args.time <= 0:
         parser.error(f"--time must be positive (got {args.time})")
+
+    if args.guided_fusion:
+        logger.warning(
+            "--guided-fusion has been removed and is ignored: parent selection is "
+            "always a uniformly random pair among those not yet fused."
+        )
 
     # --reduce: standalone mode, project inferred from path
     if args.reduce:
@@ -672,7 +652,6 @@ if __name__ == "__main__":
                                  struct_fusion=args.struct_fusion,
                                  declaration_fusion=args.declaration_fusion,
                                  state_fusion=args.state_fusion,
-                                 dataflow_type_match=args.dataflow_type_match,
                                  pre_analysis_enabled=args.pre_analysis,
                                  clang_langs=clang_langs or None)
     if not _strategies:
@@ -694,7 +673,6 @@ if __name__ == "__main__":
         strategies=_strategies,
         initial_corpus=_valid_corpus,
         pre_analysis_enabled=args.pre_analysis,
-        guided_fusion_enabled=args.guided_fusion,
         fusion_rate=args.fusion_rate,
         children_per_pair=args.children_per_pair,
     )
