@@ -93,3 +93,18 @@ projects/rust/seeds
 
 
 rustc-ice*
+
+# GCC project — build artifacts, 9 GB combined. The MLIR block above
+# ignores its equivalents; these were missing, so `git add -A` after a
+# --setup run would try to commit the whole toolchain.
+projects/gcc/gcc-src/
+projects/gcc/gcc-build/
+projects/gcc/gcc-install/
+projects/gcc/setup.log
+
+# Triton project — same reasoning. deps/ holds the prebuilt LLVM tarball
+# (375 MB) and its unpacked tree.
+projects/triton/triton-src/
+projects/triton/triton-build/
+projects/triton/deps/
+projects/triton/seeds/

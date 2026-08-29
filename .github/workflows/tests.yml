@@ -27,7 +27,11 @@ jobs:
           cache: "pip"
 
       - name: Install dependencies
-        run: pip install -r requirements.txt
+        run: pip install -r requirements.txt -r requirements-dev.txt
 
+      # pytest, not `unittest discover`: most of the suite uses pytest's
+      # parametrize, and unittest cannot import those modules at all.
+      # pytest still collects the unittest.TestCase modules, so this runs
+      # strictly more than the previous command did.
       - name: Run tests
-        run: python3 -m unittest discover -s tests -p "test_*.py" -t . -v
+        run: python3 -m pytest tests -v

@@ -1,0 +1,9 @@
+# Test-only dependencies. Kept out of requirements.txt so installing the
+# fuzzer does not pull in a test runner.
+#
+# The suite is a mix: 5 modules are unittest.TestCase, 10 use pytest's
+# parametrize/skip. pytest collects both, `unittest discover` collects only
+# the former — and silently *errors* on the latter rather than skipping
+# them, which is how CI ended up reporting ImportError for a third of the
+# suite while claiming to run it.
+pytest>=7.0
