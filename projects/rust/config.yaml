@@ -1,35 +1,66 @@
 project_name: "rust"
 
 execution:
-  # The driver handles the binary path dynamically, but this acts as a fallback/template
-  command: "/rust-src/build/x86_64-unknown-linux-gnu/stage1/bin/rustc {seed_path} -o {output_bin}"
-  timeout: 10
+  # projects/rust/driver.py builds the real command (flags, target, emit
+  # kind, optional run) per seed; this is only BaseDriver's fallback.
+  command: "rustc {seed_path} -o {output_bin}"
+  timeout: 40          # -Zsanitizer and -Clto=fat are slow
   concurrency: 16
+  # rustc is hungrier than gcc or go — monomorphisation of a fused generic
+  # can run away. Enforced with `ulimit -v` in the driver.
+  mem_limit_mb: 6144
 
 analysis:
+  # The coarse net; projects/rust/analyzer.py makes the actual decision and
+  # subtracts the resource shapes that match here but say nothing about
+  # rustc (OOM, stack overflow, recursion/type-length limits).
   crash_patterns:
     - "internal compiler error"
     - "thread 'rustc' panicked"
-    - "stack overflow"
+    - "the compiler unexpectedly panicked"
+    - "LLVM ERROR"
+    - "' failed."                  # LLVM assertion, live via llvm.assertions
+    - "rustc interrupted by"
+    - "SUMMARY: AddressSanitizer"
+    - "SUMMARY: LeakSanitizer"
+    - "error: Undefined Behavior"
     - "Segmentation fault"
     - "core dumped"
-    - "Aborted"
-    - "LLVM ERROR"
+  # A fused Rust program is usually rejected; an ordinary diagnostic is the
+  # expected outcome, not a finding.
   syntax_patterns:
-    - "error["
-    - "error:"
-    - "panicked at "
+    - "error[E"
+    - "aborting due to"
+    - "cannot find"
+    - "mismatched types"
+    - "unresolved import"
 
 paths:
-  # Point to a directory containing valid .rs files (e.g., from rust-lang/rust/tests/ui)
   seed_source: "projects/rust/seeds"
   seed_corpus: "projects/rust/corpus.db"
 
+  seed_exclude_patterns:
+    # `//@ known-bug` marks a test that is *supposed* to ICE. Fusing one and
+    # reporting the crash is rediscovering a filed bug — the same reason
+    # setup.py leaves tests/crashes out of the corpus entirely.
+    - pattern: '(?m)^//@\s*known-bug'
+      reason: "known-bug test: it is supposed to ICE, so a hit is already filed"
+    # Tests needing a companion crate, an external tool, or a target this
+    # build does not have. They fail before reaching the compiler paths
+    # this fuzzer aims at.
+    - pattern: '(?m)^//@\s*(?:aux-build|aux-crate|proc-macro|needs-|only-|ignore-test)'
+      reason: "needs an auxiliary crate, external tool or specific target"
+    # `include!`/`include_str!` of a sibling path cannot resolve once the
+    # seed leaves its original directory.
+    - pattern: 'include(?:_str|_bytes)?!\s*\('
+      reason: "includes a sibling file that cannot resolve outside its test directory"
+    # NOTE: `//@ check-fail` / `//@ build-fail` tests are deliberately NOT
+    # excluded. They are ill-formed on purpose, and rustc's error-recovery
+    # paths are a productive bug source — a `delayed_bug` that never gets
+    # cancelled surfaces precisely there.
+
 llm:
-  provider: "openai" # Options: gemini, openai, vllm, ollama
-  model: "gpt-4o-mini"
+  provider: "deepseek"
+  model: "deepseek-v4-flash"
   api_key: ""
-  # api_key: "" # Defaults to LLM_API_KEY env var
-  # api_base: "" # Optional, for vllm/ollama
   timeout: 30
-  # rate: 0.05 # Probability to use LLM generation in fuzz loop

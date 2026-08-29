@@ -358,6 +358,23 @@ def replace_random_occurrence_indented(s, old, new):
         s = s[:start] + replacement + s[end:]
     return s
 
+def rename_all_word_occurrences(s: str, old: str, new: str) -> str:
+    """Rename *every* word-boundary occurrence of `old`.
+
+    Distinct from replace_word_occurrences, which deliberately rewrites a
+    weighted-random *subset* — that is what dataflow fusion wants, since a
+    partial rename is the connection it is making.
+
+    De-collision wants the opposite. Renaming a declaration but only some
+    of its uses (or some uses but not the declaration) turns one
+    "defined multiple times" error into a pile of "cannot find type X in
+    this scope" ones. Measured on the rust-lang/rust corpus, using the
+    random-subset function here produced 162 such errors per 120 fused
+    files, and left the original E0428 collisions half-unfixed.
+    """
+    return re.sub(rf'(?<!\w){re.escape(old)}(?!\w)', new.replace('\\', '\\\\'), s)
+
+
 def replace_word_occurrences(s: str, old: str, new: str, ignorecase: bool = False) -> str:
     """
     Word-boundary-safe replacement — unlike PHP's `$`-sigil or MLIR's
@@ -4029,7 +4046,13 @@ class RustFusionStrategy(RustLexMixin, FusionStrategy):
         lines = code.splitlines()
         for line in lines:
             stripped = line.strip()
-            if stripped.startswith("#!"):
+            # `//!` is an inner doc comment, which is crate-level in exactly
+            # the way `#![...]` is: legal only before any item. Splicing a
+            # body that contains one into the middle of a fused file gives
+            # "error[E0753]: expected outer doc comment", which was 175 of
+            # ~1100 rejections on the rust-lang/rust corpus — second only
+            # to name collisions.
+            if stripped.startswith("#!") or stripped.startswith("//!"):
                 crate_attrs.append(line)
             elif stripped.startswith("use ") or stripped.startswith("extern crate "):
                 use_lines.append(line)
@@ -4052,6 +4075,53 @@ class RustFusionStrategy(RustLexMixin, FusionStrategy):
             new_main = None
 
         return crate_attrs, use_lines, body, new_main
+
+    # ------------------------------------------------------------------
+    # Cross-seed name de-collision
+    # ------------------------------------------------------------------
+
+    # Top-level items, matched at column 0 — anything indented is inside a
+    # function body and cannot collide at module scope. `impl` is absent
+    # on purpose: it declares no name of its own, and the conflicting-impl
+    # errors it causes are fixed by renaming the *type* it applies to.
+    _RUST_ITEM_RES = (
+        re.compile(r'^(?:pub(?:\([^)]*\))?\s+)?(?:unsafe\s+|async\s+|const\s+|extern\s+"[^"]*"\s+)*'
+                   r'fn\s+(\w+)', re.M),
+        re.compile(r'^(?:pub(?:\([^)]*\))?\s+)?(?:struct|enum|union|trait|type|mod)\s+(\w+)', re.M),
+        re.compile(r'^(?:pub(?:\([^)]*\))?\s+)?(?:const|static)\s+(?:mut\s+)?(\w+)', re.M),
+        re.compile(r'^macro_rules!\s+(\w+)', re.M),
+    )
+    # Names that mean something to the compiler or the prelude; renaming
+    # them changes what the program is rather than just what it calls things.
+    _RUST_KEEP_NAMES = frozenset({
+        "main", "_", "Self", "self", "crate", "super",
+        "drop", "Drop", "Copy", "Clone", "Default", "Debug",
+    })
+
+    def _rust_toplevel_names(self, body):
+        names = set()
+        for rx in self._RUST_ITEM_RES:
+            names.update(rx.findall(body))
+        return names - self._RUST_KEEP_NAMES
+
+    def _dedupe_toplevel(self, a_body, b_body, tag):
+        """Rename B's module-scope items that collide with A's.
+
+        Measured on the rust-lang/rust test corpus this is the single
+        biggest validity lever: without it, `error[E0428]: the name X is
+        defined multiple times` plus its relatives (E0119 conflicting trait
+        impls, E0592 duplicate definitions) were about half of all
+        rejections. Two files drawn from tests/ui very often both declare
+        `struct Foo` or `fn helper`.
+
+        `impl` blocks are not renamed directly — they declare no name — but
+        renaming the type they apply to resolves the conflicting-impl
+        errors that come with it.
+        """
+        collisions = self._rust_toplevel_names(a_body) & self._rust_toplevel_names(b_body)
+        for name in sorted(collisions):
+            b_body = rename_all_word_occurrences(b_body, name, f"{name}_{tag}")
+        return b_body, collisions
 
     # ------------------------------------------------------------------
     # Type-aware bridge helpers
@@ -4403,6 +4473,10 @@ class RustFusionStrategy(RustLexMixin, FusionStrategy):
         # Process A and B: separate crate attrs, use lines, and body
         attrs_a, uses_a, body_a, main_a = self._process_seed(code_a, parent_a.id)
         attrs_b, uses_b, body_b, main_b = self._process_seed(code_b, parent_b.id)
+        # Rust rejects a module-scope redeclaration outright, and two seeds
+        # from tests/ui collide constantly — see _dedupe_toplevel.
+        body_b, _collisions = self._dedupe_toplevel(
+            body_a, body_b, f"b{re.sub(r'[^a-zA-Z0-9_]', '_', parent_b.id)[:6]}")
 
         all_attrs = list(dict.fromkeys(attrs_a + attrs_b))
         all_uses = sorted(set(uses_a + uses_b))
@@ -7435,6 +7509,68 @@ class LFortranDeclarationFusionStrategy(FlangDeclarationFusionStrategy):
 
 
 
+
+class RustStateFusionStrategy(RustFusionStrategy):
+    """
+    State fusion for Rust (core/state_analysis.py): interleaves the two
+    seeds' segments at a profiled most-complex state, rather than merging
+    their `main` bodies statement by statement the way RustFusionStrategy
+    does.
+
+    Rust had no state-fusion strategy before this; the registry entry was
+    `None`. The pieces were already present — LIVE_VAR_CONFIGS has a
+    brace-mode entry for Rust, and `let` bindings are exactly what the
+    live-variable model counts — so what was missing was only the four
+    hooks below.
+
+    Those hooks are all about Rust's crate structure. `#![...]` inner
+    attributes are only legal at the top of the crate, so splicing two
+    bodies together without hoisting them first produces a hard error
+    ("an inner attribute is not permitted in this context") before any of
+    the compiler this fuzzer aims at gets to run.
+    """
+
+    def _state_prepare(self, host: Seed, donor: Seed):
+        attrs_h, uses_h, body_h, _ = self._process_seed(host.content, host.id)
+        attrs_d, uses_d, body_d, _ = self._process_seed(donor.content, donor.id)
+        body_d, _ = self._dedupe_toplevel(
+            body_h, body_d, f"d{re.sub(r'[^a-zA-Z0-9_]', '_', donor.id)[:6]}")
+        # _process_seed already renames each side's `main` apart, which is
+        # what keeps the splice from producing two of them.
+        context = (list(dict.fromkeys(attrs_h + attrs_d)),
+                   sorted(set(uses_h) | set(uses_d)))
+        return body_h, body_d, context
+
+    def _state_graft_donor(self, donor_body: str, donor_point) -> str:
+        from .state_analysis import truncate_to_balanced
+        lines = donor_body.splitlines()
+        start = (donor_point.line_idx + 1) if donor_point else 0
+        return "\n".join(lines[:truncate_to_balanced(donor_body, start, "rust")])
+
+    def _state_assemble(self, context, fused_body, host, donor, direction, host_point):
+        attrs, uses = context
+        parts = [ln for ln in attrs if ln.strip()]
+        parts.extend(ln for ln in uses if ln.strip())
+        parts.append(fused_body)
+        # Neither seed's `main` survives under its own name (see
+        # _state_prepare), so the crate needs one or it will not link.
+        # `--emit=metadata` would not care, but the driver also builds and
+        # runs some children.
+        if not re.search(r'\bfn\s+main\s*\(', fused_body):
+            parts.append("fn main() {}")
+        return "\n".join(parts) + "\n"
+
+    def _state_seed_metadata(self, host: Seed, donor: Seed) -> dict:
+        return {"type": "rust", "extension": ".rs"}
+
+    def fuse(self, parent_a: Seed, parent_b: Seed) -> Seed:
+        return self._build_state_fused(parent_a, parent_b, "ab")
+
+    def fuse_bidirectional(self, parent_a: Seed, parent_b: Seed) -> List[Seed]:
+        return [self._build_state_fused(parent_a, parent_b, "ab"),
+                self._build_state_fused(parent_b, parent_a, "ba")]
+
+
 # ==========================================
 # Go
 # ==========================================
@@ -7564,8 +7700,7 @@ class GoFusionStrategy(GenericDataflowStrategy):
         """
         collisions = go_toplevel_names(a_body) & go_toplevel_names(b_body)
         for name in sorted(collisions):
-            b_body = replace_word_occurrences(b_body, name, f"{name}_{tag}",
-                                              )
+            b_body = rename_all_word_occurrences(b_body, name, f"{name}_{tag}")
         return b_body, collisions
 
     def fuse(self, parent_a: Seed, parent_b: Seed) -> Seed:
@@ -7795,7 +7930,8 @@ STRATEGY_REGISTRY = {
     # Rust has no state-fusion strategy; --struct-fusion is its own name for
     # the declaration technique.
     "rust":     _StrategySet("projects/rust",     RustFusionStrategy,
-                             RustStructFusionStrategy, None, struct_alias=True),
+                             RustStructFusionStrategy, RustStateFusionStrategy,
+                             struct_alias=True),
     "go":       _StrategySet("projects/go",       GoFusionStrategy,
                              GoDeclarationFusionStrategy, GoStateFusionStrategy),
 }

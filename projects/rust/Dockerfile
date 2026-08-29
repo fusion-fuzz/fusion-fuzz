@@ -1,43 +1,53 @@
-# Use the official Ubuntu 22.04 as a base image
-FROM rustlang/rust:nightly
+# rustc is built from source (see setup.py) rather than taken from
+# rustlang/rust:nightly, because a released nightly has neither rustc's own
+# debug assertions nor LLVM assertions compiled in — and those are most of
+# what this fuzzer looks for.
+#
+# x.py downloads its own stage0 toolchain, so no Rust needs to be installed
+# here; this image only carries what building rustc and LLVM needs.
+FROM ubuntu:22.04
 
-# Set the maintainer label
 LABEL maintainer="yuancheng@comp.nus.edu.sg"
 
-# Prevent interactive prompts from appearing during package installation
 ARG DEBIAN_FRONTEND=noninteractive
 
-# 1. Update and install basic tools required to add PPAs and download scripts
-RUN apt update && apt install -y \
-    tmux \
-    vim \
-    sudo \
+# cmake/ninja/clang are for LLVM, in case bootstrap decides to build it from
+# source rather than download the CI artifact. pkg-config + libssl-dev are
+# what cargo links against.
+RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
+    clang \
+    lld \
     cmake \
     ninja-build \
     git \
+    ca-certificates \
+    curl \
+    wget \
+    pkg-config \
+    libssl-dev \
+    zlib1g-dev \
     python3 \
     python3-pip \
-    python3-psutil \
-    curl \
+    sqlite3 \
+    tmux \
+    vim \
+    sudo \
     unzip \
     zip \
-    # Cleanup
+    file \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
 
-# Setup User
+RUN pip3 install --no-cache-dir pyyaml requests
+
 RUN useradd -m fuzz && \
     echo "fuzz:fuzz" | chpasswd && \
     usermod -aG sudo fuzz
 
-# Set up the workspace
 WORKDIR /home/fuzz/WorkSpace
-
 RUN chown -R fuzz:fuzz /home/fuzz/WorkSpace
 
-# Switch to the user
 USER fuzz
 
-# Define the default command
 CMD ["/bin/bash"]

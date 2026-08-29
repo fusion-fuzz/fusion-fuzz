@@ -109,7 +109,11 @@ def test_declaration_flag_reaches_rusts_struct_strategy():
 def test_no_flags_enables_every_technique_the_project_has():
     from core.fusion import get_strategies as _gs
     assert len(_gs("clang", pre_analysis_enabled=True)) == 3      # dataflow+declaration+state
-    assert len(_gs("rust", pre_analysis_enabled=True)) == 2       # rust has no state fusion
+    # Rust gained state fusion when the adapter was rebuilt: the pieces
+    # were already there (a brace-mode LIVE_VAR_CONFIGS entry, `let` as the
+    # declaration form), only the four template hooks were missing.
+    assert len(_gs("rust", pre_analysis_enabled=True)) == 3
+    assert len(_gs("go", pre_analysis_enabled=True)) == 3
 
 
 def test_unknown_project_gets_no_strategies():
