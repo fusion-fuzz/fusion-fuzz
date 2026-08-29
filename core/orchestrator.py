@@ -416,6 +416,11 @@ class FusionFuzzLoop:
         elif "flang" in self.project_name or "fortran" in self.project_name:
             ext = meta.get("extension") or ".f90"
         elif "haskell" in self.project_name: ext = ".hs"
+        # Exact match, not a substring test: the other branches above can
+        # afford `in` because their names are distinctive, but "go" is two
+        # letters and would match any project name containing them.
+        elif self.project_name == "go" or "golang" in self.project_name:
+            ext = meta.get("extension") or ".go"
         return ext
 
     def _fuse_pair(self, host_seed, donor_seed):

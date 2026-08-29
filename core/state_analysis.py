@@ -145,6 +145,23 @@ LIVE_VAR_CONFIGS: Dict[str, LiveVarConfig] = {
         mode="brace",
         declare=[r'\b(?:var|let)\s+([A-Za-z_]\w*)'],
     ),
+    # Go scopes names to their enclosing `{}`, so the brace-stack model
+    # applies. `:=` is the dominant declaration form by a wide margin;
+    # `var` and the range/type-switch binders cover the rest. No decrement:
+    # Go has no `del`/`free` that ends a name's scope early — an unused one
+    # is a compile error instead, which is a fact about validity, not
+    # liveness.
+    "go": LiveVarConfig(
+        mode="brace",
+        declare=[
+            r'\bvar\s+([A-Za-z_]\w*)',
+            r'^\s*([A-Za-z_]\w*)\s*:=(?!=)',
+            r'\bfor\s+([A-Za-z_]\w*)\s*(?::=|,)',
+            r'\brange\s+([A-Za-z_]\w*)\b',
+            r'\bswitch\s+([A-Za-z_]\w*)\s*:=\s*\w+\.\(type\)',
+        ],
+        multi_name=False,
+    ),
     # MLIR is SSA: a %value's scope is exactly its enclosing region, so the
     # brace-stack model is exact here, not a heuristic — no decrement
     # needed since SSA values are never undefined once in scope.

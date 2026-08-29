@@ -34,6 +34,9 @@ SEED_TEMPLATES = {
     "cpython": "def f%d(a):\n    x = a + %d\n    y = x * 2\n    return y\n",
     "php": "--TEST--\nt%d\n--FILE--\n<?php\n$x = %d;\n$y = $x * 2;\nvar_dump($y);\n?>\n",
     "rust": "fn f%d(a: i32) -> i32 {\n    let x = a + %d;\n    let y = x * 2;\n    y\n}\n",
+    "go": ("package main\n\nimport \"fmt\"\n\nfunc f%d(a int) int {\n"
+           "\tx := a + %d\n\ty := x * 2\n\treturn y\n}\n\n"
+           "func main() { fmt.Println(f%d(1)) }\n"),
     "haskell": "f%d :: Int -> Int\nf%d a = let x = a + %d in x * 2\n",
     "flang": "program p%d\n  integer :: x\n  x = %d\n  print *, x\nend program\n",
     "mlir": ("module {\n  func.func @f%d(%%a: i32) -> i32 {\n"
@@ -189,6 +192,7 @@ def test_renaming_a_name_to_itself_is_a_noop():
 COMMENT_TOKEN = {
     "clang": "//", "gcc": "//", "php": "//", "rust": "//", "swift": "//",
     "mlir": "//", "cpython": "#", "haskell": "--", "flang": "!",
+    "go": "//",
 }
 
 

@@ -7434,6 +7434,304 @@ class LFortranDeclarationFusionStrategy(FlangDeclarationFusionStrategy):
         super().__init__(project_root=project_root)
 
 
+
+# ==========================================
+# Go
+# ==========================================
+
+# Go's file structure is rigid in a way that shapes every strategy here:
+# exactly one `package` clause, and it must come first; imports next; then
+# declarations. Two Go files therefore cannot simply be concatenated the
+# way two C translation units can.
+_GO_PACKAGE_RE = re.compile(r'^package\s+(\w+)\s*$', re.M)
+_GO_IMPORT_BLOCK_RE = re.compile(r'^import\s*\(([^)]*)\)\s*$', re.M | re.S)
+_GO_IMPORT_ONE_RE = re.compile(r'^import\s+((?:[\w.]+\s+)?(?:"[^"]+"|`[^`]+`))\s*$', re.M)
+_GO_IMPORT_SPEC_RE = re.compile(r'((?:[\w.]+\s+)?(?:"[^"]+"|`[^`]+`))')
+
+# Top-level declarations, matched at column 0 — anything indented belongs to
+# a function body and is not a package-scope name.
+_GO_TOPLEVEL_FUNC_RE = re.compile(r'^func\s+(\w+)\s*[\(\[]', re.M)
+_GO_TOPLEVEL_TYPE_RE = re.compile(r'^type\s+(\w+)\b', re.M)
+_GO_TOPLEVEL_VAR_RE = re.compile(r'^(?:var|const)\s+(\w+)\b', re.M)
+
+# Declarations Go explicitly permits more than one of, so a collision here
+# is not a collision. `init` may be declared repeatedly in one package and
+# every copy runs; `_` is the blank identifier.
+_GO_REDECLARABLE = frozenset({"init", "_"})
+
+
+def split_go_file(content):
+    """Split a Go file into (package_name, import_specs, body).
+
+    The body is everything after the package clause and import
+    declarations, with those removed — which is what makes two files
+    joinable at all.
+    """
+    package = None
+    m = _GO_PACKAGE_RE.search(content)
+    if m:
+        package = m.group(1)
+
+    imports = []
+    body = content
+    for rx in (_GO_IMPORT_BLOCK_RE, _GO_IMPORT_ONE_RE):
+        for match in list(rx.finditer(body)):
+            group = match.group(1)
+            if rx is _GO_IMPORT_BLOCK_RE:
+                imports.extend(x.strip() for x in _GO_IMPORT_SPEC_RE.findall(group))
+            else:
+                imports.append(group.strip())
+        body = rx.sub("", body)
+    if m:
+        body = _GO_PACKAGE_RE.sub("", body, count=1)
+    return package, list(dict.fromkeys(i for i in imports if i)), body.strip("\n")
+
+
+def go_toplevel_names(body):
+    """Package-scope names declared in `body`."""
+    names = set()
+    for rx in (_GO_TOPLEVEL_FUNC_RE, _GO_TOPLEVEL_TYPE_RE, _GO_TOPLEVEL_VAR_RE):
+        names.update(rx.findall(body))
+    return names - _GO_REDECLARABLE
+
+
+def assemble_go_file(package, imports, *bodies):
+    """Build one compilable file from merged parts.
+
+    Imports are merged rather than dropped, and both bodies are always
+    kept, because Go makes an *unused import* a compile error: an import
+    is only safe to carry if the code that used it comes with it.
+    """
+    parts = [f"package {package or 'main'}"]
+    specs = list(dict.fromkeys(i for i in imports if i))
+    if specs:
+        parts.append("import (\n" + "\n".join(f"\t{i}" for i in specs) + "\n)")
+    parts.extend(b for b in bodies if b and b.strip())
+    return "\n\n".join(parts) + "\n"
+
+
+class GoFusionStrategy(GenericDataflowStrategy):
+    """
+    Go (gc) fusion strategy.
+
+    Dataflow fusion is the shared rename (FusionStrategy.rename_across):
+    a name from A replaces a name in B. Go is a good fit for it — both
+    bodies end up at package scope in one file, so A's top-level names
+    really are visible where B uses them.
+
+    Everything else here is about Go's structural rules. Concatenation
+    alone produces a file with two `package` clauses and two import
+    blocks, which fails in the parser before any of the compiler this
+    fuzzer is aiming at ever runs.
+    """
+
+    LANGUAGE = "go"
+
+    def __init__(self, project_root="projects/go", lightweight: bool = False):
+        super().__init__(mutator=BaseMutator(), lightweight=lightweight)
+        self.project_root = project_root
+        self.mutation = True
+        self.dataflow_fusion = True
+
+    # Go identifiers are bare, so a substring replace would corrupt
+    # unrelated names — the same reason ClangFusionStrategy overrides this.
+    def _lightweight_replace(self, code: str, var: str, bridge: str) -> str:
+        return replace_word_occurrences(code, var, bridge)
+
+    _GO_DECL_RE = re.compile(
+        r'\bvar\s+([A-Za-z_]\w*)|^\s*([A-Za-z_]\w*)\s*:=(?!=)', re.M)
+
+    def _lightweight_vars(self, code: str) -> List[str]:
+        """Declared names, rather than every identifier.
+
+        Package and type names read the same as variables lexically, and
+        renaming `fmt` to a local is a guaranteed parse failure rather than
+        an interesting one — see FusionStrategy._DATAFLOW_KEYWORDS for the
+        same argument about keywords.
+        """
+        names = []
+        for m in self._GO_DECL_RE.finditer(code):
+            names.append(m.group(1) or m.group(2))
+        return list(dict.fromkeys(n for n in names if n))
+
+    def _dedupe_toplevel(self, a_body: str, b_body: str, tag: str):
+        """Rename B's package-scope names that collide with A's.
+
+        Go rejects a redeclaration outright ("main redeclared in this
+        block"), and with two seeds each carrying `func main` that is the
+        common case rather than an edge one — left alone it would reject
+        nearly every fused pair in the parser.
+        """
+        collisions = go_toplevel_names(a_body) & go_toplevel_names(b_body)
+        for name in sorted(collisions):
+            b_body = replace_word_occurrences(b_body, name, f"{name}_{tag}",
+                                              )
+        return b_body, collisions
+
+    def fuse(self, parent_a: Seed, parent_b: Seed) -> Seed:
+        code_a, code_b = parent_a.content, parent_b.content
+        if self.mutation and self.mut:
+            code_a = self.mut.mutate(code_a)
+            code_b = self.mut.mutate(code_b)
+
+        pkg_a, imports_a, body_a = split_go_file(code_a)
+        pkg_b, imports_b, body_b = split_go_file(code_b)
+
+        tag = f"b{parent_b.id[:6]}"
+        body_b, collisions = self._dedupe_toplevel(body_a, body_b, tag)
+
+        body_a, body_b = self.interleave_code_blocks(
+            body_a, body_b,
+            (parent_a.metadata or {}).get("dataflows"),
+            (parent_b.metadata or {}).get("dataflows"))
+
+        # `package main` when either side is: only a main package can be
+        # linked, so preferring it keeps the child reachable by more of the
+        # toolchain than a library package would be.
+        package = "main" if "main" in (pkg_a, pkg_b) else (pkg_a or pkg_b or "main")
+        content = assemble_go_file(package, imports_a + imports_b, body_a, body_b)
+
+        return Seed(content=content, metadata={
+            "parents": [parent_a.id, parent_b.id],
+            "type": "go",
+            "extension": ".go",
+            "is_main": package == "main",
+            "renamed": sorted(collisions),
+            "description": f"Fused {parent_a.id} + {parent_b.id}",
+        })
+
+
+class GoStateFusionStrategy(GoFusionStrategy):
+    """
+    State fusion for Go (core/state_analysis.py): interleaves the two
+    seeds' segments at a profiled most-complex state rather than joining
+    them end to end.
+
+    The preamble handling is what differs from the other brace languages:
+    the package clause and imports must be hoisted out before the splice,
+    or the interleave drops an `import` block into the middle of a
+    function body.
+    """
+
+    def _state_prepare(self, host: Seed, donor: Seed):
+        pkg_h, imports_h, body_h = split_go_file(host.content)
+        pkg_d, imports_d, body_d = split_go_file(donor.content)
+        body_d, _ = self._dedupe_toplevel(body_h, body_d, f"d{donor.id[:6]}")
+        package = "main" if "main" in (pkg_h, pkg_d) else (pkg_h or pkg_d or "main")
+        return body_h, body_d, (package, imports_h + imports_d)
+
+    def _state_graft_donor(self, donor_body: str, donor_point) -> str:
+        from .state_analysis import truncate_to_balanced
+        lines = donor_body.splitlines()
+        start = (donor_point.line_idx + 1) if donor_point else 0
+        return "\n".join(lines[:truncate_to_balanced(donor_body, start, "go")])
+
+    def _state_assemble(self, context, fused_body, host, donor, direction, host_point):
+        package, imports = context
+        return assemble_go_file(package, imports, fused_body)
+
+    def _state_seed_metadata(self, host: Seed, donor: Seed) -> dict:
+        return {"type": "go", "extension": ".go"}
+
+    def fuse(self, parent_a: Seed, parent_b: Seed) -> Seed:
+        return self._build_state_fused(parent_a, parent_b, "ab")
+
+    def fuse_bidirectional(self, parent_a: Seed, parent_b: Seed) -> List[Seed]:
+        return [self._build_state_fused(parent_a, parent_b, "ab"),
+                self._build_state_fused(parent_b, parent_a, "ba")]
+
+
+class GoDeclarationFusionStrategy(GoFusionStrategy):
+    """
+    Declaration fusion for Go: injects a donor-declared type into the host
+    and points one of the host's declarations at it.
+
+    Go's type identity is structural for interfaces and nominal for named
+    types, and the compiler's type checker, escape analysis and shape
+    stenciling for generics all key off that — so a donated type reaching
+    an unrelated function's signature is a cheap way into paths that a
+    single seed rarely reaches.
+    """
+
+    # `type X struct {...}` / `type X interface {...}` / `type X = Y`,
+    # captured whole so the injection carries the body with it.
+    _GO_TYPE_DECL_RE = re.compile(
+        r'^type\s+(\w+)(?:\[[^\]]*\])?\s+(struct|interface)\s*\{.*?^\}',
+        re.M | re.S)
+    _GO_TYPE_ALIAS_RE = re.compile(r'^type\s+(\w+)\s*=?\s*([\w\[\]*.]+)\s*$', re.M)
+
+    def is_viable_pair(self, seed_a: Seed, seed_b: Seed) -> bool:
+        """Only pairs where the donor actually declares a type.
+
+        Without this the strategy silently degrades to plain concatenation
+        and the run reports declaration fusions that never injected
+        anything.
+        """
+        donor = seed_b.content or ""
+        return bool(self._GO_TYPE_DECL_RE.search(donor)
+                    or self._GO_TYPE_ALIAS_RE.search(donor))
+
+    def _donor_type(self, donor_body: str):
+        """A type name the donor declares. Only the name is needed: the
+        declaration stays where it is, in the donor's half of the file."""
+        decls = list(self._GO_TYPE_DECL_RE.finditer(donor_body))
+        if decls:
+            return random.choice(decls).group(1), None
+        aliases = list(self._GO_TYPE_ALIAS_RE.finditer(donor_body))
+        if aliases:
+            return random.choice(aliases).group(1), None
+        return None, None
+
+    def fuse(self, parent_a: Seed, parent_b: Seed) -> Seed:
+        pkg_a, imports_a, body_a = split_go_file(parent_a.content)
+        pkg_b, imports_b, body_b = split_go_file(parent_b.content)
+
+        tag = f"d{parent_b.id[:6]}"
+        body_b, _ = self._dedupe_toplevel(body_a, body_b, tag)
+        name, decl = self._donor_type(body_b)
+
+        host = body_a
+        if name:
+            # Embed the donor's type into one of the host's own structs, by
+            # *name* — the declaration is not copied across.
+            #
+            # Copying it was the first attempt and it cannot work: both
+            # bodies end up in the same package, so the host would then hold
+            # a second declaration of a type the donor body still declares,
+            # and Go rejects that outright ("other declaration of T", plus
+            # "method T.M already declared" for every method on it). Since
+            # they share a package, a bare reference already resolves.
+            #
+            # Embedding rather than replacing keeps the host type's own
+            # fields, so the result is a wider type rather than a
+            # differently-shaped one — more likely to still satisfy whatever
+            # used it, which is what puts the donated type in front of the
+            # type checker instead of stopping at a field-count error.
+            host_types = list(self._GO_TYPE_DECL_RE.finditer(host))
+            if host_types:
+                target = random.choice(host_types)
+                inner = target.group(0)
+                brace = inner.find("{")
+                if brace != -1:
+                    # The newline is load-bearing: `//` comments out the
+                    # rest of its line, so without it the tag swallows
+                    # whatever followed the opening brace.
+                    widened = (inner[:brace + 1]
+                               + f"\n\t{name}  {self._tag('declaration')}\n"
+                               + inner[brace + 1:].lstrip("\n"))
+                    host = host[:target.start()] + widened + host[target.end():]
+
+        package = "main" if "main" in (pkg_a, pkg_b) else (pkg_a or pkg_b or "main")
+        content = assemble_go_file(package, imports_a + imports_b, host, body_b)
+        return Seed(content=content, metadata={
+            "parents": [parent_a.id, parent_b.id],
+            "type": "go",
+            "extension": ".go",
+            "donated_type": name,
+            "description": f"Declaration-fused {parent_a.id} <- {parent_b.id}",
+        })
+
+
 # ==========================================
 # Strategy Factory (Updated)
 # ==========================================
@@ -7498,6 +7796,8 @@ STRATEGY_REGISTRY = {
     # the declaration technique.
     "rust":     _StrategySet("projects/rust",     RustFusionStrategy,
                              RustStructFusionStrategy, None, struct_alias=True),
+    "go":       _StrategySet("projects/go",       GoFusionStrategy,
+                             GoDeclarationFusionStrategy, GoStateFusionStrategy),
 }
 
 

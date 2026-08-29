@@ -1,0 +1,74 @@
+project_name: "go"
+
+execution:
+  # projects/go/driver.py builds the real command (module context, target,
+  # gcflags) per seed; this is only BaseDriver's fallback.
+  command: "go build {seed_path}"
+  timeout: 30          # cross-compiling for a cold target builds its stdlib
+  concurrency: 16
+  # Address-space cap per compilation, enforced with `ulimit -v`. A fused
+  # program can send the type checker into unbounded instantiation; without
+  # this the host OOM killer fires and can take the orchestrator with it.
+  mem_limit_mb: 4096
+
+analysis:
+  # These are the coarse net; projects/go/analyzer.py makes the actual
+  # decision and *subtracts* the resource-exhaustion shapes that match
+  # here but say nothing about Go (out of memory, signal: killed).
+  #
+  # Note "internal compiler error" alone is not enough: base.FatalfAt only
+  # prints it when no ordinary errors were reported first, so on fused
+  # input an ICE frequently arrives as a bare panic + stack instead. The
+  # panic/goroutine patterns are what catch those.
+  crash_patterns:
+    - "internal compiler error"
+    - "panic: "
+    - "fatal error: "
+    - "WARNING: DATA RACE"
+    - "runtime error:"
+    - "signal SIGSEGV"
+    - "unexpected fault address"
+    - "goroutine stack exceeds"
+    - "checkptr:"
+  # A fused Go program is usually ill-formed; an ordinary diagnostic is the
+  # expected outcome, not a finding. Go's are bare "file:line:col: msg", so
+  # these match the recurring compiler messages rather than a prefix.
+  syntax_patterns:
+    - "syntax error"
+    - "undefined:"
+    - "declared and not used"
+    - "imported and not used"
+    - "cannot use"
+    - "too many errors"
+
+paths:
+  seed_source: "projects/go/seeds"
+  seed_corpus: "projects/go/corpus.db"
+
+  seed_exclude_patterns:
+    # cgo seeds need a C toolchain for the target and cannot cross-compile;
+    # they also cannot be fused with a non-cgo seed into one file, because
+    # the `import "C"` preamble is position-sensitive.
+    - pattern: '(?m)^\s*import\s+"C"|^\s*//\s*#include'
+      reason: "uses cgo (import \"C\"), which cannot cross-compile or be fused"
+    # Files whose build constraints exclude every target this driver uses.
+    # They compile to an empty package, so every execution on them is spent
+    # learning nothing.
+    - pattern: '(?m)^//go:build\s+(?:ignore|never)\b'
+      reason: "//go:build ignore — never part of a build"
+    # Tests that only mean something as a whole directory: the companion
+    # files are not in the corpus, so these can never resolve.
+    - pattern: '(?m)^//\s*(?:rundir|compiledir|errorcheckdir|runindir)\b'
+      reason: "directory-based test; its companion files are not in the corpus"
+    # NOTE: `// errorcheck` files are deliberately NOT excluded. They are
+    # ill-formed on purpose, the way clang's -verify tests are, and the
+    # clang adapter does exclude those — but Go's compiler swallows an ICE
+    # whenever ordinary errors came first, so error-recovery paths are
+    # exactly where an under-tested crash can hide. driver.py passes
+    # -d=panic precisely to make those visible.
+
+llm:
+  provider: "deepseek"
+  model: "deepseek-v4-flash"
+  api_key: ""
+  timeout: 30
