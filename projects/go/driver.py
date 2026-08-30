@@ -29,6 +29,7 @@ target costs a environment variable and buys the whole backend surface.
 import os
 import random
 import shutil
+import threading
 import time
 
 from core.driver import BaseDriver, ExecutionResult
@@ -82,10 +83,24 @@ class GoDriver(BaseDriver):
     # which analyzer.classify files as resource exhaustion rather than a bug.
     DEFAULT_MEM_LIMIT_MB = 4096
 
+    # Ceiling on .fused/go-cache. See _trim_cache for why Go's own trimming
+    # cannot be relied on here.
+    DEFAULT_CACHE_LIMIT_MB = 8192
+    # Executions between size checks. The check walks the cache's 256 shards,
+    # so it is not free; it just has to run far more often than the cache
+    # takes to grow by its headroom.
+    DEFAULT_CACHE_CHECK_EVERY = 500
+    # Never evict an entry used more recently than this. cmd/go refreshes an
+    # entry's mtime on use but at most once per hour (mtimeInterval in
+    # src/cmd/go/internal/cache/cache.go), so an entry in active use can
+    # still carry an mtime up to an hour old. Evicting inside that window
+    # risks deleting a file a running build is about to open.
+    CACHE_GRACE_SECONDS = 3600
+
     def __init__(self, config):
         super().__init__(config)
-        mem_mb = config.get("execution", {}).get("mem_limit_mb",
-                                                 self.DEFAULT_MEM_LIMIT_MB)
+        exec_cfg = config.get("execution", {})
+        mem_mb = exec_cfg.get("mem_limit_mb", self.DEFAULT_MEM_LIMIT_MB)
         self.mem_limit_kb = int(mem_mb) * 1024
         self.goroot = os.path.join(self.ffl_root, "projects", "go", "go-src")
         self.go_bin = os.path.join(self.goroot, "bin", "go")
@@ -95,6 +110,21 @@ class GoDriver(BaseDriver):
         # rest take milliseconds.
         self.gocache = os.path.join(self.ffl_root, ".fused", "go-cache")
         os.makedirs(self.gocache, exist_ok=True)
+
+        # Disk containment. 0 (or negative) disables the cap entirely.
+        self.cache_limit_bytes = int(
+            exec_cfg.get("cache_limit_mb", self.DEFAULT_CACHE_LIMIT_MB)
+        ) * 1024 * 1024
+        self.cache_check_every = max(
+            1, int(exec_cfg.get("cache_check_every",
+                                self.DEFAULT_CACHE_CHECK_EVERY)))
+        # execute() runs on `concurrency` threads. The counter needs a lock of
+        # its own so that incrementing it never waits behind a trim in
+        # progress, and the trim needs one that non-participating threads can
+        # decline rather than queue on.
+        self._cache_counter_lock = threading.Lock()
+        self._cache_trim_lock = threading.Lock()
+        self._execs_since_cache_check = 0
 
     # ── command construction ──────────────────────────────────────────
 
@@ -125,15 +155,30 @@ class GoDriver(BaseDriver):
         # `go build -o /dev/null` is only legal for a main package; for a
         # library package `go build` compiles and discards on its own.
         out = "-o /dev/null " if facts["is_main"] else ""
+        # GOMEMLIMIT is a *soft* limit on the Go heap; `ulimit -v` below is a
+        # hard limit on total address space, which is strictly larger than the
+        # heap. Setting the two equal means the process hits the hard wall
+        # before the soft limit ever engages, so the runtime never gets the
+        # chance to collect harder and back off. Leaving headroom is what
+        # makes GOMEMLIMIT do anything at all.
+        soft_mem_mib = max(64, (self.mem_limit_kb // 1024) * 3 // 4)
         env = (
             f"GOROOT={self.goroot} GOCACHE={self.gocache} "
+            # Contain the toolchain's scratch space. Without this the link and
+            # assembly steps write go-build* directories under /tmp, and any
+            # execution alive when the orchestrator is SIGKILLed (which
+            # cleanup_stale_processes does by pattern, with the watchdog
+            # restarting it) leaves them there permanently. Pointed at the
+            # per-execution workdir, they are removed by the rmtree in
+            # execute()'s finally along with everything else.
+            f"GOTMPDIR={workdir} "
             f"GOOS={goos} GOARCH={goarch} "
             f"GOPROXY=off GOFLAGS=-mod=mod "
             # CGO off unless the seed asks for it: it needs a target C
             # toolchain that does not exist for the cross targets.
             f"CGO_ENABLED={'1' if facts['has_cgo'] else '0'} "
             # Keep a runaway compilation from taking the whole box down.
-            f"GOMEMLIMIT={self.mem_limit_kb // 1024}MiB "
+            f"GOMEMLIMIT={soft_mem_mib}MiB "
         )
         # `-gcflags=` without an `all=` prefix, deliberately: the prefixed
         # form applies the flags to every dependency including the standard
@@ -178,7 +223,141 @@ class GoDriver(BaseDriver):
         # when it writes test.sh; without it the fallback substitutes the
         # bare seed id and the saved reproducer is unrunnable.
         res.seed_file = seed_file
+        # Every distinct fused program leaves new entries in the shared build
+        # cache. Nothing else ever removes them; see _trim_cache.
+        self._trim_cache()
         return res
+
+    # ── disk containment ──────────────────────────────────────────────
+
+    def prepare_environment(self):
+        """Called once by the orchestrator before the fuzzing loop starts."""
+        self._sweep_stale_workdirs()
+        self._trim_cache(force=True)
+
+    def _sweep_stale_workdirs(self):
+        """Remove per-execution directories left by an earlier run.
+
+        execute() wipes its workdir in a `finally`, but that only runs if the
+        process lives long enough to reach it. cleanup_stale_processes kills
+        by pattern with SIGKILL and the watchdog restarts the orchestrator, so
+        whichever workdirs were live at that moment are orphaned — and nothing
+        else collects them. Safe to do here and only here: prepare_environment
+        runs before any execution thread starts, so no live workdir exists yet.
+        """
+        base = os.path.join(self.fused_base, self.project_name)
+        if not os.path.isdir(base):
+            return
+        removed = 0
+        try:
+            with os.scandir(base) as it:
+                for entry in it:
+                    if entry.is_dir(follow_symlinks=False):
+                        shutil.rmtree(entry.path, ignore_errors=True)
+                        removed += 1
+        except OSError:
+            return
+        if removed:
+            print(f"[go] swept {removed} stale workdir(s) from {base}")
+
+    def _cache_shard_entries(self):
+        """(mtime, size, path) for every file in the cache's 256 shards.
+
+        Only the shard directories are walked, so the cache's own bookkeeping
+        at the top level (trim.txt, README, lock) is never a candidate for
+        eviction.
+        """
+        entries = []
+        total = 0
+        for i in range(256):
+            shard = os.path.join(self.gocache, f"{i:02x}")
+            try:
+                with os.scandir(shard) as it:
+                    for e in it:
+                        try:
+                            if not e.is_file(follow_symlinks=False):
+                                continue
+                            st = e.stat(follow_symlinks=False)
+                        except OSError:
+                            continue
+                        entries.append((st.st_mtime, st.st_size, e.path))
+                        total += st.st_size
+            except OSError:
+                continue
+        return entries, total
+
+    def _trim_cache(self, force=False):
+        """Keep .fused/go-cache under execution.cache_limit_mb.
+
+        Why this is needed at all: cmd/go trims its own cache, but on a
+        schedule built for a developer's laptop rather than a fuzzer.
+        src/cmd/go/internal/cache/cache.go:
+
+            trimInterval  = 24 * time.Hour   // scan at most once a day
+            trimLimit     = 5 * 24 * time.Hour   // drop entries unused 5 days
+
+        So for the first five days of a continuous run Go deletes *nothing*,
+        and every distinct fused program has meanwhile added a fresh set of
+        entries — measured at ~36 KB for a small program. At this fuzzer's
+        throughput that is multiple GB per hour of monotonic growth, which is
+        what fills the disk. The per-target standard libraries are not the
+        problem: they are ~30 MB each and there are thirteen targets.
+
+        Eviction order is Go's own policy, oldest mtime first. cmd/go
+        refreshes an entry's mtime when it is used, so the stdlib entries —
+        the ones worth keeping and the expensive ones to rebuild — stay at the
+        young end while single-use fused-program entries age out. Entries
+        inside CACHE_GRACE_SECONDS are never touched, which is what keeps this
+        safe to run while builds are in flight.
+        """
+        if self.cache_limit_bytes <= 0:
+            return
+
+        if force:
+            self._cache_trim_lock.acquire()
+        else:
+            with self._cache_counter_lock:
+                self._execs_since_cache_check += 1
+                if self._execs_since_cache_check < self.cache_check_every:
+                    return
+                self._execs_since_cache_check = 0
+            # One trimmer is enough. A thread that arrives while a trim is
+            # already running skips its turn rather than serialising behind it.
+            if not self._cache_trim_lock.acquire(blocking=False):
+                return
+
+        try:
+            entries, total = self._cache_shard_entries()
+            if total <= self.cache_limit_bytes:
+                return
+            # Free down to 80% of the cap, so the next execution to check does
+            # not immediately trigger another full walk.
+            target = int(self.cache_limit_bytes * 0.8)
+            cutoff = time.time() - self.CACHE_GRACE_SECONDS
+            entries.sort()          # oldest mtime first
+            freed = removed = 0
+            for mtime, size, path in entries:
+                if total - freed <= target:
+                    break
+                if mtime > cutoff:
+                    # Sorted by mtime, so everything from here on is hot.
+                    break
+                try:
+                    os.remove(path)
+                except OSError:
+                    continue
+                freed += size
+                removed += 1
+            mib = 1024 * 1024
+            print(f"[go] build cache {total // mib} MiB over the "
+                  f"{self.cache_limit_bytes // mib} MiB cap: removed "
+                  f"{removed} entries, freed {freed // mib} MiB")
+            if total - freed > self.cache_limit_bytes:
+                print("[go] warning: build cache still over its cap - every "
+                      "remaining entry was used within the last hour. Raise "
+                      "execution.cache_limit_mb or lower concurrency.")
+        finally:
+            self._cache_trim_lock.release()
 
     # ── crash oracle ──────────────────────────────────────────────────
     #

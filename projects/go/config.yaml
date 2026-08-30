@@ -5,11 +5,24 @@ execution:
   # gcflags) per seed; this is only BaseDriver's fallback.
   command: "go build {seed_path}"
   timeout: 30          # cross-compiling for a cold target builds its stdlib
-  concurrency: 16
+  concurrency: 24
   # Address-space cap per compilation, enforced with `ulimit -v`. A fused
   # program can send the type checker into unbounded instantiation; without
   # this the host OOM killer fires and can take the orchestrator with it.
   mem_limit_mb: 4096
+  # Ceiling on the shared build cache at .fused/go-cache. cmd/go trims its
+  # own cache at most once a day and only drops entries unused for five days
+  # (trimInterval / trimLimit in src/cmd/go/internal/cache/cache.go), so on a
+  # continuous run it reclaims nothing for the first five days while every
+  # distinct fused program keeps adding entries. projects/go/driver.py
+  # enforces this cap instead, evicting oldest-used-first the way cmd/go
+  # does. Set to 0 to disable. The floor is roughly 400 MB: the thirteen
+  # target standard libraries are ~30 MB each and are worth keeping resident.
+  cache_limit_mb: 8192
+  # Executions between cache size checks. Each check walks the cache's 256
+  # shard directories, so it should be rare relative to execution but
+  # frequent relative to how fast the cache grows by its headroom.
+  cache_check_every: 500
 
 analysis:
   # These are the coarse net; projects/go/analyzer.py makes the actual
