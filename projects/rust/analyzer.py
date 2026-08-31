@@ -243,6 +243,12 @@ _SAFE_FLAG_RE = re.compile(
     r'^-(?:C\s*[\w=-]+|Z\s*[\w=-]+|O|g|W\s*[\w-]+|A\s*[\w-]+|D\s*[\w-]+)$'
     r'|^--edition=\d+$')
 
+# `-Ztreat-err-as-bug` aborts the compiler at the first emitted diagnostic on
+# purpose, so any ordinary user error becomes a panic in rustc_errors. Seeds
+# under tests/ui/treat-err-as-bug/ carry it in their own compile-flags; letting
+# it through turns every syntax or type error into a bogus finding.
+_DENIED_FLAG_RE = re.compile(r'^-Z\s*treat-err-as-bug(=|$)')
+
 _UNSAFE_BLOCK_RE = re.compile(r'\bunsafe\s*(?:\{|fn\b|impl\b|trait\b)')
 _RAW_PTR_RE = re.compile(r'\*(?:const|mut)\s+\w')
 _TRANSMUTE_RE = re.compile(r'\btransmute\b|\bfrom_raw_parts\b|\bMaybeUninit\b'
@@ -265,7 +271,8 @@ def compile_flags_of(content):
     m = _COMPILE_FLAGS_RE.search(content or "")
     if not m:
         return []
-    return [f for f in m.group(1).split() if _SAFE_FLAG_RE.match(f)][:6]
+    return [f for f in m.group(1).split()
+            if _SAFE_FLAG_RE.match(f) and not _DENIED_FLAG_RE.match(f)][:6]
 
 
 def analyze_seed(content, filename=""):

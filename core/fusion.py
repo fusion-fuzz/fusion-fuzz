@@ -4476,19 +4476,39 @@ class RustFusionStrategy(RustLexMixin, FusionStrategy):
             inner = f"unsafe {{\n{inner}\n}}"
         return f"'{label}: {{\n{inner}\n}}"
 
+    # Substituting a whole body at every call site multiplies the body once
+    # per function processed, and the copies carry call sites of the functions
+    # still to come — so the cost is the product of the per-function call
+    # counts, not their sum. tests/ui/async-await/deep-futures-are-freeze.rs is
+    # the worst case in the rust corpus: main0 calls main1 and main2, main1
+    # calls main2 and main3, and so on to main40, which makes the call-site
+    # count literally Fibonacci. main24 already needs 75,025 sites and 9 MB;
+    # main40 needs 10^8 and never finishes. Budget the work rather than trust
+    # the shape of the input.
+    _INLINE_MAX_BODY = 100_000   # chars of main_body
+    _INLINE_MAX_SITES = 2_000    # call sites spliced across all functions
+
     def _inline_calls_in_body(self, main_body: str, fn_defs: list, uid: str) -> str:
         """Replace direct calls to any inlinable fn in fn_defs with its
-        flattened labeled-block body, substituting the real call arguments."""
+        flattened labeled-block body, substituting the real call arguments.
+
+        Inlining stops early once the budget above is spent; the partially
+        inlined body is still well-formed, since every splice replaces a
+        complete call expression.
+        """
         uid = re.sub(r'[^a-zA-Z0-9_]', '_', uid)
         counter = 0
         for fn in fn_defs:
+            if len(main_body) > self._INLINE_MAX_BODY or counter >= self._INLINE_MAX_SITES:
+                break
             params = self._parse_params(fn['params_text'])
             if not self._fn_is_inlinable(fn, params):
                 continue
             # Compute the literal mask once per function and locate every
-            # call site up front, then splice back-to-front so earlier
-            # offsets stay valid — avoids re-scanning the whole (growing)
-            # body from scratch for every single occurrence.
+            # call site up front, then rebuild the body in a single forward
+            # pass — avoids re-scanning the whole (growing) body from scratch
+            # for every single occurrence, and keeps one pass O(len) rather
+            # than O(len x sites).
             is_real = self._rust_real_mask(main_body)
             call_re = re.compile(r'\b' + re.escape(fn['name']) + r'\s*\(')
             spans = []
@@ -4499,12 +4519,35 @@ class RustFusionStrategy(RustLexMixin, FusionStrategy):
                 close_paren = self._rust_matching_close(main_body, is_real, open_paren, '(', ')')
                 if close_paren is not None:
                     spans.append((cand.start(), open_paren, close_paren))
-            for start, open_paren, close_paren in reversed(spans):
+            if not spans:
+                continue
+            del spans[max(0, self._INLINE_MAX_SITES - counter):]
+            out = []
+            prev = 0
+            grown = 0
+            for start, open_paren, close_paren in spans:
+                # A call nested in an outer call's arguments is already
+                # carried along inside args_text; splicing it separately
+                # would use offsets the outer splice has invalidated.
+                if start < prev:
+                    continue
+                # The per-function check above bounds where this pass starts,
+                # not where it ends: one pass over a body just under the cap
+                # can still multiply it by the number of call sites. Stop
+                # substituting once this pass has added a body's worth, and
+                # leave the remaining call sites as plain calls.
+                if grown > self._INLINE_MAX_BODY:
+                    break
                 args_text = main_body[open_paren + 1:close_paren]
                 counter += 1
                 label = f"ffl_{uid}_{fn['name']}_{counter}"
                 replacement = self._flatten_fn_call(fn, params, args_text, label)
-                main_body = main_body[:start] + replacement + main_body[close_paren + 1:]
+                grown += len(replacement) - (close_paren + 1 - start)
+                out.append(main_body[prev:start])
+                out.append(replacement)
+                prev = close_paren + 1
+            out.append(main_body[prev:])
+            main_body = "".join(out)
         return main_body
 
     def _flatten_and_extract_main(self, body: str, main_name, uid: str):
