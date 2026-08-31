@@ -1,0 +1,59 @@
+project_name: "tint"
+
+execution:
+  # projects/tint/driver.py builds the real command (backend, flags,
+  # sanitizer env) per seed; this is only BaseDriver's fallback.
+  command: "tint {seed_path}"
+  # tint compiles a small shader in milliseconds, but an assert+IR-validate
+  # debug build is slower, and a fused shader can nest deeply enough to be
+  # slow to parse. Enough to be sure a timeout is a hang.
+  timeout: 20
+  concurrency: 16
+  # Resident-memory cap per execution, enforced with ASan's
+  # hard_rss_limit_mb — deliberately NOT `ulimit -v`. The build is ASan,
+  # and ASan reserves ~20 TB of virtual address space for shadow memory at
+  # startup, so any `ulimit -v` low enough to be a useful cap kills tint
+  # before it runs: every execution fails identically.
+  mem_limit_mb: 4096
+
+analysis:
+  # The coarse net. projects/tint/analyzer.py makes the actual decision and
+  # subtracts the shapes that match here but say nothing about tint — above
+  # all resource exhaustion.
+  crash_patterns:
+    - "internal compiler error"
+    - "TINT_ASSERT"
+    - "TINT_UNREACHABLE"
+    - "TINT_UNIMPLEMENTED"
+    - "AddressSanitizer"
+    - "UndefinedBehaviorSanitizer"
+    - "runtime error:"
+    - "Segmentation fault"
+    - "Illegal instruction"
+  # A fused WGSL program is usually ill-formed, and an ordinary diagnostic
+  # is the *expected* outcome, not a finding. tint's are
+  # "file:line:col error: msg", so these match the recurring messages.
+  syntax_patterns:
+    - "error:"
+    - "unresolved"
+    - "no matching"
+    - "cannot"
+    - "must be"
+    - "expected"
+
+paths:
+  seed_source: "projects/tint/seeds"
+  seed_corpus: "projects/tint/corpus.db"
+
+  seed_exclude_patterns:
+    # A shader whose declared correct outcome is a specific diagnostic —
+    # tint's own negative tests. Fusing them produces a program whose
+    # success criterion no longer exists.
+    - pattern: '(?m)^\s*//\s*(?:expected-error|CHECK|RUN):'
+      reason: "negative test: its correct outcome is a specific diagnostic"
+
+llm:
+  provider: "deepseek"
+  model: "deepseek-v4-flash"
+  api_key: ""
+  timeout: 30
