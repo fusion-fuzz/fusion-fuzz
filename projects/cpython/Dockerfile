@@ -65,6 +65,11 @@ RUN apt-get update && \
     && rm -rf /var/lib/apt/lists/* \
     && rm llvm.sh
 
+# FusionFuzz's own dependencies. main.py imports yaml at startup, so
+# without these the container builds CPython fine and then cannot run the
+# fuzzer at all.
+RUN python3.12 -m pip install --no-cache-dir pyyaml requests
+
 # Set Clang 21 as the default compiler environment variables
 ENV CC=clang-21
 ENV CXX=clang++-21

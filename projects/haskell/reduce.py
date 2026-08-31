@@ -9,7 +9,24 @@ import sys
 # root on sys.path.
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".."))
 
-from projects.haskell.setup import _COMPILE_ERROR_MARKERS
+# GHC diagnostics that mean the reduction produced code that no longer
+# compiles, rather than code that still crashes the compiler.
+#
+# Defined here rather than imported. It used to come from
+# projects/haskell/setup.py, which no longer defines it — the import made
+# this whole file unimportable, so the Haskell reducer could not be run at
+# all. The list mirrors `analysis.syntax_patterns` in
+# projects/haskell/config.yaml, which is the project's own answer to the
+# same question.
+_COMPILE_ERROR_MARKERS = (
+    "parse error",
+    "error:",
+    "Variable not in scope",
+    "Couldn't match expected type",
+    "No instance for",
+    "Ambiguous type variable",
+    "Not in scope",
+)
 
 stdouterr = None
 
@@ -39,7 +56,7 @@ def _load_crash_patterns():
 
 
 # Function to run the test command and check for bug presence
-def run_test(cmd, bug_output):
+def run_test(cmd, bug_output, timeout=15):
     """
     Executes the provided `ghc -fno-code` command and checks if the
     expected crash marker (a GHC panic / internal-error string) appears
@@ -58,7 +75,7 @@ def run_test(cmd, bug_output):
     try:
         result = subprocess.run(
             cmd, shell=True, capture_output=True, text=True,
-            encoding="utf-8", errors="replace", timeout=15,
+            encoding="utf-8", errors="replace", timeout=timeout,
         )
     except Exception:
         return False
@@ -140,7 +157,7 @@ def further_minimize_testcase(lines, bug_output, testpath, reproduce_cmd):
     return lines
 
 
-def minimize_ghc_flags(testpath, ghc_bin, ghc_flags, bug_output):
+def reduce_flags(flags, bug_output, testpath, ghc_bin, env_prefix=""):
     """
     Drops extra -O.../-X... flags one at a time while the crash still
     reproduces — the Haskell analogue of PHP's -d ini-flag reduction,
@@ -148,12 +165,12 @@ def minimize_ghc_flags(testpath, ghc_bin, ghc_flags, bug_output):
     (see HaskellDriver.GHC_FLAG_SETS). -fno-code -v0 are always kept
     (that's the fixed, non-negotiable invocation the driver itself uses).
     """
-    reduced = list(ghc_flags)
+    reduced = list(flags)
     while True:
         found_shorter = False
         for i in range(len(reduced)):
             candidate = reduced[:i] + reduced[i + 1:]
-            cmd = " ".join([ghc_bin, *candidate, testpath])
+            cmd = env_prefix + " ".join([ghc_bin, *candidate, testpath])
             if run_test(cmd, bug_output) or run_test(cmd, bug_output) or run_test(cmd, bug_output):
                 reduced = candidate
                 found_shorter = True
@@ -163,7 +180,7 @@ def minimize_ghc_flags(testpath, ghc_bin, ghc_flags, bug_output):
     return reduced
 
 
-def reduce_haskell(testpath, ghc_bin, ghc_flags, bug_output):
+def reduce_haskell(testpath, ghc_bin, ghc_flags, bug_output, env_prefix=""):
     """
     Minimizes a Haskell crash reproducer:
       1. Confirms `ghc -fno-code` on the reproducer actually triggers
@@ -173,7 +190,7 @@ def reduce_haskell(testpath, ghc_bin, ghc_flags, bug_output):
       3. Drops unnecessary extra flags while the crash still holds.
     Returns (minimized_source, minimized_ghc_flags).
     """
-    reproduce_cmd = " ".join([ghc_bin, *ghc_flags, testpath])
+    reproduce_cmd = env_prefix + " ".join([ghc_bin, *ghc_flags, testpath])
 
     # Initial test to verify if the reproduce command triggers the bug
     if not run_test(reproduce_cmd, bug_output) and not run_test(reproduce_cmd, bug_output) and not run_test(reproduce_cmd, bug_output):
@@ -204,9 +221,14 @@ def reduce_haskell(testpath, ghc_bin, ghc_flags, bug_output):
                 break
 
         reduced_hs = "\n".join(further_minimized_lines)
-        reduced_flags = minimize_ghc_flags(testpath, ghc_bin, ghc_flags, bug_output)
+        reduced_flags = reduce_flags(
+            ghc_flags, bug_output, testpath, ghc_bin, env_prefix)
 
         return reduced_hs, reduced_flags
+
+
+# Previous name, kept so anything importing it keeps working.
+minimize_ghc_flags = reduce_flags
 
 
 if __name__ == "__main__":

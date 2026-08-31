@@ -157,7 +157,16 @@ PRE_ANALYSIS_KEYS = ("most_complex_states", "segment_boundaries")
 #   2  cap removed (every line is a candidate anchor), _is_safe gate dropped
 #   3  cap reinstated at 100/seed — uncapped pushed corpus.db to 488 MB on
 #      the long tail (one seed cached 9230 points) for no measured gain
-PRE_ANALYSIS_VERSION = 3
+# Bumped twice while fixing core/state_analysis._compute_segment_boundaries,
+# which now rejects two kinds of cut it used to offer:
+#   4: immediately before a continuation clause (elif/else/except/finally/
+#      catch), which severs the clause from the header that owns it.
+#   5: anywhere inside a string or comment. A triple-quoted string changes
+#      no paren depth and its prose is often unindented, so every docstring
+#      line looked like a legal boundary.
+# A stale cache is worse than none here: it silently overrides the
+# corrected computation with the indices the old one produced.
+PRE_ANALYSIS_VERSION = 5
 
 # Keys written by builds whose semantics no longer match what the code
 # reads. states_of_interest held only the maximum-live-variable points
@@ -709,6 +718,46 @@ class GenericMetadataCollector(BaseMetadataCollector):
 
 
 # ---------------------------------------------------------------------------
+# JavaScript / V8
+# ---------------------------------------------------------------------------
+
+class JavaScriptMetadataCollector(BaseMetadataCollector):
+    """Static facts about a JS seed.
+
+    Unlike the Go and Rust collectors there is no type inference to do —
+    JavaScript declarations carry no type — so this records what a *V8*
+    seed is worth knowing for: which functions exist (declaration fusion
+    needs a callable to point at), and how much of the engine's
+    optimising, memory and internals surface the file touches.
+    """
+
+    language = "javascript"
+
+    _FUNC_RE    = re.compile(r'\bfunction\s*\*?\s*([A-Za-z_$][\w$]*)\s*\(')
+    _CLASS_RE   = re.compile(r'\bclass\s+([A-Za-z_$][\w$]*)')
+    # let/const are the block-scoped forms that make a redeclaration a
+    # SyntaxError, so they are the ones fusion has to track.
+    _LEXICAL_RE = re.compile(r'^(?:let|const)\s+([A-Za-z_$][\w$]*)', re.M)
+    # V8's %-prefixed runtime functions: the unsafe surface.
+    _NATIVES_RE = re.compile(r'%([A-Z]\w*)\s*\(')
+    _TYPED_RE   = re.compile(
+        r'\b(?:ArrayBuffer|SharedArrayBuffer|DataView|Atomics|'
+        r'(?:Ui|I)nt(?:8|16|32)Array|Float(?:32|64)Array|BigInt64Array)\b')
+
+    def static_collect(self, content: str, filename: str = "") -> dict:
+        natives = self._NATIVES_RE.findall(content)
+        return {
+            "function_names": self._FUNC_RE.findall(content),
+            "class_names":    self._CLASS_RE.findall(content),
+            "lexical_names":  self._LEXICAL_RE.findall(content),
+            "natives":        sorted(set(natives)),
+            "natives_count":  len(natives),
+            "typed_array_count": len(self._TYPED_RE.findall(content)),
+            "line_count":     len(content.splitlines()),
+        }
+
+
+# ---------------------------------------------------------------------------
 # Collector registry
 # ---------------------------------------------------------------------------
 
@@ -717,6 +766,10 @@ _COLLECTORS: Dict[str, BaseMetadataCollector] = {
     "python":  PythonMetadataCollector(),
     "cpython": PythonMetadataCollector(),
     "go":      GoMetadataCollector(),
+    "javascript": JavaScriptMetadataCollector(),
+    "js":      JavaScriptMetadataCollector(),
+    "v8":      JavaScriptMetadataCollector(),
+    "spidermonkey": JavaScriptMetadataCollector(),
     "mlir":    MLIRMetadataCollector(),
     "wgsl":    WGSLMetadataCollector(),
     "naga":    WGSLMetadataCollector(),

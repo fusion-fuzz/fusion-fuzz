@@ -60,6 +60,9 @@ LANGUAGE_ALIASES: Dict[str, str] = {
     "flang": "flang", "fortran": "flang", "f90": "flang",
     "mlir": "mlir",
     "naga": "naga", "wgsl": "naga",
+    "javascript": "javascript", "js": "javascript",
+    "mjs": "javascript", "v8": "javascript",
+    "spidermonkey": "javascript", "sm": "javascript",
 }
 
 
@@ -145,6 +148,25 @@ LIVE_VAR_CONFIGS: Dict[str, LiveVarConfig] = {
         mode="brace",
         declare=[r'\b(?:var|let)\s+([A-Za-z_]\w*)'],
     ),
+    # JavaScript scopes `let`/`const` to the enclosing `{}`, so the
+    # brace-stack model applies to them exactly. `var` is the exception —
+    # it is function-scoped and hoisted, so a var declared inside a block
+    # is dropped at that block's `}` when it is really still live. That is
+    # a known over-count rather than an oversight: modelling hoisting
+    # properly needs a parse, and `var` is the minority form in the mjsunit
+    # corpus. No decrement — JavaScript's `delete` removes an object
+    # property, not a binding.
+    "javascript": LiveVarConfig(
+        mode="brace",
+        declare=[
+            r'\b(?:let|const|var)\s+([A-Za-z_$][\w$]*)',
+            r'\bfunction\s*\*?\s*([A-Za-z_$][\w$]*)',
+            r'\bclass\s+([A-Za-z_$][\w$]*)',
+            r'\bfor\s*\(\s*(?:let|const|var)\s+([A-Za-z_$][\w$]*)',
+            r'\bcatch\s*\(\s*([A-Za-z_$][\w$]*)\s*\)',
+        ],
+        multi_name=False,
+    ),
     # Go scopes names to their enclosing `{}`, so the brace-stack model
     # applies. `:=` is the dominant declaration form by a wide margin;
     # `var` and the range/type-switch binders cover the rest. No decrement:
@@ -187,6 +209,12 @@ _LEXICON = {
     "php":     {"line": ["//", "#"], "block": [("/*", "*/")], "quotes": ['"', "'"]},
     "cpython": {"line": ["#"], "block": [], "quotes": ['"""', "'''", '"', "'"]},
     "go":      {"line": ["//"], "block": [("/*", "*/")], "quotes": ['"', "`"]},
+    # Template literals make the backtick a string delimiter in JS, and
+    # regex literals are deliberately not modelled: telling `/` division
+    # from a regex needs parse context, and treating it as a quote would
+    # swallow arbitrary code.
+    "javascript": {"line": ["//"], "block": [("/*", "*/")],
+                   "quotes": ['"', "'", "`"]},
     "clang":   {"line": ["//"], "block": [("/*", "*/")], "quotes": ['"', "'"]},
     "swift":   {"line": ["//"], "block": [("/*", "*/")], "quotes": ['"']},
     "haskell": {"line": ["--"], "block": [("{-", "-}")], "quotes": ['"']},
@@ -660,6 +688,16 @@ def segment_boundaries(content: str, language: str) -> List[int]:
     return list(_segment_boundaries_cached(content, language))
 
 
+# Keywords that *continue* a compound statement rather than starting one.
+# A cut immediately before any of them separates the clause from its
+# header, which is a syntax error in every language here — Python's
+# `elif`/`else`/`except`/`finally`/`case`, and the brace languages'
+# `else`/`catch`/`finally`/`while` (the tail of a do-while).
+_CONTINUATION_RE = re.compile(
+    r'^(?:\}\s*)?(?:elif|else|except|finally|case|catch|while)\b'
+    r'|^\}\s*(?:else|catch|finally|while)?\s*[;{]?\s*$')
+
+
 def _compute_segment_boundaries(content: str, language: str) -> List[int]:
     """Line indices after which `content` can be cut into two independently
     well-formed statement sequences.
@@ -698,10 +736,33 @@ def _compute_segment_boundaries(content: str, language: str) -> List[int]:
         end = min(offsets[i] + len(line), len(depth) - 1)
         if depth[end] != 0:
             continue
+        # The cut must not land inside a string or comment. `mask` already
+        # records that (it is what keeps parens inside strings out of the
+        # depth count), but it was only ever consulted for the depth.
+        #
+        # A triple-quoted string does not change paren depth and its prose
+        # is often unindented, so every line of a docstring or of embedded
+        # test data satisfied both tests above and was offered as a legal
+        # boundary. Cutting there ends the prefix mid-literal and leaves
+        # the suffix's prose as bare code — "unterminated string literal",
+        # or an email header parsed as an expression. On the CPython corpus
+        # this was the whole of the remaining syntax failures once
+        # continuation clauses were handled.
+        if end < len(mask) and not mask[end]:
+            continue
         if indentation_scoped:
             nxt = _next_nonblank(i)
             if nxt is not None and nxt[:1].isspace():
                 continue
+        # A continuation clause is at the same indentation (and, for brace
+        # languages, the same delimiter depth) as the header it belongs to,
+        # so neither test above rejects it — yet cutting here severs
+        # `elif`/`else`/`except` from the `if`/`try` that owns it. On the
+        # CPython corpus this was 58 of 66 remaining parse failures: the
+        # four-segment interleave kept splitting top-level if/elif chains.
+        nxt = _next_nonblank(i)
+        if nxt is not None and _CONTINUATION_RE.match(nxt.lstrip()):
+            continue
         out.append(i)
     return out
 

@@ -4,7 +4,7 @@ import subprocess
 stdouterr = None
 
 
-def run_test(cmd, bug_output):
+def run_test(cmd, bug_output, timeout=15):
     """
     Execute the provided Naga command and check whether the expected bug
     output appears in stdout/stderr.
@@ -16,7 +16,7 @@ def run_test(cmd, bug_output):
             capture_output=True,
             text=True,
             errors="replace",
-            timeout=15,
+            timeout=timeout,
         )
     except Exception:
         return False
@@ -81,13 +81,13 @@ def further_minimize_testcase(lines, bug_output, testpath, reproduce_cmd):
     return lines
 
 
-def reduce_backend_args(backend_args, bug_output, testpath, nagapath, env_prefix):
+def reduce_flags(flags, bug_output, testpath, nagapath, env_prefix):
     """
     Try removing optional Naga backend/output arguments. The input path is
-    always preserved; backend_args is usually empty or an output file/profile
+    always preserved; flags is usually empty or an output file/profile
     suffix copied from the original crash command.
     """
-    reduced = backend_args.split()
+    reduced = flags.split()
     changed = True
     while changed:
         changed = False
@@ -135,10 +135,15 @@ def reduce_naga(testpath, nagapath, backend_args, bug_output, env_prefix=""):
     reduced_wgsl = "\n".join(further_minimized_lines)
 
     print("reducing naga backend args")
-    reduced_backend_args = reduce_backend_args(
+    reduced_backend_args = reduce_flags(
         backend_args, bug_output, testpath, nagapath, env_prefix)
 
     return reduced_wgsl, reduced_backend_args.strip("\n")
+
+
+# Naga takes backend selectors rather than compiler flags, but the
+# reducer interface is the shared one; the old name stays as an alias.
+reduce_backend_args = reduce_flags
 
 
 if __name__ == "__main__":

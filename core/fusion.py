@@ -1,4 +1,5 @@
 import abc
+import ast
 import uuid
 import random
 import sqlite3
@@ -234,11 +235,36 @@ class FusionStrategy(abc.ABC):
         host_body, donor_body, context = self._state_prepare(host, donor)
         lightweight = self.STATE_FORCE_LIGHTWEIGHT or getattr(self, "lightweight", False)
 
+        # --pre-analysis caches `most_complex_states` and
+        # `segment_boundaries` as *line indices into the seed's original
+        # content*. _state_prepare may return a body that is no longer that
+        # text — every language that hoists a preamble does exactly this:
+        # CPython strips module-level imports, Swift its `import` lines,
+        # Rust its crate attributes and `use`s, Go its package clause. Each
+        # removed line shifts every index below it, so a cut computed as
+        # "between two top-level statements" lands somewhere else entirely.
+        #
+        # Measured on the CPython Lib corpus that put 52 of 116
+        # four-segment children inside a compound statement — `if:` and
+        # `class:` headers left with no body, `return` outside a function.
+        #
+        # Recomputing costs a scan of one body; using a stale index costs
+        # the child. The cache still applies wherever _state_prepare is a
+        # no-op, which is where it was doing the work anyway.
+        host_cache = ((host.metadata or {}).get("most_complex_states")
+                      if host_body == host.content else None)
+        donor_cache = ((donor.metadata or {}).get("most_complex_states")
+                       if donor_body == donor.content else None)
+        host_bounds = ((host.metadata or {}).get("segment_boundaries")
+                       if host_body == host.content else None)
+        donor_bounds = ((donor.metadata or {}).get("segment_boundaries")
+                        if donor_body == donor.content else None)
+
         host_point = pick_state_point(host_body, self.LANGUAGE, self.project_root,
-                                      cached=(host.metadata or {}).get("most_complex_states"),
+                                      cached=host_cache,
                                       lightweight=lightweight)
         donor_point = pick_state_point(donor_body, self.LANGUAGE, self.project_root,
-                                       cached=(donor.metadata or {}).get("most_complex_states"),
+                                       cached=donor_cache,
                                        lightweight=lightweight)
         if host_point is None:
             lines = host_body.splitlines()
@@ -251,8 +277,8 @@ class FusionStrategy(abc.ABC):
         woven = interleave_segments(
             host_body, donor_body, host_point, donor_point, self.LANGUAGE,
             tag_comment=self._tag("state"),
-            a_boundaries=(host.metadata or {}).get("segment_boundaries"),
-            b_boundaries=(donor.metadata or {}).get("segment_boundaries"))
+            a_boundaries=host_bounds,
+            b_boundaries=donor_bounds)
         if woven is not None:
             fused_body, segments = woven
             seg_meta = segments.to_metadata()
@@ -1638,15 +1664,92 @@ class CPythonFusionStrategy(FusionStrategy):
         # read self.lightweight for its own pick_state_point() calls.
         self.lightweight = lightweight
 
+    # Only a *module-level* import may be hoisted: it must start at column
+    # zero. `import` inside a block belongs to that block. Used as the
+    # fallback when `code` does not parse.
+    _PY_TOPLEVEL_IMPORT_RE = re.compile(r'^(?:import|from)\s')
+
+    @staticmethod
+    def _py_import_spans(code):
+        """(start, end) line spans of `code`'s module-level import
+        statements, or None if it does not parse.
+
+        Spans, not lines: a parenthesised import runs across several.
+
+            from typing import (
+                Foo,
+                Bar,
+            )
+
+        Matching only the first line hoists `from typing import (` and
+        leaves the rest behind, so both halves are syntax errors. That was
+        53 of ~70 remaining parse failures on the CPython Lib corpus —
+        larger than every other cause combined.
+        """
+        try:
+            tree = ast.parse(code)
+        except SyntaxError:
+            return None
+        spans = []
+        for node in tree.body:
+            if isinstance(node, (ast.Import, ast.ImportFrom)):
+                spans.append((node.lineno - 1,
+                              getattr(node, "end_lineno", node.lineno)))
+        return spans
+
     def _extract_imports_and_body(self, code):
+        """Split module-level imports out of `code`, leaving nested ones.
+
+        The indentation test is the whole point. This previously hoisted
+        every line whose *stripped* form began with `import`/`from`, at any
+        depth, and appended the de-indented text to the module's import
+        list. Two things broke at once:
+
+          * The block it came from was left empty. A conditional import —
+
+                try:
+                    import _md5
+                except ImportError:
+                    ...
+
+            became `try:` immediately followed by `except`, which is
+            "IndentationError: expected an indented block after 'try'
+            statement". Measured on the CPython Lib corpus this was the
+            single largest cause of invalid children.
+
+          * The import stopped being conditional. Hoisting it to module
+            level turns "use this if available" into a hard dependency, so
+            the child fails on any machine without the module — including
+            the one it was fused on.
+        """
+        lines = code.splitlines()
+        spans = self._py_import_spans(code)
+        if spans is None:
+            # Host `ast` is older than the interpreter under test, so this
+            # runs on valid code often enough to matter. Track parenthesis
+            # depth: a `from x import (` continues across lines, and
+            # hoisting only its first line leaves both halves broken.
+            imports, body_lines, depth, buf = [], [], 0, []
+            for line in lines:
+                if depth == 0 and not buf:
+                    if not self._PY_TOPLEVEL_IMPORT_RE.match(line):
+                        body_lines.append(line)
+                        continue
+                buf.append(line)
+                depth += line.count("(") - line.count(")")
+                if depth <= 0 and not line.rstrip().endswith("\\"):
+                    imports.append("\n".join(buf))
+                    buf, depth = [], 0
+            if buf:                      # unbalanced; keep it in the body
+                body_lines.extend(buf)
+            return "\n".join(body_lines), imports
+
+        hoisted = set()
         imports = []
-        body_lines = []
-        for line in code.splitlines():
-            stripped = line.strip()
-            if stripped.startswith("import ") or stripped.startswith("from "):
-                imports.append(stripped)
-            else:
-                body_lines.append(line)
+        for start, end in spans:
+            imports.append("\n".join(lines[start:end]))
+            hoisted.update(range(start, end))
+        body_lines = [ln for i, ln in enumerate(lines) if i not in hoisted]
         return "\n".join(body_lines), imports
 
     def _instrumentation_builtins(self, defined_vars):
@@ -2200,31 +2303,105 @@ except Exception as _e:
         selected = random.choice(phases)
         return '\n' + selected + '\n'
 
-    def _splice_functions_or_classes(self, code1, code2, fusion_rhs="0"):
-        def get_blocks(code):
-            blocks = []
-            imports = []
-            current_block = []
-            for line in code.splitlines():
-                if line.startswith("import ") or line.startswith("from "):
-                    imports.append(line)
-                elif line.strip() and not line.startswith(" "):
-                    if current_block:
-                        block_str = "\n".join(current_block)
-                        if block_str.strip().endswith(":"): block_str += "\n    pass"
-                        blocks.append(block_str)
-                        current_block = []
-                    current_block.append(line)
-                elif line.strip():
-                    current_block.append(line)
-            if current_block:
-                block_str = "\n".join(current_block)
-                if block_str.strip().endswith(":"): block_str += "\n    pass"
-                blocks.append(block_str)
-            return imports, blocks
+    # Keywords that continue the statement above them at the same
+    # indentation. A column-zero line starting with one of these is not a
+    # new top-level block, and cutting before it orphans it.
+    _PY_CONTINUATION_KW = ("except", "else", "elif", "finally", "case")
 
-        imports1, blocks1 = get_blocks(code1)
-        imports2, blocks2 = get_blocks(code2)
+    @staticmethod
+    def _py_blocks_by_indent(lines):
+        """Split top-level statements without parsing.
+
+        Groups a column-zero line with everything indented under it, and
+        keeps together the three things a naive "column zero starts a
+        block" rule tears apart: a decorator and the def it decorates, a
+        `try` and its `except`/`finally`, and an `if` and its `else`.
+        """
+        blocks, current, pending_decorators = [], [], []
+
+        def flush():
+            if current:
+                blocks.append("\n".join(current))
+                current.clear()
+
+        for line in lines:
+            stripped = line.strip()
+            starts_toplevel = bool(stripped) and not line[:1].isspace()
+            if starts_toplevel:
+                first = stripped.split("(")[0].split()[0].rstrip(":")
+                if stripped.startswith("@"):
+                    # A decorator belongs to whatever follows it.
+                    flush()
+                    pending_decorators.append(line)
+                    continue
+                if first in CPythonFusionStrategy._PY_CONTINUATION_KW:
+                    # Continues the block above; do not start a new one.
+                    current.append(line)
+                    continue
+                flush()
+                current.extend(pending_decorators)
+                pending_decorators.clear()
+                current.append(line)
+            else:
+                # Indented or blank: part of the current block. Blank lines
+                # are kept rather than dropped — removing them changes line
+                # numbers, and the cached state indices are line-based.
+                if current or pending_decorators:
+                    current.append(line)
+        current.extend(pending_decorators)
+        flush()
+        return [b for b in blocks if b.strip()]
+
+    @staticmethod
+    def _py_toplevel_blocks(code):
+        """Top-level statements of `code`, each as a complete text block.
+
+        Uses the real grammar (`ast`) rather than "a line starting at
+        column zero begins a new block". That heuristic split apart every
+        construct whose continuation is also at column zero:
+
+            @decorator          -> flushed alone, leaving a decorator with
+            def f(): ...           nothing to decorate
+
+            try:                -> `try:` flushed alone with a synthesised
+                ...                `pass`, and `except` orphaned
+            except E:
+                ...
+
+        It also appended that `pass` at a fixed four spaces regardless of
+        the header's own indentation, and dropped blank lines outright.
+
+        Falls back to the line heuristic only when `code` does not parse.
+        Parents come from CPython's own Lib, so in practice it always does;
+        the fallback matters for a child being re-fused.
+        """
+        lines = code.splitlines()
+        try:
+            tree = ast.parse(code)
+        except SyntaxError:
+            # `ast` here is the *host* interpreter's, which is older than
+            # the CPython being fuzzed — 3.12 in this adapter's image
+            # against a 3.16 trunk. Seeds using newer syntax (PEP 695
+            # `type X = ...`, PEP 654 `except*`, PEP 810 `lazy import`,
+            # t-strings) do not parse for us even though the target accepts
+            # them, so this fallback runs on real, valid code and has to be
+            # good rather than merely present.
+            return CPythonFusionStrategy._py_blocks_by_indent(lines)
+        blocks = []
+        for node in tree.body:
+            # decorator_list entries precede the statement's own lineno, so
+            # start from the earliest of them or the node itself.
+            start = min([d.lineno for d in getattr(node, "decorator_list", [])]
+                        + [node.lineno]) - 1
+            end = getattr(node, "end_lineno", node.lineno)
+            block = "\n".join(lines[start:end])
+            if block.strip():
+                blocks.append(block)
+        return blocks
+
+    def _splice_functions_or_classes(self, code1, code2, fusion_rhs="0"):
+        blocks1 = self._py_toplevel_blocks(code1)
+        blocks2 = self._py_toplevel_blocks(code2)
         # No bridge definition: dataflow fusion is a rename in B (see
         # FusionStrategy.rename_across), so the two bodies simply meet.
         return "\n".join(blocks1) + "\n" + "\n".join(blocks2)
@@ -3702,6 +3879,16 @@ class MLIRStateFusionStrategy(MLIRFusionStrategy):
         host_body = re.sub(r'^\s*//\s*-{3,}.*$', '', host_body, flags=re.MULTILINE).strip()
         donor_body = re.sub(r'^\s*//\s*-{3,}.*$', '', donor_body, flags=re.MULTILINE).strip()
 
+        # The cached state points are line indices into the *original*
+        # seed text, and everything above has rewritten it — directives
+        # stripped, symbols renamed, the outer module removed. Reusing them
+        # here would splice at an index that no longer means what it did.
+        # See the same guard in FusionStrategy._build_state_fused.
+        host_cache = ((host.metadata or {}).get("most_complex_states")
+                      if host_body == host.content else None)
+        donor_cache = ((donor.metadata or {}).get("most_complex_states")
+                       if donor_body == donor.content else None)
+
         if not self._is_plausible_mlir(host_body) or not self._is_plausible_mlir(donor_body):
             # Not plausibly MLIR (e.g. LLM-authored pseudo-code seed) —
             # emit the host alone rather than grafting unparseable text.
@@ -3712,7 +3899,7 @@ class MLIRStateFusionStrategy(MLIRFusionStrategy):
             })
 
         host_point = pick_state_point(host_body, "mlir", self.project_root,
-                                       cached=(host.metadata or {}).get("most_complex_states"),
+                                       cached=host_cache,
                                        lightweight=self.lightweight)
         host_lines = host_body.splitlines()
         if host_point is None:
@@ -3731,7 +3918,7 @@ class MLIRStateFusionStrategy(MLIRFusionStrategy):
         donor_lines = donor_body.splitlines()
         picked = self._pick_donor_point(
             donor_body, donor_lines,
-            cached=(donor.metadata or {}).get("most_complex_states"))
+            cached=donor_cache)
 
         if picked is None:
             # Donor has no graftable region (e.g. its block is just a
@@ -7712,13 +7899,19 @@ class GoFusionStrategy(GenericDataflowStrategy):
         pkg_a, imports_a, body_a = split_go_file(code_a)
         pkg_b, imports_b, body_b = split_go_file(code_b)
 
-        tag = f"b{parent_b.id[:6]}"
-        body_b, collisions = self._dedupe_toplevel(body_a, body_b, tag)
-
         body_a, body_b = self.interleave_code_blocks(
             body_a, body_b,
             (parent_a.metadata or {}).get("dataflows"),
             (parent_b.metadata or {}).get("dataflows"))
+
+        # After the dataflow rename, never before. A package-scope `var` is
+        # in both sets — the names this dedupes and the names the rename
+        # draws from — so running the rename second puts a colliding name
+        # back, and Go rejects the redeclaration outright. Worse, the
+        # rename only rewrites a weighted-random subset of occurrences, so
+        # the uses left behind then refer to a name nothing declares.
+        tag = f"b{parent_b.id[:6]}"
+        body_b, collisions = self._dedupe_toplevel(body_a, body_b, tag)
 
         # `package main` when either side is: only a main package can be
         # linked, so preferring it keeps the child reachable by more of the
@@ -7901,6 +8094,379 @@ def _instantiate(cls, project_root: str, lightweight: bool):
 # Which strategies each project offers. Adding a language means adding its
 # classes and one row here — previously it meant appending another branch
 # to a ten-way if-chain that all ten rows duplicated verbatim.
+# ---------------------------------------------------------------------------
+# JavaScript / V8
+# ---------------------------------------------------------------------------
+
+# mjsunit tests declare the flags they need in a leading comment. The line
+# has to survive fusion and stay at the top: projects/v8/driver.py reads it
+# to decide how to run the child, and a test written around
+# %OptimizeFunctionOnNextCall does nothing without --allow-natives-syntax.
+_JS_FLAGS_RE = re.compile(r'^//\s*Flags:\s*(.+)$', re.M)
+
+# A directive prologue ("use strict") is only a directive when it is the
+# first statement. Concatenating two files buries the second one's, which
+# silently changes that half's semantics — so it is hoisted, not left.
+_JS_DIRECTIVE_RE = re.compile(r'^\s*(["\'])use (?:strict|asm)\1\s*;?\s*$', re.M)
+
+# Top-level declarations, anchored at column 0. JavaScript has no top-level
+# marker the way Go has `func` at package scope, so indentation is the only
+# cheap signal — and it is a good one for this corpus, which is machine-
+# checked, uniformly formatted test code.
+#
+# The split between these two groups is the whole point:
+#   let/const/class  redeclaring one is a SyntaxError, thrown at parse time
+#                    for the *entire* script. One collision and neither
+#                    half of the fused program runs.
+#   var/function     redeclaration is explicitly legal. Renaming them would
+#                    be churn that changes nothing.
+_JS_LEXICAL_DECL_RE = re.compile(
+    r'^(?:let|const)\s+([A-Za-z_$][\w$]*)', re.M)
+_JS_CLASS_DECL_RE = re.compile(r'^class\s+([A-Za-z_$][\w$]*)', re.M)
+
+# Matched at a known top-level position by js_toplevel_names, so it is not
+# anchored with ^ itself.
+_JS_TOPLEVEL_DECL_RE = re.compile(r'(?:let|const|class)\s+([A-Za-z_$][\w$]*)')
+
+
+def split_js_file(content):
+    """Split a JS file into (flag_comments, directives, body).
+
+    Both preambles are pulled out so the caller can put them back at the
+    top of the fused file, where they are the only place they mean
+    anything.
+    """
+    flags = [m.group(0).strip() for m in _JS_FLAGS_RE.finditer(content)]
+    body = _JS_FLAGS_RE.sub("", content)
+    directives = [m.group(0).strip() for m in _JS_DIRECTIVE_RE.finditer(body)]
+    body = _JS_DIRECTIVE_RE.sub("", body)
+    return flags, directives, body.strip("\n")
+
+
+def js_toplevel_names(body):
+    """Top-level names whose redeclaration is a SyntaxError.
+
+    Deliberately only let/const/class: `var` and `function` may legally be
+    declared twice, so renaming them would change the program without
+    fixing anything.
+
+    Brace depth, not column, decides what counts as top level. Column
+    alone over-collects badly on this corpus: mjsunit tests routinely wrap
+    a section in a bare `{ ... }` block or an IIFE and leave the contents
+    unindented, and a `const` inside one of those is block-scoped — two of
+    them in one file is perfectly legal. Counting those as top-level names
+    would make the strategy rename bindings that never collided.
+
+    Strings and comments are masked out first, so a brace inside a
+    template literal or a comment does not shift the depth for everything
+    after it.
+    """
+    from .state_analysis import _lexical_mask
+    mask = _lexical_mask(body, "javascript")
+
+    names = set()
+    depth = 0
+    at_line_start = True
+    i, n = 0, len(body)
+    while i < n:
+        ch = body[i]
+        real = mask[i] if i < len(mask) else True
+        if ch == "\n":
+            at_line_start = True
+            i += 1
+            continue
+        if real:
+            if ch in "{([":
+                depth += 1
+            elif ch in "})]":
+                depth = max(0, depth - 1)
+            elif depth == 0 and at_line_start and not ch.isspace():
+                m = _JS_TOPLEVEL_DECL_RE.match(body, i)
+                if m:
+                    names.add(m.group(1))
+        if not ch.isspace():
+            at_line_start = False
+        i += 1
+    return names
+
+
+
+
+def assemble_js_file(flags, directives, *bodies):
+    """Build one script from merged parts.
+
+    Flags are merged rather than dropped: they are what makes each half
+    reach the tier or the GC state its test was written for, and dropping
+    one silently turns that half into a script that runs in the
+    interpreter and tests nothing.
+
+    The output is exactly what the fusion techniques produced. The
+    execution harness that makes a fused program reach V8's optimising
+    compilers lives in projects/v8/driver.py and is wrapped around the
+    script at run time, deliberately not baked in here: a fused child can
+    be fused again, so a harness in the text would compound across a
+    chain and - worse - offer its own identifiers to the dataflow rename,
+    which was observed renaming a seed's variable to the harness's `ARGS`.
+    """
+    parts = []
+    merged = []
+    for line in flags:
+        for tok in line.split(":", 1)[1].split():
+            if tok not in merged:
+                merged.append(tok)
+    if merged:
+        parts.append("// Flags: " + " ".join(merged))
+    if directives:
+        parts.append(directives[0])
+
+    parts.extend(b for b in bodies if b and b.strip())
+    return "\n\n".join(parts) + "\n"
+
+
+class V8FusionStrategy(GenericDataflowStrategy):
+    """
+    JavaScript (V8/d8) fusion strategy.
+
+    Dataflow fusion is the shared rename (FusionStrategy.rename_across):
+    a name from A replaces a name in B. JavaScript suits it well — both
+    bodies land in one script's top-level scope, so A's names really are
+    visible where B uses them, and the language's dynamic typing means a
+    renamed binding usually still *runs* rather than failing to compile.
+    That matters here in a way it does not for a static language: the
+    point of running V8 is to reach the optimising tiers, and a program
+    that does not execute never reaches them at all.
+    """
+
+    LANGUAGE = "javascript"
+
+    def __init__(self, project_root="projects/v8", lightweight: bool = False):
+        super().__init__(mutator=BaseMutator(), lightweight=lightweight)
+        self.project_root = project_root
+        self.mutation = True
+        self.dataflow_fusion = True
+
+    # JS identifiers are bare, so a substring replace would corrupt
+    # unrelated names — the same reason ClangFusionStrategy overrides this.
+    def _lightweight_replace(self, code: str, var: str, bridge: str) -> str:
+        return replace_word_occurrences(code, var, bridge)
+
+    _JS_DECL_RE = re.compile(
+        r'\b(?:let|const|var)\s+([A-Za-z_$][\w$]*)')
+
+    def _lightweight_vars(self, code: str) -> List[str]:
+        """Declared bindings, rather than every identifier.
+
+        Property names and global built-ins read the same as variables
+        lexically, and renaming `Array` or `Math` is a guaranteed
+        ReferenceError rather than an interesting one — the same argument
+        FusionStrategy._DATAFLOW_KEYWORDS makes about keywords.
+        """
+        names = self._JS_DECL_RE.findall(code)
+        return list(dict.fromkeys(n for n in names if n))
+
+    def _dedupe_toplevel(self, a_body: str, b_body: str, tag: str):
+        """Rename B's top-level let/const/class names that collide with A's.
+
+        A redeclared lexical binding is a SyntaxError raised while parsing,
+        before a single line of either half executes. With two seeds that
+        both open `let a = ...` — ordinary in a machine-generated test
+        corpus — that would reject a large share of fused pairs at the
+        parser, never reaching the engine this is aimed at.
+        """
+        collisions = js_toplevel_names(a_body) & js_toplevel_names(b_body)
+        for name in sorted(collisions):
+            b_body = rename_all_word_occurrences(b_body, name, f"{name}_{tag}")
+        return b_body, collisions
+
+    def fuse(self, parent_a: Seed, parent_b: Seed) -> Seed:
+        # Split before mutating, and mutate only the body. A `// Flags:`
+        # line is configuration, not program text — it is passed to d8 on
+        # the command line — but to a mutator it is just a comment with
+        # integers in it. Mutating it rewrote `--stack-size=100` into
+        # `--stack-size=2147483647`, which makes V8 fail a DCHECK while
+        # setting up the stack guard, before a line of JavaScript runs.
+        # Two of the campaign's first findings were that, not engine bugs.
+        flags_a, dirs_a, body_a = split_js_file(parent_a.content)
+        flags_b, dirs_b, body_b = split_js_file(parent_b.content)
+        if self.mutation and self.mut:
+            body_a = self.mut.mutate(body_a)
+            body_b = self.mut.mutate(body_b)
+
+        body_a, body_b = self.interleave_code_blocks(
+            body_a, body_b,
+            (parent_a.metadata or {}).get("dataflows"),
+            (parent_b.metadata or {}).get("dataflows"))
+
+        # After the dataflow rename, never before. The rename's whole job
+        # is to make a name from A appear in B, so running it second would
+        # reintroduce exactly the top-level collision the dedupe just
+        # removed — and a redeclared `let`/`const` is a SyntaxError raised
+        # while parsing, which takes down both halves before either runs.
+        tag = f"b{parent_b.id[:6]}"
+        body_b, collisions = self._dedupe_toplevel(body_a, body_b, tag)
+
+        content = assemble_js_file(flags_a + flags_b, dirs_a + dirs_b,
+                                   body_a, body_b)
+
+        return Seed(content=content, metadata={
+            "parents": [parent_a.id, parent_b.id],
+            "type": "javascript",
+            "extension": ".js",
+            "renamed": sorted(collisions),
+            "description": f"Fused {parent_a.id} + {parent_b.id}",
+        })
+
+
+class V8StateFusionStrategy(V8FusionStrategy):
+    """
+    State fusion for JavaScript (core/state_analysis.py): interleaves the
+    two seeds' segments at a profiled most-complex state rather than
+    joining them end to end.
+
+    This is the technique that matters most for an executing target. Joined
+    end to end, two scripts simply run in sequence and the engine sees
+    nothing it would not have seen running them separately. Spliced into
+    each other's live state, the second half's code runs against bindings
+    and object shapes its author never wrote it for — which is how a
+    function gets an argument of an unexpected shape, the inline caches go
+    polymorphic, and the optimising compiler is asked to specialise
+    something it has no good specialisation for.
+    """
+
+    def _state_prepare(self, host: Seed, donor: Seed):
+        flags_h, dirs_h, body_h = split_js_file(host.content)
+        flags_d, dirs_d, body_d = split_js_file(donor.content)
+        body_d, _ = self._dedupe_toplevel(body_h, body_d, f"d{donor.id[:6]}")
+        return body_h, body_d, (flags_h + flags_d, dirs_h + dirs_d)
+
+    def _state_graft_donor(self, donor_body: str, donor_point) -> str:
+        from .state_analysis import truncate_to_balanced
+        lines = donor_body.splitlines()
+        start = (donor_point.line_idx + 1) if donor_point else 0
+        return "\n".join(lines[:truncate_to_balanced(donor_body, start,
+                                                     "javascript")])
+
+    def _state_assemble(self, context, fused_body, host, donor, direction,
+                        host_point):
+        flags, directives = context
+        return assemble_js_file(flags, directives, fused_body)
+
+    def _state_seed_metadata(self, host: Seed, donor: Seed) -> dict:
+        return {"type": "javascript", "extension": ".js"}
+
+    def fuse(self, parent_a: Seed, parent_b: Seed) -> Seed:
+        return self._build_state_fused(parent_a, parent_b, "ab")
+
+    def fuse_bidirectional(self, parent_a: Seed, parent_b: Seed) -> List[Seed]:
+        return [self._build_state_fused(parent_a, parent_b, "ab"),
+                self._build_state_fused(parent_b, parent_a, "ba")]
+
+
+class V8DeclarationFusionStrategy(V8FusionStrategy):
+    """
+    Declaration fusion for JavaScript: takes a class the donor declares and
+    makes one of the host's `new` expressions construct it instead.
+
+    JavaScript has no type declarations to inject, so the analogue of Go's
+    donated struct is a donated *class*. It targets the same thing V8's
+    optimiser is built around: object shape. Every JS object carries a
+    hidden class (a Map, in V8's terms), and the inline caches and the
+    optimising compiler's type feedback are entirely built on the
+    assumption that a given site sees a small, stable set of them.
+    Swapping in a differently-shaped object at one construction site is
+    the cheapest way to violate that assumption — the site goes
+    polymorphic or megamorphic, and the engine has to deoptimise and
+    re-specialise code it had already committed to.
+    """
+
+    # Two donor forms, because JavaScript has two ways of writing a
+    # constructor and the corpus uses both. `class` is only 4% of these
+    # seeds on its own; the pre-ES6 form — a function that assigns to
+    # `this` — is roughly as common, and V8 treats objects from the two
+    # identically. Restricting to `class` would leave most of the corpus
+    # unable to donate.
+    _JS_CLASS_BODY_RE = re.compile(
+        r'^\s*class\s+([A-Za-z_$][\w$]*)(?:\s+extends\s+[\w$.]+)?\s*\{', re.M)
+    _JS_CTOR_FN_RE = re.compile(
+        r'^\s*function\s+([A-Za-z_$][\w$]*)\s*\([^)]*\)\s*\{'
+        r'(?:[^{}]|\{[^{}]*\})*?\bthis\.\w+\s*=', re.M | re.S)
+
+    _JS_NEW_RE = re.compile(r'\bnew\s+([A-Za-z_$][\w$]*)\s*\(')
+    # The other host site: an object-literal initialiser. Replacing one
+    # with a donor construction is the same operation as retargeting a
+    # `new` — the binding ends up holding a differently-shaped object —
+    # and it nearly doubles how many seeds can act as host.
+    _JS_OBJ_LIT_RE = re.compile(
+        r'\b(?:let|const|var)\s+[A-Za-z_$][\w$]*\s*=\s*(\{\s*\})')
+
+    def is_viable_pair(self, seed_a: Seed, seed_b: Seed) -> bool:
+        """Only pairs where the donor declares a class and the host builds
+        something.
+
+        Without this the strategy silently degrades to plain concatenation
+        and the run reports declaration fusions that never injected
+        anything.
+        """
+        donor, host = seed_b.content or "", seed_a.content or ""
+        has_donor = (self._JS_CLASS_BODY_RE.search(donor)
+                     or self._JS_CTOR_FN_RE.search(donor))
+        has_site = (self._JS_NEW_RE.search(host)
+                    or self._JS_OBJ_LIT_RE.search(host))
+        return bool(has_donor and has_site)
+
+    def _donor_class(self, donor_body: str):
+        """A constructible name the donor declares. Only the name is
+        needed: the declaration stays where it is, in the donor's half of
+        the script."""
+        decls = [m.group(1) for m in self._JS_CLASS_BODY_RE.finditer(donor_body)]
+        decls += [m.group(1) for m in self._JS_CTOR_FN_RE.finditer(donor_body)]
+        return random.choice(decls) if decls else None
+
+    def fuse(self, parent_a: Seed, parent_b: Seed) -> Seed:
+        flags_a, dirs_a, body_a = split_js_file(parent_a.content)
+        flags_b, dirs_b, body_b = split_js_file(parent_b.content)
+
+        tag = f"b{parent_b.id[:6]}"
+        body_b, collisions = self._dedupe_toplevel(body_a, body_b, tag)
+
+        injected = None
+        donor_cls = self._donor_class(body_b)
+        if donor_cls:
+            # Never retarget a construction of the donor's own class: that
+            # is a no-op that would still be reported as an injection.
+            sites = [(m.start(), m.end(), m.group(1))
+                     for m in self._JS_NEW_RE.finditer(body_a)
+                     if m.group(1) != donor_cls]
+            # An empty object literal is the other site: `let x = {}`
+            # becomes `let x = new Donor()`, giving x the donor's shape.
+            sites += [(m.start(1), m.end(1), "{}")
+                      for m in self._JS_OBJ_LIT_RE.finditer(body_a)]
+            if sites:
+                start, end, replaced = random.choice(sites)
+                body_a = body_a[:start] + f"new {donor_cls}(" + (
+                    ")" if replaced == "{}" else "") + body_a[end:]
+                injected = (replaced, donor_cls)
+
+        # The donor's declaration has to precede the host's use of it:
+        # `class` bindings are hoisted but sit in the temporal dead zone,
+        # so constructing one before its declaration is a ReferenceError
+        # rather than the shape confusion this is aiming at.
+        content = assemble_js_file(flags_a + flags_b, dirs_a + dirs_b,
+                                   body_b, body_a)
+
+        meta = {
+            "parents": [parent_a.id, parent_b.id],
+            "type": "javascript",
+            "extension": ".js",
+            "renamed": sorted(collisions),
+            "description": f"Fused {parent_a.id} + {parent_b.id}",
+        }
+        if injected:
+            meta["injected_class"] = injected[1]
+            meta["replaced_class"] = injected[0]
+        return Seed(content=content, metadata=meta)
+
+
 STRATEGY_REGISTRY = {
     "haskell":  _StrategySet("projects/haskell",  HaskellFusionStrategy,
                              HaskellDeclarationFusionStrategy, HaskellStateFusionStrategy),
@@ -7932,6 +8498,18 @@ STRATEGY_REGISTRY = {
     "rust":     _StrategySet("projects/rust",     RustFusionStrategy,
                              RustStructFusionStrategy, RustStateFusionStrategy,
                              struct_alias=True),
+    "v8":       _StrategySet("projects/v8",       V8FusionStrategy,
+                             V8DeclarationFusionStrategy, V8StateFusionStrategy),
+    # SpiderMonkey consumes the same language as V8, so it reuses the same
+    # three strategies verbatim rather than cloning them — the same
+    # arrangement GCC has with clang's. The strategies are source-to-source
+    # and never invoke an engine: nothing in split_js_file,
+    # js_toplevel_names or assemble_js_file is V8-specific. What differs
+    # between the two targets is the driver, the execution harness and the
+    # crash oracle, which are per-project files already.
+    "spidermonkey": _StrategySet("projects/spidermonkey", V8FusionStrategy,
+                                 V8DeclarationFusionStrategy,
+                                 V8StateFusionStrategy),
     "go":       _StrategySet("projects/go",       GoFusionStrategy,
                              GoDeclarationFusionStrategy, GoStateFusionStrategy),
 }

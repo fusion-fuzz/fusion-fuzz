@@ -237,3 +237,70 @@ def test_weighted_order_handles_empty_and_all_zero_input():
 
 def test_legacy_alias_still_resolves():
     assert find_most_complex_state is find_state_points
+
+
+# ---------------------------------------------------------------------------
+# segment_boundaries: two predicates that were missing
+# ---------------------------------------------------------------------------
+
+def test_boundary_is_rejected_before_a_continuation_clause():
+    """`elif`/`else`/`except` sit at the same indentation and the same
+    delimiter depth as the header they belong to, so neither the depth test
+    nor the column-zero test rejects them — yet cutting there severs the
+    clause from its `if`/`try`.
+
+    On the CPython Lib corpus this was 58 of 66 remaining parse failures:
+    the four-segment interleave kept splitting top-level if/elif chains.
+    """
+    from core.state_analysis import segment_boundaries
+    code = ("import sys\n"
+            "if sys.byteorder == 'little':\n"
+            "    x = 1\n"
+            "elif sys.byteorder == 'big':\n"
+            "    x = 2\n"
+            "else:\n"
+            "    x = 3\n"
+            "y = 4\n")
+    lines = code.splitlines()
+    for idx in segment_boundaries(code, "cpython"):
+        nxt = next((lines[j] for j in range(idx + 1, len(lines))
+                    if lines[j].strip()), "")
+        assert not nxt.lstrip().startswith(("elif", "else", "except", "finally")), \
+            f"boundary at line {idx} precedes {nxt!r}"
+
+
+def test_boundary_is_rejected_inside_a_string():
+    """A triple-quoted string changes no paren depth and its prose is often
+    unindented, so every docstring line satisfied both existing tests.
+    Cutting there ends the prefix mid-literal and leaves the suffix's prose
+    as bare code."""
+    from core.state_analysis import segment_boundaries
+    code = ('x = 1\n'
+            'def f():\n'
+            '    """Docstring.\n'
+            '\n'
+            'Check that this prose is not a boundary.\n'
+            'More prose at column zero.\n'
+            '    """\n'
+            '    return 2\n'
+            'y = 3\n')
+    inside = {2, 3, 4, 5, 6}          # the docstring's own lines
+    assert not (set(segment_boundaries(code, "cpython")) & inside)
+
+
+def test_brace_languages_also_reject_continuation_and_string_cuts():
+    """Both predicates are language-independent: a cut before `} else {`
+    splits a C if/else just as surely, and one inside a block comment is
+    just as unterminated."""
+    from core.state_analysis import segment_boundaries
+    code = ('int a = 1;\n'
+            'void f(void) {\n'
+            '    if (a) {\n'
+            '    }\n'
+            '}\n'
+            '/* a comment\n'
+            'with prose at column zero\n'
+            '*/\n'
+            'int b = 2;\n')
+    bounds = set(segment_boundaries(code, "clang"))
+    assert 6 not in bounds, "cut inside a block comment"

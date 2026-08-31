@@ -152,6 +152,13 @@ if __name__ == "__main__":
 
     reproduce_cmd = f"{env_prefix}{lfortran_bin} {' '.join(reduced_flags)} ./{os.path.basename(testpath)}"
 
+    src_dir = os.path.join(
+        os.path.dirname(os.path.abspath(__file__)), "lfortran-src")
+    commit_result = subprocess.run(
+        f"cd {src_dir} && git rev-parse HEAD",
+        shell=True, capture_output=True, text=True)
+    commit = (commit_result.stdout or "").strip() or "unknown"
+
     report_template = """
 The following code:
 
@@ -174,6 +181,21 @@ Compiler version:
 {version}
 ```
 
+Commit:
+```
+{commit}
+```
+
+Build configuration:
+```
+{build_config}
+```
+
+Operating System:
+```
+{os_desc}
+```
+
 *This bug was found by [fusion-fuzz](https://github.com/fusion-fuzz/fusion-fuzz)*
 """
 
@@ -182,6 +204,9 @@ Compiler version:
         stdouterr=stdouterr,
         cmd=reproduce_cmd,
         version=lfortran_version,
+        commit=commit,
+        build_config="cmake -DCMAKE_BUILD_TYPE=Debug -DWITH_LLVM=yes",
+        os_desc="Ubuntu 22.04 Host, Docker fusion-fuzz-lfortran:latest",
     )
 
     print('\033[94m' + bug_report + '\033[0m')

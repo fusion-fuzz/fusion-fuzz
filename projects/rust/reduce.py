@@ -3,17 +3,22 @@ import subprocess
 
 stdouterr = None
 
-def run_test(cmd, bug_output):
+def run_test(cmd, bug_output, timeout=30):
+    """Run the reproduce command and check whether bug_output appears in the
+    combined stdout/stderr."""
     try:
-        result = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=30)
-    except:
+        result = subprocess.run(
+            cmd, shell=True, capture_output=True, text=True,
+            errors="replace", timeout=timeout,
+        )
+    except Exception:
         return False
 
     combined = result.stdout + result.stderr
     if bug_output in combined:
         global stdouterr
         if stdouterr is None:
-            stdouterr = result.stderr
+            stdouterr = combined
         return True
     return False
 
@@ -58,7 +63,7 @@ def further_minimize_testcase(lines, bug_output, testpath, reproduce_cmd):
     return lines
 
 
-def reduce_flags(flags, bug_output, testpath, rustc_path):
+def reduce_flags(flags, bug_output, testpath, rustc_path, env_prefix=""):
     """Try removing rustc flags one at a time."""
     reduced = flags[:]
     changed = True
@@ -66,7 +71,7 @@ def reduce_flags(flags, bug_output, testpath, rustc_path):
         changed = False
         for i in range(len(reduced)):
             trial = reduced[:i] + reduced[i+1:]
-            cmd = f"{rustc_path} {' '.join(trial)} {testpath}"
+            cmd = f"{env_prefix}{rustc_path} {' '.join(trial)} {testpath}"
             if run_test(cmd, bug_output) or run_test(cmd, bug_output):
                 reduced = trial
                 changed = True
@@ -74,8 +79,8 @@ def reduce_flags(flags, bug_output, testpath, rustc_path):
     return reduced
 
 
-def reduce_rust(testpath, rustc_path, flags, bug_output):
-    reproduce_cmd = f"{rustc_path} {' '.join(flags)} {testpath}"
+def reduce_rust(testpath, rustc_path, flags, bug_output, env_prefix=""):
+    reproduce_cmd = f"{env_prefix}{rustc_path} {' '.join(flags)} {testpath}"
 
     if not (run_test(reproduce_cmd, bug_output) or
             run_test(reproduce_cmd, bug_output) or
@@ -104,7 +109,7 @@ def reduce_rust(testpath, rustc_path, flags, bug_output):
     reduced_rs = "\n".join(further_minimized_lines)
 
     print("Reducing flags...")
-    reduced_flags = reduce_flags(flags, bug_output, testpath, rustc_path)
+    reduced_flags = reduce_flags(flags, bug_output, testpath, rustc_path, env_prefix)
     print(f"Reduced flags: {reduced_flags}")
 
     return reduced_rs, reduced_flags
@@ -134,6 +139,13 @@ if __name__ == "__main__":
 
     reproduce_cmd = f"{rustc_path} {' '.join(reduced_flags)} ./test.rs"
 
+    src_dir = os.path.join(
+        os.path.dirname(os.path.abspath(__file__)), "rust-src")
+    commit_result = subprocess.run(
+        f"cd {src_dir} && git rev-parse HEAD",
+        shell=True, capture_output=True, text=True)
+    commit = (commit_result.stdout or "").strip() or "unknown"
+
     report_template = """
 The following code:
 
@@ -156,6 +168,21 @@ Compiler version:
 {version}
 ```
 
+Commit:
+```
+{commit}
+```
+
+Build configuration:
+```
+{build_config}
+```
+
+Operating System:
+```
+{os_desc}
+```
+
 *This bug was found by [fusion-fuzz](https://github.com/fusion-fuzz/fusion-fuzz)*
 """
 
@@ -164,6 +191,11 @@ Compiler version:
         stdouterr=stdouterr,
         cmd=reproduce_cmd,
         version=rustc_version,
+        commit=commit,
+        build_config="./x.py build --stage 1 with config.toml: "
+                    "rust.debug-assertions = true, llvm.assertions = true, "
+                    "download-ci-llvm = true (assertions build)",
+        os_desc="Ubuntu 22.04 Host, Docker fusion-fuzz-rust:latest",
     )
 
     print('\033[94m' + bug_report + '\033[0m')

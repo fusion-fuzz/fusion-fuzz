@@ -1,30 +1,131 @@
 project_name: "cpython"
 
 execution:
-  # The driver handles the binary path dynamically, but this acts as a fallback/template
+  # projects/cpython/driver.py builds the real command (interpreter flags,
+  # sanitizer options, containment) per seed; this is BaseDriver's fallback.
   command: "projects/cpython/cpython/build/python {seed_path}"
-  timeout: 10
-  concurrency: 1
-  memory_limit_mb: 512  # Per-execution virtual-memory cap (RLIMIT_AS); 0 = no limit
+  timeout: 15
+  # Raised 1 -> 8 -> 16 as the reasons for caution were removed rather than
+  # assumed. CPython is the only target here whose seeds are *executed*, so
+  # the original worry was a fused program binding a port, forking, or
+  # deleting files. Since then: seeds doing any of those are excluded by
+  # paths.seed_exclude_patterns below, every execution runs in its own temp
+  # directory under a timeout, and the decomposed corpus brought the p95
+  # runtime to 1.09s with zero timeouts — so a worker is no longer held for
+  # 15s by a single hung seed. 16 matches every other adapter.
+  concurrency: 16
+  # Applied through ASan's hard_rss_limit_mb, not `ulimit -v`: an
+  # ASan-instrumented process reserves a huge virtual address space before
+  # running any of its own code, so a -v cap stops it starting at all.
+  mem_limit_mb: 2048
 
 analysis:
+  # The coarse net. projects/cpython/analyzer.py makes the actual decision
+  # and subtracts what these would over-match — chiefly MemoryError and
+  # RecursionError, which are ordinary exceptions saying the fused program
+  # nested or allocated too much, not that CPython is wrong.
+  #
+  # The previous list was two entries, "SUMMARY:" and ": Assertion `". That
+  # missed a plain segfault entirely: _check_crash is purely pattern-based
+  # (the return-code check in core/driver.py is commented out), so a
+  # Segmentation fault was never reported, and the handler for it in the
+  # driver's signature extractor was dead code.
   crash_patterns:
-    - "SUMMARY:"
-    - ": Assertion `"
+    - "SUMMARY:"                   # ASan / UBSan / LSan
+    - "runtime error:"             # UBSan
+    - "Fatal Python error"
+    - "Assertion"                  # both glibc's and CPython's spelling
+    - "Debug memory block at address"
+    - "bad leading pad byte"
+    - "bad trailing pad byte"
+    - "bad ID: Allocated using API"
+    - "Segmentation fault"
+    - "Bus error"
+    - "Aborted"
+    - "core dumped"
+    # A C function that returns NULL without setting an exception is a
+    # C-level contract violation, and CPython reports it as an ordinary
+    # SystemError — the one bug class that hides inside a normal traceback.
+    - "returned NULL without setting an exception"
+    - "returned a result with an exception set"
 
+  # Every other adapter compiles; here the seed runs, so "expected failure"
+  # means an ordinary Python exception rather than a compile diagnostic.
+  syntax_patterns:
+    - "SyntaxError"
+    - "IndentationError"
+    - "NameError"
+    - "TypeError"
+    - "AttributeError"
+    - "ImportError"
+    - "ModuleNotFoundError"
+    - "ValueError"
 
 paths:
-  # We point to the Lib/test directory inside the cloned repo (path relative to project root)
-  seed_source: "projects/cpython/cpython-fuzzing-corpus"
+  # CPython's own Lib/test, extracted by setup.py from the cloned tree —
+  # the tests its developers wrote to pin down interpreter behaviour.
+  seed_source: "projects/cpython/seeds"
   seed_corpus: "projects/cpython/corpus.db"
-  seed_blacklist:
-    - "ctypes"
-    - "__code__"
+
+  seed_exclude_patterns:
+    # ctypes can segfault the interpreter from pure Python by design, so a
+    # crash from one of these says nothing about CPython being wrong. It
+    # would also be the single loudest "finding" in any run.
+    - pattern: '(?m)^\s*(?:import ctypes|from ctypes)\b'
+      reason: "ctypes can segfault the interpreter by design; a crash proves nothing"
+    # Hand-built code objects are the same argument: feeding the eval loop
+    # arbitrary bytecode crashes it on purpose.
+    - pattern: '\b__code__\b|\btypes\.CodeType\s*\('
+      reason: "constructs code objects directly; crashing the eval loop is expected"
+    # The _testcapi family exists to *deliberately* misuse the C API —
+    # double-frees, mismatched allocator APIs, deliberately corrupted pad
+    # bytes — and then assert on the diagnostic CPython prints. Two
+    # consequences, both noise:
+    #   * the interpreter really does abort, and that abort is the test
+    #     passing, not a defect;
+    #   * the *expected output* is a string literal in the test's own
+    #     assertion, so an oracle scanning for "Debug memory block at
+    #     address" matches text the program merely printed.
+    # Three of the first five findings on this corpus were exactly that.
+    - pattern: '(?m)^\s*(?:import|from)\s+_test(?:capi|internalcapi|buffer|multiphase|singlephase|limitedcapi|clinic)\b|\b_test(?:capi|internalcapi)\.'
+      reason: "_testcapi deliberately misuses the C API; its crashes are the test passing"
+    # Seeds that would take the fuzzing loop off this machine. Every seed
+    # here actually executes.
+    - pattern: '\b(?:socket\.(?:bind|connect|create_server)|http\.server|socketserver)\b'
+      reason: "binds or connects a socket; seeds here are executed, not just compiled"
+    - pattern: '\bsubprocess\.(?:run|Popen|call|check_output)\b|\bos\.(?:system|fork|exec\w+)\b'
+      reason: "spawns processes; a concurrent loop would fork-bomb itself"
+    - pattern: '\bshutil\.rmtree\b|\bos\.(?:remove|unlink|rmdir|removedirs)\s*\('
+      reason: "deletes files; the execution has no sandbox beyond its temp directory"
+    # A relative import only resolves inside its package. Every seed here is
+    # written out as a standalone script in a temp directory, so these fail
+    # identically every time with "attempted relative import with no known
+    # parent package" — measured as 18 of 120 executions, the single largest
+    # runtime failure, and not one of them says anything about CPython.
+    - pattern: '(?m)^\s*from\s+\.'
+      reason: "relative import cannot resolve in a standalone script"
+    # Network clients. The socket exclusion above catches servers; these are
+    # the other direction, and they fail with ConnectionRefusedError (8 of
+    # 120) rather than exercising the interpreter.
+    - pattern: '(?m)^\s*(?:import|from)\s+(?:urllib|http\.client|ftplib|smtplib|poplib|imaplib|telnetlib|xmlrpc)\b'
+      reason: "network client; nothing to connect to, so it fails identically every run"
+    # Data-driven tests that locate their fixtures relative to their own
+    # path. The seed no longer sits next to them, so it dies on
+    # FileNotFoundError before reaching anything interesting.
+    - pattern: '\b__file__\b'
+      reason: "locates data files relative to its own path, which no longer exists"
+    # Concurrency primitives. A fused program that acquires a lock its
+    # other half never releases does not fail — it *hangs*, burning the
+    # whole execution timeout. That costs the valid rate and the throughput
+    # at the same time: measured as 6 of 15 timeouts, and timeouts are the
+    # most expensive kind of failure there is.
+    - pattern: '\b(?:threading\.(?:Thread|Lock|RLock|Condition|Event|Semaphore|Barrier)|multiprocessing\.|concurrent\.futures)'
+      reason: "concurrency primitives deadlock after fusion and burn the full timeout"
+    - pattern: '\basyncio\.(?:run|get_event_loop|new_event_loop)\b'
+      reason: "starts an event loop that a fused program may never exit"
 
 llm:
-  provider: "openai" # Options: gemini, openai, vllm, ollama
-  model: "gpt-4o"
-  # api_key: "" # Defaults to LLM_API_KEY env var
-  # api_base: "" # Optional, for vllm/ollama
+  provider: "deepseek"
+  model: "deepseek-v4-flash"
+  api_key: ""
   timeout: 30
-  # rate: 0.05 # Probability to use LLM generation in fuzz loop

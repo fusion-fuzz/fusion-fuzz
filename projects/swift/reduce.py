@@ -1,3 +1,4 @@
+import os
 import subprocess
 
 stdouterr = None
@@ -183,6 +184,16 @@ Compiler version:
 {version}
 ```
 
+Build configuration:
+```
+{build_config}
+```
+
+Operating System:
+```
+{os_desc}
+```
+
 *This bug was found by [fusion-fuzz](https://github.com/fusion-fuzz/fusion-fuzz)*
 """
 
@@ -191,6 +202,8 @@ Compiler version:
         stdouterr=stdouterr,
         cmd=reproduce_cmd,
         version=swift_version,
+        build_config="Official swift.org toolchain (no local build)",
+        os_desc="Ubuntu 22.04 Host, Docker fusion-fuzz-swift:latest",
     )
 
     print('\033[94m' + bug_report + '\033[0m')

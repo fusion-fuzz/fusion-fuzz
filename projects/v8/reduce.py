@@ -6,7 +6,7 @@ stdouterr = None
 # Function to run the test command and check for bug presence
 def run_test(cmd, bug_output, timeout=20):
     """
-    Executes the provided command to run the Python test and checks
+    Executes the provided command to run the JS test and checks
     if the expected bug output or any sanitizer error appears.
     """
     # Run the command and capture the output
@@ -94,7 +94,7 @@ def further_minimize_testcase(lines, bug_output, testpath, reproduce_cmd):
 
     return lines
 
-def reduce_flags(flags, bug_output, testpath, pypath, env_prefix=""):
+def reduce_flags(flags, bug_output, testpath, d8path, env_prefix=""):
     """Try removing interpreter flags one at a time.
 
     Same signature as every other adapter's reduce_flags (see
@@ -109,7 +109,7 @@ def reduce_flags(flags, bug_output, testpath, pypath, env_prefix=""):
         changed = False
         for i in range(len(reduced)):
             trial = reduced[:i] + reduced[i + 1:]
-            cmd = f"{env_prefix}{pypath} {' '.join(trial)} {testpath}"
+            cmd = f"{env_prefix}{d8path} {' '.join(trial)} {testpath}"
             if run_test(cmd, bug_output) or run_test(cmd, bug_output):
                 reduced = trial
                 changed = True
@@ -117,8 +117,8 @@ def reduce_flags(flags, bug_output, testpath, pypath, env_prefix=""):
     return reduced
 
 
-def reduce_python(testpath, pypath, config, bug_output, env_prefix=""):
-    reproduce_cmd = f'{env_prefix}{pypath} {config} {testpath}'
+def reduce_js(testpath, d8path, config, bug_output, env_prefix=""):
+    reproduce_cmd = f'{env_prefix}{d8path} {config} {testpath}'
     # Initial test to verify if the reproduce command triggers the bug
     if not run_test(reproduce_cmd, bug_output) and not run_test(reproduce_cmd, bug_output) and not run_test(reproduce_cmd, bug_output):
         return "bug not reproduced when reducing", "bug not reproduced when reducing"
@@ -144,60 +144,63 @@ def reduce_python(testpath, pypath, config, bug_output, env_prefix=""):
             n = len(further_minimized_lines)
             step = max(n // 2, 1)
             if step==init_step:
-                print("reducing python finished")
+                print("reducing js finished")
                 break
-        reducedpy = "\n".join(further_minimized_lines)
+        reducedjs = "\n".join(further_minimized_lines)
 
         reduced_config = " ".join(
-            reduce_flags(config.split(), bug_output, testpath, pypath, env_prefix))
+            reduce_flags(config.split(), bug_output, testpath, d8path, env_prefix))
 
-        return reducedpy, reduced_config.strip('\n')
+        return reducedjs, reduced_config.strip('\n')
 
 
 
 if __name__ == "__main__":
 
-    # Define the path to the test Python file; move the reproducer to /tmp
-    # first, and copy any dependencies alongside it.
-    #
-    # NOT test.py: "test" is a stdlib package, so a file with that name
-    # shadows it and `import test.support` — which most of CPython's own
-    # corpus does — fails with "'test' is not a package" instead of
-    # reproducing.
-    testpath = "/tmp/ffl_repro.py"
+    # Path to the reproducer. d8 takes a plain script path, so unlike the
+    # CPython reducer there is no stdlib-shadowing hazard in the name —
+    # but the file still has to live outside the checkout, because a fused
+    # script can and does delete things in its working directory.
+    testpath = "/tmp/ffl_repro.js"
 
-    # default cpython path
-    pypath = "/home/fuzz/WorkSpace/fusion-fuzz/projects/cpython/cpython/build/python"
+    # default d8 path
+    d8path = "/home/fuzz/WorkSpace/fusion-fuzz/projects/v8/v8-src/v8/out/fuzz/d8"
 
-    # Interpreter flags the crash was found under (e.g. "-X tracemalloc").
-    config = ''
+    # The runtime flags the crash was found under. Copy them from the
+    # `command` line of the finding — for V8 this is the *most* important
+    # field to get right, because a bug that needs --stress-maglev or
+    # --deopt-every-n-times will not reproduce at all without it, and the
+    # config reduction below will then strip every flag as "unnecessary".
+    config = '--allow-natives-syntax --fuzzing'
 
-    # The expected bug output that we are trying to reproduce
+    # The expected bug output that we are trying to reproduce.
     # if sanitizers' alerts
     bug_output = 'Sanitizer'
-    # if assertion failure
-    #bug_output = 'core dumped'
+    # if a DCHECK / CHECK failure
+    #bug_output = 'Debug check failed'
+    # if a sandbox violation
+    #bug_output = 'V8 sandbox violation detected'
 
-    reducedpy, reduced_config = reduce_python(testpath, pypath, config, bug_output)
+    reducedjs, reduced_config = reduce_js(testpath, d8path, config, bug_output)
 
-    reduced_config = f'{pypath} {reduced_config} ./ffl_repro.py'
+    reduced_config = f'{d8path} {reduced_config} ./ffl_repro.js'
 
     # auto generate bug report
-    report_template = "\nThe following code:\n\n```python\n{poc}\n```\n\nResulted in this output:\n```\n{stdouterr}\n```\n\nTo reproduce:\n```\n{config}\n```\n\nCommit:\n```\n{commit}\n```\n\nBuild configuration:\n```\n{build_config}\n```\n\nOperating System:\n```\n{os}\n```\n\n*This bug was found by [fusion-fuzz](https://github.com/fusion-fuzz/fusion-fuzz)*\n"
+    report_template = "\nThe following code:\n\n```javascript\n{poc}\n```\n\nResulted in this output:\n```\n{stdouterr}\n```\n\nTo reproduce:\n```\n{config}\n```\n\nCommit:\n```\n{commit}\n```\n\nBuild configuration:\n```\n{build_config}\n```\n\nOperating System:\n```\n{os}\n```\n\n*This bug was found by [fusion-fuzz](https://github.com/fusion-fuzz/fusion-fuzz)*\n"
 
-    os.system("cd /home/fuzz/WorkSpace/fusion-fuzz/projects/cpython/cpython/; git rev-parse HEAD > /tmp/cpython_commit")
-    f = open("/tmp/cpython_commit","r")
+    os.system("cd /home/fuzz/WorkSpace/fusion-fuzz/projects/v8/v8-src/v8/; git rev-parse HEAD > /tmp/v8_commit")
+    f = open("/tmp/v8_commit","r")
     commit = f.read()
     f.close()
 
-    build_config = './configure --with-pydebug --enable-experimental-jit=yes --with-address-sanitizer --with-undefined-behavior-sanitizer'
+    build_config = "gn gen out/fuzz --args='is_debug = true v8_enable_slow_dchecks = true v8_enable_verify_heap = true v8_enable_verify_csa = true v8_enable_object_print = true is_asan = true'"
 
     # NOTE: this shadows the `os` module imported at the top. It only works
     # because the os.system() call above has already run; keep it last.
-    os = "Ubuntu 22.04 Host, Docker fusion-fuzz-cpython:latest"
+    os = "Ubuntu 24.04 Docker, fusion-fuzz-v8:latest"
 
     bug_report = report_template.format(
-        poc = reducedpy,
+        poc = reducedjs,
         stdouterr = stdouterr,
         config = reduced_config,
         commit = commit,

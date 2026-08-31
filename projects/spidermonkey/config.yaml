@@ -1,0 +1,89 @@
+project_name: "spidermonkey"
+
+execution:
+  # projects/spidermonkey/driver.py builds the real command (shell path,
+  # flag groups, sanitizer env) per seed; this is only BaseDriver's fallback.
+  command: "js {seed_path}"
+  # The shell executes a script in milliseconds, but a debug build with
+  # --gc-zeal can be an order of magnitude slower, and fused code produces
+  # accidental long loops. Enough to be sure a timeout means a hang.
+  timeout: 20
+  concurrency: 16
+  # Resident-memory cap per execution, enforced with ASan's
+  # hard_rss_limit_mb — deliberately NOT `ulimit -v`. The build is ASan,
+  # and ASan reserves ~20 TB of virtual address space for shadow memory at
+  # startup, so any `ulimit -v` low enough to be a useful cap kills the
+  # shell before main(): every execution fails identically and the run
+  # reports a 0% valid rate.
+  mem_limit_mb: 4096
+
+analysis:
+  # The coarse net. projects/spidermonkey/analyzer.py makes the actual
+  # decision and *subtracts* the shapes that match here but say nothing
+  # about the engine — above all OOM, which SpiderMonkey reports through
+  # MOZ_CRASH in places, the same channel a genuine impossible-state abort
+  # uses.
+  crash_patterns:
+    - "Assertion failure:"
+    - "Hit MOZ_CRASH"
+    - "AddressSanitizer"
+    - "UndefinedBehaviorSanitizer"
+    - "runtime error:"
+    - "Segmentation fault"
+    - "Illegal instruction"
+    - "Bus error"
+  # A fused JavaScript program is usually semantically broken, and an
+  # uncaught exception is the *expected* outcome, not a finding.
+  syntax_patterns:
+    - "SyntaxError"
+    - "ReferenceError"
+    - "TypeError"
+    - "RangeError"
+    - "InternalError"
+    - "is not defined"
+    - "is not a function"
+    - "unexpected token"
+
+paths:
+  seed_source: "projects/spidermonkey/seeds"
+  seed_corpus: "projects/spidermonkey/corpus.db"
+
+  seed_exclude_patterns:
+    # load() / loadRelativeToScript() pull in one of jit-test's lib/
+    # helpers. A fused seed no longer sits next to it, so every execution
+    # on such a file dies in the first line having tested nothing.
+    - pattern: '(?m)^\s*(?:load|loadRelativeToScript|snarf|read)\s*\('
+      reason: "loads a jit-test helper that is not in the corpus"
+    # ES modules: the shell needs --module for these, and their `import`
+    # bindings cannot be merged into a fused script the way statements can.
+    - pattern: '(?m)^\s*(?:import|export)\s+(?:\{|\*|default\b|[\w$]+\s+from)'
+      reason: "ES module; needs --module and cannot be fused as a script"
+    # Tests whose declared correct outcome is a specific failure. Like
+    # clang's -verify tests, the diagnostic *is* the expected result, so
+    # fusing them produces a program whose success criterion no longer
+    # exists. Note this is only the `error:`/`exitstatus:` form — the
+    # `allow-oom` form is kept, because analyzer.py can honour it at
+    # judgement time instead.
+    - pattern: '(?m)^//\s*\|jit-test\|.*\b(?:error|exitstatus)\s*:'
+      reason: "declares a specific failure as its correct outcome"
+    # Tests that only mean something under a build this adapter does not
+    # make, or on a platform check that will skip them anyway.
+    - pattern: '(?m)^//\s*\|jit-test\|.*\bskip-if\s*:.*\b(?:true|!getBuildConfiguration)'
+      reason: "unconditionally skipped by its own directive"
+    # Spawns a worker thread and communicates through postMessage. Fusing
+    # changes what the worker half runs, and a hang there is a timeout,
+    # not a finding.
+    - pattern: '(?m)\bevalInWorker\s*\(|\bsetSharedObject\s*\('
+      reason: "spawns a worker; nondeterministic and hangs rather than fails"
+    # Deliberate-crash primitives, the SpiderMonkey analogue of V8's
+    # triggerAssertFalse: their whole purpose is to abort the process on
+    # demand, so every execution on them is a guaranteed finding that says
+    # nothing about the engine.
+    - pattern: '\b(?:crash|assertJitStackInvariants|oomAfterAllocations|oomAtAllocation)\s*\('
+      reason: "deliberately aborts or asserts on demand"
+
+llm:
+  provider: "deepseek"
+  model: "deepseek-v4-flash"
+  api_key: ""
+  timeout: 30

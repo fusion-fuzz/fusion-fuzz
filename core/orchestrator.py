@@ -649,7 +649,20 @@ class FusionFuzzLoop:
         # 2. Determine file extension
         ext = self._seed_extension(seed)
 
-        test_filename = f"test{ext}"
+        # "test" is a stdlib package name in Python, and a reproducer saved
+        # as test.py shadows it: `import test.support`, which most of
+        # CPython's own corpus does, then resolves to the reproducer itself
+        # and dies with "'test' is not a package". Every CPython bundle
+        # that imports it was unreproducible — verified on a real
+        # heap-use-after-free that reproduced immediately once renamed.
+        #
+        # Only Python is affected (no other target here treats a bare
+        # filename as a module name), so only Python is renamed; changing
+        # the name everywhere would invalidate every existing bundle's
+        # test.sh for no gain. `min.<ext>` keeps its name — "min" shadows
+        # nothing.
+        stem = "ffl_repro" if ext == ".py" else "test"
+        test_filename = f"{stem}{ext}"
 
         # 3. Write test.<ext> — original reproducer
         try:

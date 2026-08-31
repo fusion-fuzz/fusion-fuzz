@@ -65,15 +65,39 @@ class TestCPythonSignatures(unittest.TestCase):
         self.assertIn("heap-use-after-free", sig)
 
     def test_fatal_python_error(self):
+        """The signature keeps the "Fatal Python error" prefix rather than
+        reducing to the bare signal name: the interpreter's own fatal
+        handler firing and a raw SIGSEGV are different failures and should
+        not share a bucket."""
         stderr = "Fatal Python error: Segmentation fault\nThread 0x00007f...\n"
         sig = self.driver.extract_crash_signature("", stderr, 139)
-        self.assertEqual(sig, "Segmentation fault")
+        self.assertEqual(sig, "Fatal Python error: Segmentation fault")
 
-    def test_assertion_failed(self):
-        stderr = "python: Objects/dictobject.c:1503: insertdict: Assertion `value != NULL` failed."
+    def test_assertion_failed_glibc_format(self):
+        """glibc's assert() closes the expression with a single quote.
+
+        This test previously fed ``Assertion `value != NULL` failed`` — a
+        backtick on *both* sides — which is not a format any assert()
+        produces. It matched the driver's regex because that regex had the
+        same mistake, so the test passed while the adapter could not
+        recognise a single real assertion failure.
+        """
+        stderr = ("python: Objects/dictobject.c:1503: insertdict: "
+                  "Assertion `value != NULL' failed.")
         sig = self.driver.extract_crash_signature("", stderr, 134)
         self.assertIn("Assertion", sig)
         self.assertIn("value != NULL", sig)
+        self.assertIn("Objects/dictobject.c:1503", sig)
+
+    def test_assertion_failed_cpython_format(self):
+        """CPython's own _PyObject_AssertFailed (Objects/object.c) uses
+        double quotes and appends a message — a second spelling the old
+        regex also missed."""
+        stderr = ('Objects/object.c:275: _Py_NegativeRefcount: '
+                  'Assertion "op->ob_refcnt > 0" failed: object has negative ref count')
+        sig = self.driver.extract_crash_signature("", stderr, 134)
+        self.assertIn("Assertion", sig)
+        self.assertIn("op->ob_refcnt > 0", sig)
 
     def test_bus_error(self):
         sig = self.driver.extract_crash_signature("", "Bus error (core dumped)", 135)

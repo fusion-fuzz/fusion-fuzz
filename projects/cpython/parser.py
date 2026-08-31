@@ -1,9 +1,37 @@
-import os
-import sqlite3
-import json
+"""
+projects/cpython/parser.py — turn .py files into seeds.
+
+The dataflow analysis below is kept as it was: it walks a real AST rather
+than guessing from line co-occurrence the way the C-family parser does,
+which is strictly better information and worth keeping.
+
+What changed is everything around it. The previous version reimplemented
+seed collection, the sqlite schema and corpus loading from scratch — about
+130 lines duplicating core/parser.py's BaseParser, which every other
+adapter in this repo subclasses. Two consequences: the metadata keys drift
+from what the framework reads, and improvements to BaseParser (the
+`identifier` uniqueness handling, the metadata merge) never reach this
+project.
+"""
+
+import importlib.util
 import ast
-import concurrent.futures
-import multiprocessing
+import os
+
+from core.parser import BaseParser
+
+# main.py loads project parsers by file path, so there is no package
+# context for a relative import.
+try:
+    from projects.cpython.analyzer import analyze_seed
+except ImportError:  # pragma: no cover - direct-load fallback
+    _spec = importlib.util.spec_from_file_location(
+        "ffl_cpython_analyzer_parser",
+        os.path.join(os.path.dirname(os.path.abspath(__file__)), "analyzer.py"))
+    _mod = importlib.util.module_from_spec(_spec)
+    _spec.loader.exec_module(_mod)
+    analyze_seed = _mod.analyze_seed
+
 
 class PythonFastDataflow:
     """
@@ -74,152 +102,70 @@ class PythonFastDataflow:
         
         return list(self.variables), self._merge_dataflows(self.interactions)
 
-def _process_seed_file(file_path, source_path):
-    """
-    Worker function to parse a single seed file.
-    """
-    seed_filename = os.path.relpath(file_path, source_path)
-    try:
-        with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
-            content = f.read()
-        
-        # Initialize Analyzer per file to be safe in threads
-        analyzer = PythonFastDataflow()
-        variables, dataflows = analyzer.analyze(content)
 
-        # Basic metadata extraction
-        metadata = {
-            "type": "python",
-            "filename": seed_filename,
-            "is_test": "test_" in seed_filename,
-            "variables": variables,
-            "dataflows": dataflows
-        }
-        
+class CPythonParser(BaseParser):
+    extensions = ['.py']
+    seed_type = 'python'
+
+    def parse_content(self, content, filename=""):
+        variables, dataflows = PythonFastDataflow().analyze(content)
+        facts = analyze_seed(content, filename)
         return {
-            "identifier": seed_filename, # Use filename as identifier for initial corpus
-            "content": content,
-            "metadata": metadata
+            # core/dryrun.py's _COLLECTORS and core/state_analysis.py's
+            # alias table both accept "python" and map it to the CPython
+            # collector / live-variable config.
+            "type":       "python",
+            "extension":  ".py",
+            "is_test":    "test_" in (filename or ""),
+            "variables":  variables,
+            "dataflows":  dataflows,
+            # Containment facts. CPython is the only target here whose
+            # seeds are executed, so these are what keep a concurrent loop
+            # from binding ports or forking — see projects/cpython/config.yaml.
+            "uses_ctypes":          facts["uses_ctypes"],
+            "touches_code_objects": facts["touches_code_objects"],
+            "uses_network":         facts["uses_network"],
+            "uses_subprocess":      facts["uses_subprocess"],
+            "writes_fs":            facts["writes_fs"],
+            "test_only":            facts["test_only"],
         }
-    except Exception as e:
-        print(f"Failed to read/parse seed {seed_filename}: {e}")
-        return None
+
+    def load_corpus(self, db_path):
+        """Load, backfilling dataflow metadata for any seed missing it.
+
+        setup.py builds corpus.db through this same parser, so on a normal
+        install this does nothing. It covers a corpus.db written by the
+        previous hand-rolled collector, whose rows predate the containment
+        keys.
+        """
+        seeds = super().load_corpus(db_path)
+        analyzer = PythonFastDataflow()
+        for seed in seeds:
+            meta = seed.get("metadata") or {}
+            if meta.get("dataflows") is not None:
+                continue
+            meta["variables"], meta["dataflows"] = analyzer.analyze(
+                seed.get("content") or "")
+            seed["metadata"] = meta
+        return seeds
+
+
+_parser = CPythonParser(__file__)
+
 
 def collect_seeds(source_path, blacklist=None):
-    """
-    Iterates over Python files in the CPython Lib/test directory,
-    parses them in parallel, and saves them to corpus.db.
-    """
-    if not os.path.exists(source_path):
-        print(f"Error: Seed source path not found: {source_path}")
-        return None
+    return _parser.collect_seeds(source_path, blacklist=blacklist)
 
-    seeds_output = []
-
-    # List files recursively
-    print(f"Scanning for .py files in {source_path}...")
-    seed_paths = []
-    try:
-        for root, _, files in os.walk(source_path):
-            for file in files:
-                if file.endswith('.py'):
-                    seed_paths.append(os.path.join(root, file))
-    except OSError as e:
-        print(f"Error listing directory {source_path}: {e}")
-        return None
-
-    total_files = len(seed_paths)
-    print(f"Found {total_files} seeds. Processing in parallel...")
-
-    # Use CPU count for AST parsing
-    max_workers = os.cpu_count() or 4
-
-    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
-        # Submit tasks
-        future_to_file = {executor.submit(_process_seed_file, fp, source_path): fp for fp in seed_paths}
-
-        completed = 0
-        skipped = 0
-        for future in concurrent.futures.as_completed(future_to_file):
-            res = future.result()
-            if res:
-                if blacklist and any(term in res["content"] for term in blacklist):
-                    skipped += 1
-                else:
-                    seeds_output.append(res)
-
-            completed += 1
-            if completed % 100 == 0:
-                print(f"  Parsed {completed}/{total_files}...")
-
-    if skipped:
-        print(f"Skipped {skipped} seeds matching blacklist.")
-
-    # Save to corpus.db in the project directory
-    try:
-        # Determine DB path relative to this script
-        current_dir = os.path.dirname(os.path.abspath(__file__))
-        db_path = os.path.join(current_dir, "corpus.db")
-        
-        print(f"Saving corpus to local DB: {db_path}...")
-        
-        conn = sqlite3.connect(db_path)
-        cursor = conn.cursor()
-        
-        # Use 'identifier' column instead of 'filename' to match core schema
-        cursor.execute('''
-            CREATE TABLE IF NOT EXISTS seeds (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                identifier TEXT UNIQUE,
-                content TEXT,
-                metadata TEXT
-            )
-        ''')
-        
-        # Batch insert for speed
-        inserts = []
-        for seed in seeds_output:
-            inserts.append((
-                seed['identifier'], 
-                seed['content'], 
-                json.dumps(seed['metadata'])
-            ))
-            
-        # Use INSERT OR IGNORE to skip duplicates if re-running
-        cursor.executemany('''
-            INSERT OR IGNORE INTO seeds (identifier, content, metadata) 
-            VALUES (?, ?, ?)
-        ''', inserts)
-        
-        count = len(inserts)
-        conn.commit()
-        conn.close()
-        print(f"Saved/Updated {count} seeds to {db_path}")
-        return db_path
-        
-    except Exception as e:
-        print(f"Error saving to corpus.db: {e}")
-        return None
 
 def load_corpus(db_path):
-    """
-    Loads seeds from the SQLite corpus.db into a list of dictionaries.
-    """
-    if not os.path.exists(db_path):
-        print(f"Corpus DB not found: {db_path}")
-        return []
+    return _parser.load_corpus(db_path)
 
-    conn = sqlite3.connect(db_path)
-    cursor = conn.cursor()
-    cursor.execute("SELECT identifier, content, metadata FROM seeds")
-    rows = cursor.fetchall()
-    conn.close()
 
-    seeds = []
-    for r in rows:
-        seeds.append({
-            "filename": r[0], # Map identifier back to filename for compatibility
-            "content": r[1],
-            "metadata": json.loads(r[2])
-        })
-    return seeds
+if __name__ == "__main__":
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    seeds_dir = os.path.join(script_dir, "seeds")
+    print("Executing CPython parser standalone.")
+    if os.path.exists(seeds_dir):
+        collect_seeds(seeds_dir)
+    else:
+        print(f"Error: 'seeds' directory not found at {seeds_dir}. Run setup.py first.")

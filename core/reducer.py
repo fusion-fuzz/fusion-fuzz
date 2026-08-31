@@ -161,7 +161,12 @@ def _find_test_file(bug_dir: str) -> tuple[str | None, str | None]:
         ext = os.path.splitext(fname)[1].lower()
         return _EXT_PRIORITY.get(ext, 2)
 
-    for prefix in ("test", "reproduce"):
+    # "ffl_repro" is what _save_crash_bundle names a Python reproducer:
+    # "test" is a stdlib package, so test.py shadows it and any reproducer
+    # doing `import test.support` dies with "'test' is not a package"
+    # instead of reproducing. Without this prefix --reduce cannot find a
+    # CPython bundle's reproducer at all.
+    for prefix in ("test", "ffl_repro", "reproduce"):
         candidates = [
             f for f in os.listdir(bug_dir)
             if f.startswith(prefix) and not f.endswith((".sh", ".out"))
@@ -277,7 +282,7 @@ def reduce_command(bug_dir: str, override_sig: str | None = None) -> None:
         sys.exit(1)
 
     ext = os.path.splitext(test_fname)[1]
-    min_fname = f"min{ext}"
+    min_fname = f"min{ext}"      # "min" shadows nothing, so it keeps its name
     min_path = os.path.join(bug_dir, min_fname)
 
     content = open(test_path, encoding="utf-8", errors="replace").read()

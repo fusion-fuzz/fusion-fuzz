@@ -90,11 +90,17 @@ class TestReproducerFiles(unittest.TestCase):
 
     def _check(self, project, ext):
         d = self._run(project, ext)
-        self.assertTrue(os.path.exists(os.path.join(d, f"test{ext}")),
-                        f"test{ext} missing for {project}")
+        # Python reproducers are named ffl_repro.py, not test.py: "test" is
+        # a stdlib package, and a file called test.py shadows it, so any
+        # reproducer doing `import test.support` — which most of CPython's
+        # corpus does — fails with "'test' is not a package" instead of
+        # reproducing. See the comment in _save_crash_bundle.
+        stem = "ffl_repro" if ext == ".py" else "test"
+        self.assertTrue(os.path.exists(os.path.join(d, f"{stem}{ext}")),
+                        f"{stem}{ext} missing for {project}")
         self.assertTrue(os.path.exists(os.path.join(d, f"min{ext}")),
                         f"min{ext} missing for {project}")
-        self.assertEqual(_read(os.path.join(d, f"test{ext}")), "crash_code()")
+        self.assertEqual(_read(os.path.join(d, f"{stem}{ext}")), "crash_code()")
         self.assertEqual(_read(os.path.join(d, f"min{ext}")), "crash_code()")
 
     def test_python(self):   self._check("cpython", ".py")
@@ -175,11 +181,16 @@ class TestCommandScript(unittest.TestCase):
         mode = os.stat(os.path.join(d, "test.sh")).st_mode
         self.assertTrue(mode & stat.S_IXUSR)
 
-    def test_test_sh_references_test_filename(self):
+    def test_test_sh_references_the_reproducer_it_wrote(self):
+        """Whatever the reproducer is called, test.sh must point at that
+        file — the bundle is worthless if the script names something the
+        directory does not contain."""
         d = self._make_bundle()
         content = _read(os.path.join(d, "test.sh"))
-        self.assertIn("test", content)
         self.assertNotIn("reproduce", content)
+        named = [f for f in os.listdir(d)
+                 if f != "test.sh" and os.path.splitext(f)[1] and f in content]
+        self.assertTrue(named, f"test.sh names no file in the bundle: {content!r}")
 
 
 # ---------------------------------------------------------------------------

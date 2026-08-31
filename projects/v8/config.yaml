@@ -1,0 +1,109 @@
+project_name: "v8"
+
+execution:
+  # projects/v8/driver.py builds the real command (d8 path, flag groups,
+  # ulimit) per seed; this is only BaseDriver's fallback.
+  command: "d8 {seed_path}"
+  # d8 executes a script in milliseconds, but a debug build with
+  # verify-heap on can be an order of magnitude slower, and fused code
+  # produces accidental long loops. Enough to be sure a timeout means a
+  # hang, not slow verification.
+  timeout: 20
+  concurrency: 16
+  # Resident-memory cap per execution, enforced with ASan's
+  # hard_rss_limit_mb — deliberately NOT `ulimit -v`. The build is
+  # is_asan, and ASan reserves ~20 TB of virtual address space for shadow
+  # memory at startup, so any `ulimit -v` low enough to be a useful cap
+  # kills d8 before main() with "ReserveShadowMemoryRange failed": every
+  # execution fails identically and the run reports a 0% valid rate.
+  mem_limit_mb: 4096
+  # V8's own heap ceiling, deliberately below mem_limit_mb so the engine
+  # reports a clean "JavaScript heap out of memory" — which analyzer.py
+  # files as resource exhaustion — before the ulimit turns it into a bare
+  # allocation failure that looks like a crash.
+  heap_limit_mb: 1024
+  # Fraction of executions that also run a differential (correctness)
+  # check: the same program under --jitless and under the optimising
+  # compilers, compared. A miscompile computes a wrong answer without
+  # crashing, so it is invisible to the crash oracle — and it is V8's most
+  # productive bug class. Each check costs two extra runs (three when it
+  # has to confirm a mismatch), so this trades crash throughput directly.
+  # Set to 0 to disable.
+  differential_rate: 0.30
+
+analysis:
+  # The coarse net. projects/v8/analyzer.py makes the actual decision and
+  # *subtracts* the shapes that match here but say nothing about V8 —
+  # above all OOM, which V8 reports through the same "Fatal error" channel
+  # as a genuine DCHECK failure.
+  crash_patterns:
+    - "# Fatal error"
+    - "Debug check failed"
+    - "Check failed"
+    - "V8 sandbox violation detected"
+    - "AddressSanitizer"
+    - "UndefinedBehaviorSanitizer"
+    - "runtime error:"
+    - "Segmentation fault"
+    - "Illegal instruction"
+  # A fused JavaScript program is usually semantically broken, and an
+  # uncaught exception is the *expected* outcome, not a finding. These are
+  # the shapes that mean "the fusion produced nonsense".
+  syntax_patterns:
+    - "SyntaxError"
+    - "ReferenceError"
+    - "TypeError"
+    - "RangeError"
+    - "is not defined"
+    - "is not a function"
+    - "Unexpected token"
+    - "Invalid or unexpected token"
+
+paths:
+  seed_source: "projects/v8/seeds"
+  seed_corpus: "projects/v8/corpus.db"
+
+  seed_exclude_patterns:
+    # `load()` / d8.file.execute() pull in a sibling script — nearly always
+    # mjsunit.js. A seed no longer sits next to it, so every execution on
+    # such a file dies in the first line having tested nothing.
+    - pattern: '(?m)^\s*(?:load|d8\.file\.execute)\s*\('
+      reason: "load()s a sibling script that is not in the corpus"
+    # ES modules: d8 needs --module for these, and their `import` bindings
+    # cannot be merged into a fused script the way statements can.
+    - pattern: '(?m)^\s*(?:import|export)\s+(?:\{|\*|default\b|[\w$]+\s+from)'
+      reason: "ES module; needs --module and cannot be fused as a script"
+    # Workers run the *same file* in a second isolate and communicate
+    # through postMessage. Fusing changes what the worker half runs, and a
+    # hang there is a timeout, not a finding.
+    - pattern: '(?m)\bnew\s+Worker\s*\('
+      reason: "spawns a Worker; nondeterministic and hangs rather than fails"
+    # Seeds whose purpose is to crash V8 on demand. triggerAssertFalse and
+    # its siblings are literally `DCHECK(false)` / `CHECK(false)`
+    # (src/extensions/trigger-failure-extension.cc) and %AbortJS calls
+    # base::OS::Abort — they are V8 self-testing its own failure
+    # machinery, so every execution on them is a guaranteed finding that
+    # says nothing about the engine.
+    - pattern: '\btrigger(?:Assert|Check|SlowAssert)False\s*\('
+      reason: "calls V8's deliberate DCHECK(false) trigger"
+    - pattern: '%(?:AbortJS|SystemBreak)\s*\('
+      reason: "deliberately aborts the process"
+    # NOTE: seeds that cannot take part in a differential comparison —
+    # those calling %GetOptimizationStatus, %IsBeingInterpreted, Math.random
+    # and the rest — are deliberately NOT excluded here. They are still
+    # worth fuzzing for crashes; projects/v8/driver.py skips only the
+    # correctness comparison for them (V8Driver._DIFF_INELIGIBLE).
+    # Tests that assert V8 must *fail* to compile them. Like clang's
+    # -verify tests, their expected output is a diagnostic.
+    - pattern: '(?m)^//\s*Files:.*mjsunit\.js|^//\s*MODULE\b'
+      reason: "harness-driven test; not runnable as a standalone script"
+    # NOTE: files using %-natives syntax are deliberately NOT excluded.
+    # They are the unsafe surface this adapter is aimed at; driver.py
+    # detects them and forces --allow-natives-syntax, without which they
+    # would not even parse.
+
+llm:
+  provider: "deepseek"
+  model: "deepseek-v4-flash"
+  api_key: ""
+  timeout: 30
