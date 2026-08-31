@@ -19,6 +19,10 @@ output/
 
 # Generated SQLite Databases (Corpus, Knowledge Bases)
 *.db
+# ...except the shared bug corpus, which is intentionally versioned via
+# git-lfs. It is only untracked-and-therefore-ignorable now because the
+# history rewrite removed it; `*.db` never applied while it was tracked.
+!corpus/corpus.db
 *.db.bak
 *.bak
 projects/*/corpus.db
