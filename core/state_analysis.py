@@ -60,6 +60,7 @@ LANGUAGE_ALIASES: Dict[str, str] = {
     "flang": "flang", "fortran": "flang", "f90": "flang",
     "mlir": "mlir",
     "naga": "naga", "wgsl": "naga",
+    "tint": "naga",
     "javascript": "javascript", "js": "javascript",
     "mjs": "javascript", "v8": "javascript",
     "spidermonkey": "javascript", "sm": "javascript",

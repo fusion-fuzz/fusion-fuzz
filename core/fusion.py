@@ -8536,6 +8536,13 @@ STRATEGY_REGISTRY = {
                              SwiftDeclarationFusionStrategy, SwiftStateFusionStrategy),
     "naga":     _StrategySet("projects/naga",     NagaFusionStrategy,
                              NagaDeclarationFusionStrategy, NagaStateFusionStrategy),
+    # tint is Dawn's WGSL compiler — the same language naga handles — so it
+    # reuses naga's three strategies verbatim, the way GCC reuses clang's
+    # and SpiderMonkey reuses V8's. The strategies are source-to-source and
+    # never invoke a compiler; nothing in them is naga-specific. What
+    # differs between the two targets is the driver and the crash oracle.
+    "tint":     _StrategySet("projects/tint",     NagaFusionStrategy,
+                             NagaDeclarationFusionStrategy, NagaStateFusionStrategy),
     # Rust has no state-fusion strategy; --struct-fusion is its own name for
     # the declaration technique.
     "rust":     _StrategySet("projects/rust",     RustFusionStrategy,

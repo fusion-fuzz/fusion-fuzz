@@ -60,7 +60,6 @@ DIAGNOSTIC2 = ("shader.wgsl:12:9 error: no matching call to 'textureSample(f32)'
 @pytest.mark.parametrize("output,kind", [
     (ICE, "ice"),
     (UNREACHABLE, "ice"),
-    (UNIMPLEMENTED, "ice"),
     (ASAN, "sanitizer"),
     (UBSAN, "ubsan"),
 ])
@@ -102,7 +101,25 @@ def test_ice_signature_names_the_source_location():
 
 def test_ice_kind_distinguishes_the_macro():
     assert analyzer.crash_signature(UNREACHABLE).startswith("UNREACHABLE:")
-    assert analyzer.crash_signature(UNIMPLEMENTED).startswith("UNIMPLEMENTED:")
+    assert analyzer.crash_signature(ICE).startswith("ICE:")
+
+
+def test_unimplemented_is_not_a_bug():
+    """TINT_UNIMPLEMENTED *declares* that a path was never written —
+    `default: TINT_IR_UNIMPLEMENTED(mod) << builtin.value()` and its kin.
+    Reaching one means the input used a feature tint does not support yet,
+    which is documented behaviour, not a defect; filing them would add one
+    entry per unsupported builtin.
+
+    TINT_ASSERT and TINT_UNREACHABLE are the opposite: they assert
+    something the compiler believes cannot happen, so reaching one is
+    always a real internal error. The campaign's first run produced a
+    `TINT_UNIMPLEMENTED subgroup_id` finding, which is what prompted the
+    distinction."""
+    verdict = analyzer.classify(UNIMPLEMENTED)
+    assert verdict["is_bug"] is False, verdict
+    assert verdict["kind"] == "unimplemented"
+    assert verdict["signature"] is None
 
 
 def test_signature_is_stable_across_volatile_detail():

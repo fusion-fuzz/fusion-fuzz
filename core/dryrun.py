@@ -774,6 +774,7 @@ _COLLECTORS: Dict[str, BaseMetadataCollector] = {
     "wgsl":    WGSLMetadataCollector(),
     "naga":    WGSLMetadataCollector(),
     "wgslc":   WGSLMetadataCollector(),
+    "tint":    WGSLMetadataCollector(),
     # projects/clang/parser.py's ClangParser.parse_content sets "type" to
     # one of these three depending on extension (.c/.cpp,.cc,.cxx,.mm/.m).
     "c":       ClangMetadataCollector(),
