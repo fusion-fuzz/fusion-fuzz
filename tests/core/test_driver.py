@@ -11,7 +11,8 @@ import tempfile
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
 
-from core.driver import BaseDriver, DockerDriver, ExecutionResult
+from core.driver import (BaseDriver, DockerDriver, ExecutionResult,
+                         cleanup_stale_processes)
 
 
 # ---------------------------------------------------------------------------
@@ -352,6 +353,50 @@ class TestDockerDriverExecute(unittest.TestCase):
 
         self.assertTrue(any(str(p).endswith(".go") for p in written_paths),
                         f"Expected .go extension, got paths: {written_paths}")
+
+
+class TestCleanupStaleProcesses(unittest.TestCase):
+    """An unconditional `pkill -9 -x <frontend>` also kills the compiles the
+    fuzzer's own worker threads have in flight: each comes back as return
+    code -9, which the analyzer cannot tell from a rejected test case, so
+    every sweep books a batch of valid tests as syntax errors. Only
+    processes older than the age threshold may be reaped."""
+
+    #: (pid, ppid, etimes, comm, args)
+    TABLE = [
+        (1, 0, 9999, "bash", "/bin/bash"),
+        (100, 1, 5000, "python3", "python3 main.py --project flang"),
+        (200, 100, 3, "flang", "flang -fsyntax-only /tmp/x.f90"),
+        (300, 100, 900, "flang", "flang -fsyntax-only /tmp/leaked.f90"),
+        (400, 1, 900, "python3", "python3 projects/flang/prune_corpus.py"),
+        (500, 1, 900, "vim", "vim projects/flang/driver.py"),
+    ]
+
+    def _reap(self, min_age=120.0, my_pid=100):
+        with patch("core.driver._process_table", return_value=self.TABLE), \
+             patch("core.driver.os.getpid", return_value=my_pid), \
+             patch("core.driver.os.kill") as killer:
+            cleanup_stale_processes("flang", min_age=min_age)
+        return {c.args[0] for c in killer.call_args_list}
+
+    def test_reaps_only_the_leaked_frontend(self):
+        self.assertEqual(self._reap(), {300})
+
+    def test_leaves_an_in_flight_compile_alone(self):
+        self.assertNotIn(200, self._reap())
+
+    def test_does_not_kill_another_tool_run_from_the_project_path(self):
+        """`python3 projects/flang/prune_corpus.py` matches the by-path
+        sweep but is not a leaked frontend."""
+        self.assertNotIn(400, self._reap())
+
+    def test_does_not_kill_itself_or_an_ancestor(self):
+        reaped = self._reap()
+        self.assertNotIn(100, reaped)
+        self.assertNotIn(1, reaped)
+
+    def test_does_not_kill_an_editor(self):
+        self.assertNotIn(500, self._reap())
 
 
 if __name__ == "__main__":

@@ -10,7 +10,7 @@ import logging
 import tokenize
 import keyword
 from dataclasses import dataclass, field
-from typing import List, Dict, Any, Tuple
+from typing import List, Dict, Any, Tuple, Set
 from .mutation import BaseMutator, PHPMutator, CPythonMutator, RustMutator, HaskellMutator
 
 logger = logging.getLogger("FFL.Fusion")
@@ -7135,9 +7135,15 @@ class FlangFusionStrategy(GenericDataflowStrategy):
         r'^(?:[A-Za-z_][\w()*,: \t]*?\s+)?(program|module|submodule|subroutine|function|block\s*data)\b',
         re.IGNORECASE,
     )
+    # A block opener only counts when it really requires a matching END.
+    # `DO 10 I=1,N` (labelled, terminated by the label), `FORALL (...) stmt`
+    # and `TYPE IS (...)` / `CLASS IS (...)` inside a SELECT TYPE are
+    # single statements, not blocks: counting them as openers desynchronises
+    # every depth-based scan below (unit splitting most of all).
     _INNER_OPEN_RE = re.compile(
-        r'^(if\s*\(.*\)\s*then\s*$|do\b|select\s*(?:case|type)\b'
-        r'|where\s*\(.*\)\s*$|forall\b.*$|type\s*(?!\()(?:,|::|\s|$)'
+        r'^(if\s*\(.*\)\s*then\s*$|do(?!\s+\d)\b|select\s*(?:case|type)\b'
+        r'|where\s*\(.*\)\s*$|forall\s*\(.*\)\s*$'
+        r'|type(?!\s*\()(?!\s+is\b)(?:\s*,|\s*::|\s|$)'
         r'|interface\b|associate\s*\(|block(?!\s*data)\b|critical\b'
         r'|enum\b|change\s+team\b)',
         re.IGNORECASE,
@@ -7510,7 +7516,470 @@ class FlangFusionStrategy(GenericDataflowStrategy):
     # ── Dataflow fusion: insert before the outermost unit's END ──────
 
 
+    # ── Dataflow fusion: carry A's declaration over with A's name ───
+
+    def _dataflow_replace(self, code: str, old: str, new: str) -> str:
+        """Replace one occurrence of `old`, matching case-insensitively:
+        Fortran folds case, so a name declared `Count` is the same entity
+        as `COUNT` two lines down, and a case-sensitive scan would miss
+        most of its uses."""
+        matches = [m for m in re.finditer(
+            rf'(?<!\w){re.escape(old)}(?!\w)', code, re.IGNORECASE)]
+        if not matches:
+            return code
+        m = random.choice(matches)
+        return code[:m.start()] + new + code[m.end():]
+
+    def _intrinsic_decls(self, code: str) -> Dict[str, str]:
+        """name -> a declaration statement for it, for every variable
+        `code` declares with an *intrinsic* type.
+
+        Derived types are deliberately excluded: their definition lives in
+        the donor's own program unit and is not visible from the unit the
+        name is being spliced into, so carrying such a declaration over
+        would only trade one error for another."""
+        decls: Dict[str, str] = {}
+        for m in self._FORTRAN_VAR_DECL_RE.finditer(code):
+            base = re.sub(r'\s+', ' ', m.group(1).strip())
+            kind = (m.group(2) or '').strip()
+            for name in m.group(3).split(','):
+                name = re.split(r'[\s(]', name.strip(), 1)[0]
+                if name:
+                    decls[name] = f"  {base}{kind} :: {name}"
+        return decls
+
+    def rename_across(self, code_a: str, code_b: str,
+                      names_a=None, names_b=None):
+        """Connect the two seeds by giving one of B's variables a name — and
+        a declared type — taken from A.
+
+        The base implementation just renames an occurrence in B to a name
+        from A. In C or PHP the fused halves share one scope, so that name
+        resolves; Fortran keeps A and B as separate program units, so the
+        spliced name is simply undeclared in B ("No explicit type declared
+        for 'x'" was the single largest source of invalid children here).
+        Copying A's declaration of the name into the *same* unit of B both
+        makes the child legal and is what actually crosses the two seeds:
+        B's expression now runs against A's declared type."""
+        decls_a = self._intrinsic_decls(code_a)
+        units_b, ok = self._split_top_level(code_b)
+        if not decls_a or not ok:
+            return super().rename_across(code_a, code_b, names_a, names_b)
+
+        idx = next((i for i, (k, _) in enumerate(units_b) if k == 'program'), None)
+        if idx is None:
+            idx = next((i for i, (k, _) in enumerate(units_b) if k == 'subprogram'), None)
+        if idx is None:
+            return super().rename_across(code_a, code_b, names_a, names_b)
+
+        unit = self._decompose_unit(units_b[idx][1])
+        declared_b = sorted(self._declared_names(unit["decls"]))
+        if not unit["execs"] or not declared_b:
+            return super().rename_across(code_a, code_b, names_a, names_b)
+
+        var_a = random.choice(sorted(decls_a))
+        var_b = random.choice(declared_b)
+        if var_a.upper() == var_b.upper():
+            return code_a, code_b
+
+        exec_text = '\n'.join(unit["execs"])
+        renamed = self._dataflow_replace(exec_text, var_b, var_a)
+        if renamed == exec_text:
+            return code_a, code_b
+        renamed = self._tag_renamed_lines(exec_text, renamed)
+
+        new_decls = list(unit["decls"])
+        if var_a.upper() not in {n.upper() for n in declared_b}:
+            new_decls.append(decls_a[var_a])
+
+        parts = ([unit["header"]] + new_decls + renamed.split('\n')
+                 + unit["tail"] + [unit["footer"]])
+        units_b[idx] = (units_b[idx][0],
+                        '\n'.join(p for p in parts if p is not None))
+        return code_a, '\n'.join(t for _, t in units_b)
+
+    # ── Program-unit structure ────────────────────────────────────
+    #
+    # Fortran has no braces: a file is a flat sequence of program units
+    # (PROGRAM / MODULE / SUBMODULE / SUBROUTINE / FUNCTION / BLOCK DATA),
+    # and the language enforces two rules that plain `code_a + code_b`
+    # concatenation violates on almost every pair:
+    #
+    #   1. "A source file cannot contain more than one main program" —
+    #      both sides of a fusion normally have one (an explicit PROGRAM
+    #      unit, or a bare specification+execution part with no header,
+    #      which *is* a main program).
+    #   2. A MODULE must precede any unit that USEs it.
+    #
+    # Splitting both sides into units lets the donor's main program be
+    # demoted to an ordinary SUBROUTINE and every module be hoisted, which
+    # is what makes a fused Fortran file compile at all.
+
+    _MODULE_HEAD_RE = re.compile(r'^(module|submodule)\b', re.IGNORECASE)
+    _PROGRAM_HEAD_RE = re.compile(r'^program\b', re.IGNORECASE)
+    _SUBPROGRAM_KW_RE = re.compile(r'\b(subroutine|function)\b', re.IGNORECASE)
+    _BLOCKDATA_HEAD_RE = re.compile(r'^block\s*data\b', re.IGNORECASE)
+    _CONTAINS_RE = re.compile(r'^contains\s*$', re.IGNORECASE)
+    _PREPROC_RE = re.compile(r'^\s*#')
+
+    #: First token of a statement that belongs to a unit's *specification*
+    #: part. Anything else starts the execution part.
+    _DECL_FIRST = frozenset((
+        "use", "import", "implicit", "integer", "real", "double", "complex",
+        "logical", "character", "type", "class", "parameter", "dimension",
+        "allocatable", "pointer", "target", "external", "intrinsic",
+        "common", "equivalence", "data", "namelist", "public", "private",
+        "protected", "optional", "intent", "save", "volatile",
+        "asynchronous", "bind", "value", "sequence", "interface",
+        "abstract", "enum", "procedure", "format", "entry", "generic",
+        "contiguous", "codimension", "automatic", "static", "end",
+    ))
+
+    @classmethod
+    def _unit_kind(cls, first_line: str) -> str:
+        """'module' | 'program' | 'subprogram' for a unit header line.
+
+        The SUBROUTINE/FUNCTION test comes first on purpose: a separate
+        module procedure is spelled `MODULE FUNCTION f(...)`, which starts
+        with `module` but is a subprogram, not a module."""
+        low = first_line.strip().lower()
+        if cls._SUBPROGRAM_KW_RE.search(low):
+            return 'subprogram'
+        if cls._MODULE_HEAD_RE.match(low):
+            return 'module'
+        if cls._PROGRAM_HEAD_RE.match(low):
+            return 'program'
+        if cls._BLOCKDATA_HEAD_RE.match(low):
+            return 'subprogram'
+        return 'subprogram'
+
+    @classmethod
+    def _split_top_level(cls, code: str):
+        """Split a file into top-level program units.
+
+        Returns ([(kind, text)], ok) with kind in
+        {'module', 'program', 'subprogram', 'loose'}; 'loose' is
+        comments/preprocessor lines between units. A header-less
+        specification+execution part is reported as 'program' — that is
+        exactly what Fortran calls it. `ok` is False when the depth scan
+        didn't balance, in which case callers must fall back to leaving
+        the text alone rather than rearranging a mis-parsed file."""
+        logical = cls._join_continuations(code)
+        units, cur = [], []
+        cur_kind = None
+        udepth = idepth = 0
+        ok = True
+
+        def flush(kind):
+            nonlocal cur, cur_kind
+            if cur:
+                units.append((kind, '\n'.join(cur)))
+            cur, cur_kind = [], None
+
+        for ll in logical:
+            first = cls._strip_comment(ll.split('\n', 1)[0]).strip()
+            kind = cls._classify(first)
+
+            if idepth > 0:
+                cur.append(ll)
+                if kind == 'inner_open':
+                    idepth += 1
+                elif kind == 'inner_close':
+                    idepth -= 1
+                continue
+
+            if udepth == 0:
+                if kind == 'unit_open':
+                    if cur:
+                        # Executable/spec text before this header is a
+                        # header-less main program only if it is more than
+                        # blank lines and comments.
+                        flush('program' if cls._is_code_block('\n'.join(cur)) else 'loose')
+                    cur = [ll]
+                    cur_kind = cls._unit_kind(first)
+                    udepth = 1
+                elif kind == 'unit_close':
+                    # Terminates a header-less main program.
+                    cur.append(ll)
+                    flush('program' if cls._is_code_block('\n'.join(cur)) else 'loose')
+                elif kind == 'inner_close':
+                    ok = False
+                    cur.append(ll)
+                else:
+                    if kind == 'inner_open':
+                        idepth += 1
+                    cur.append(ll)
+                continue
+
+            cur.append(ll)
+            if kind == 'unit_open':
+                udepth += 1
+            elif kind == 'unit_close':
+                udepth -= 1
+                if udepth == 0:
+                    flush(cur_kind or 'subprogram')
+            elif kind == 'inner_open':
+                idepth += 1
+
+        if cur:
+            flush(cur_kind or ('program' if cls._is_code_block('\n'.join(cur)) else 'loose'))
+        if udepth != 0 or idepth != 0:
+            ok = False
+        return units, ok
+
+    @classmethod
+    def _is_code_block(cls, text: str) -> bool:
+        """True when `text` holds a real statement (not just blank lines,
+        `!` comments and preprocessor directives)."""
+        for line in text.split('\n'):
+            if cls._PREPROC_RE.match(line):
+                continue
+            if cls._strip_comment(line).strip():
+                return True
+        return False
+
+    @classmethod
+    def _demote_main(cls, text: str, new_name: str) -> str:
+        """Turn a main program into `SUBROUTINE new_name ... END SUBROUTINE`.
+
+        Handles both spellings: an explicit `PROGRAM p` header (rewritten
+        in place) and a header-less main program (wrapped)."""
+        lines = text.split('\n')
+        head_idx = next((i for i, ln in enumerate(lines)
+                         if cls._strip_comment(ln).strip()), None)
+        has_header = (head_idx is not None
+                      and cls._PROGRAM_HEAD_RE.match(cls._strip_comment(lines[head_idx]).strip()))
+
+        end_idx = None
+        for i in range(len(lines) - 1, -1, -1):
+            stripped = cls._strip_comment(lines[i]).strip()
+            if not stripped:
+                continue
+            if cls._UNIT_CLOSE_RE.match(stripped) and not cls._INNER_CLOSE_RE.match(stripped):
+                end_idx = i
+            break
+
+        out = list(lines)
+        if end_idx is not None:
+            indent = out[end_idx][:len(out[end_idx]) - len(out[end_idx].lstrip())]
+            out[end_idx] = f"{indent}end subroutine {new_name}"
+        else:
+            out.append(f"end subroutine {new_name}")
+
+        if has_header:
+            indent = out[head_idx][:len(out[head_idx]) - len(out[head_idx].lstrip())]
+            out[head_idx] = f"{indent}subroutine {new_name}"
+        else:
+            out.insert(0, f"subroutine {new_name}")
+        return '\n'.join(out)
+
+    @classmethod
+    def _insert_call_before_end(cls, text: str, callee: str) -> str:
+        """Add `CALL callee` at the end of a unit's execution part — just
+        before its CONTAINS (if any), otherwise before its END."""
+        lines = text.split('\n')
+        stop = len(lines)
+        depth = 0
+        for i, ln in enumerate(lines):
+            stripped = cls._strip_comment(ln).strip()
+            if not stripped:
+                continue
+            kind = cls._classify(stripped)
+            if kind == 'inner_open':
+                depth += 1
+            elif kind == 'inner_close':
+                depth = max(depth - 1, 0)
+            elif depth == 0 and cls._CONTAINS_RE.match(stripped):
+                stop = i
+                break
+        else:
+            for i in range(len(lines) - 1, -1, -1):
+                stripped = cls._strip_comment(lines[i]).strip()
+                if not stripped:
+                    continue
+                if cls._UNIT_CLOSE_RE.match(stripped) and not cls._INNER_CLOSE_RE.match(stripped):
+                    stop = i
+                break
+        return '\n'.join(lines[:stop] + [f"  call {callee}"] + lines[stop:])
+
+    #: Base name given to a donor main program that had to be demoted so
+    #: the fused file keeps exactly one main program.
+    DONOR_MAIN_NAME = "ffl_donor_main"
+
+    @classmethod
+    def _unique_donor_name(cls, *codes: str) -> str:
+        """A demoted-main name not already taken. Fusion chains feed one
+        fused child back in as the next host, so a fixed name would collide
+        with the subroutine the previous link in the chain created."""
+        taken = ' '.join(codes).lower()
+        name = cls.DONOR_MAIN_NAME
+        n = 2
+        while re.search(rf'(?<!\w){name}(?!\w)', taken):
+            name = f"{cls.DONOR_MAIN_NAME}{n}"
+            n += 1
+        return name
+
+    def _concat_units(self, code_a: str, code_b: str) -> str:
+        """Concatenate two Fortran sources as one legal compilation unit:
+        at most one main program survives (the donor's is demoted to a
+        subroutine and called from the host's), and every MODULE is
+        hoisted ahead of the units that might USE it."""
+        units_a, ok_a = self._split_top_level(code_a)
+        units_b, ok_b = self._split_top_level(code_b)
+        if not (ok_a and ok_b):
+            return f"{code_a}\n{code_b}"
+
+        a_main = next((i for i, (k, _) in enumerate(units_a) if k == 'program'), None)
+        b_main = next((i for i, (k, _) in enumerate(units_b) if k == 'program'), None)
+
+        if a_main is not None and b_main is not None:
+            name = self._unique_donor_name(code_a, code_b)
+            units_b[b_main] = ('subprogram', self._demote_main(units_b[b_main][1], name))
+            if random.random() < 0.5:
+                units_a[a_main] = ('program',
+                                   self._insert_call_before_end(units_a[a_main][1], name))
+
+        mods = [t for k, t in units_a if k == 'module'] + [t for k, t in units_b if k == 'module']
+        rest = [t for k, t in units_a if k != 'module'] + [t for k, t in units_b if k != 'module']
+        return '\n'.join(mods + rest)
+
+
     # ── Top-level name-conflict resolution ────────────────────────
+    # ── Unit-body decomposition (spec part / execution part) ───────
+
+    _FIRST_TOKEN_RE = re.compile(r'^([A-Za-z_]\w*)')
+    _DECL_NAMES_RE = re.compile(r'::\s*(.+)$')
+
+    @classmethod
+    def _group_statements(cls, logical_lines: List[str]) -> List[str]:
+        """Group logical lines into statements, keeping a nested block
+        (IF/DO/SELECT/TYPE/INTERFACE/...) atomic as one entry — the same
+        rule _split_statements uses, but applied to a bare unit body that
+        has already had its header and footer removed."""
+        out: List[str] = []
+        cur: List[str] = []
+        idepth = 0
+        for ll in logical_lines:
+            first = cls._strip_comment(ll.split('\n', 1)[0]).strip()
+            kind = cls._classify(first)
+            if idepth > 0:
+                cur.append(ll)
+                if kind == 'inner_open':
+                    idepth += 1
+                elif kind == 'inner_close':
+                    idepth -= 1
+                    if idepth == 0:
+                        out.append('\n'.join(cur))
+                        cur = []
+                continue
+            if kind == 'inner_open':
+                cur = [ll]
+                idepth = 1
+            else:
+                out.append(ll)
+        if cur:
+            out.append('\n'.join(cur))
+        return out
+
+    @classmethod
+    def _stmt_head(cls, stmt: str) -> str:
+        """Lowercased first token of a statement's first code line ('' for
+        a blank/comment-only statement)."""
+        for line in stmt.split('\n'):
+            code = cls._strip_comment(line).strip()
+            if code:
+                m = cls._FIRST_TOKEN_RE.match(code)
+                return m.group(1).lower() if m else ''
+        return ''
+
+    @classmethod
+    def _decompose_unit(cls, text: str) -> dict:
+        """Split one program unit into header / specification part /
+        execution part / internal-subprogram tail / footer.
+
+        Fortran orders these strictly (USE, then IMPORT, then IMPLICIT,
+        then the rest of the declarations, then executable statements,
+        then CONTAINS), and violating the order is a hard error — which is
+        exactly what a position-blind line splice does."""
+        logical = cls._join_continuations(text)
+        header = footer = None
+
+        head_i = next((i for i, ll in enumerate(logical)
+                       if cls._strip_comment(ll.split('\n', 1)[0]).strip()), None)
+        if head_i is not None:
+            first = cls._strip_comment(logical[head_i].split('\n', 1)[0]).strip()
+            if cls._classify(first) == 'unit_open':
+                header = '\n'.join(logical[:head_i + 1])
+                logical = logical[head_i + 1:]
+
+        for i in range(len(logical) - 1, -1, -1):
+            code = cls._strip_comment(logical[i].split('\n', 1)[0]).strip()
+            if not code:
+                continue
+            if cls._UNIT_CLOSE_RE.match(code) and not cls._INNER_CLOSE_RE.match(code):
+                footer = '\n'.join(logical[i:])
+                logical = logical[:i]
+            break
+
+        stmts = cls._group_statements(logical)
+        decls: List[str] = []
+        execs: List[str] = []
+        tail: List[str] = []
+        in_exec = False
+        for idx, stmt in enumerate(stmts):
+            head = cls._stmt_head(stmt)
+            if not in_exec and head == 'contains':
+                tail = stmts[idx:]
+                break
+            if head == 'contains':
+                tail = stmts[idx:]
+                break
+            if in_exec:
+                execs.append(stmt)
+                continue
+            if head == '' or head in cls._DECL_FIRST:
+                decls.append(stmt)
+            else:
+                in_exec = True
+                execs.append(stmt)
+        return {"header": header, "footer": footer,
+                "decls": decls, "execs": execs, "tail": tail}
+
+    @classmethod
+    def _declared_names(cls, decls: List[str]) -> Set[str]:
+        names = set()
+        for stmt in decls:
+            head = cls._stmt_head(stmt)
+            if head in ('use', 'import', 'implicit', 'interface', 'procedure'):
+                continue
+            for line in stmt.split('\n'):
+                m = cls._DECL_NAMES_RE.search(cls._strip_comment(line))
+                if not m:
+                    continue
+                depth = 0
+                buf = ''
+                for ch in m.group(1) + ',':
+                    if ch in '([':
+                        depth += 1
+                    elif ch in ')]':
+                        depth -= 1
+                    if ch == ',' and depth == 0:
+                        nm = cls._FIRST_TOKEN_RE.match(buf.strip())
+                        if nm:
+                            names.add(nm.group(1))
+                        buf = ''
+                    else:
+                        buf += ch
+        return names
+
+    @staticmethod
+    def _rename_names(code: str, names, suffix: str) -> str:
+        for name in sorted(names, key=len, reverse=True):
+            code = re.sub(rf'(?<!\w){re.escape(name)}(?!\w)', name + suffix,
+                          code, flags=re.IGNORECASE)
+        return code
+
+
 
     def _extract_top_level_names(self, code: str):
         names = set()
@@ -7559,10 +8028,10 @@ class FlangFusionStrategy(GenericDataflowStrategy):
             fused = self._statement_fuse(code2, code1, variable2, variable1)
         elif mode == 'df_ab':
             new_code1, new_code2 = self.interleave_code_blocks(code1, code2, dataflow1, dataflow2)
-            fused = f"{new_code1}\n{new_code2}"
+            fused = self._concat_units(new_code1, new_code2)
         elif mode == 'df_ba':
             new_code2, new_code1 = self.interleave_code_blocks(code2, code1, dataflow2, dataflow1)
-            fused = f"{new_code1}\n{new_code2}"
+            fused = self._concat_units(new_code1, new_code2)
         else:
             raise ValueError(f"Unknown mode: {mode}")
 
@@ -7635,6 +8104,122 @@ class FlangStateFusionStrategy(FlangFusionStrategy):
         return {"type": host.metadata.get("type", "fortran"),
                 "extension": host.metadata.get("extension", ".f90")}
 
+    # ── Unit-aware four-segment weave ──────────────────────────────
+
+    def _merge_decls(self, host_decls: List[str], donor_decls: List[str]) -> List[str]:
+        """Concatenate two specification parts in the order Fortran
+        mandates: every USE first, then IMPORT, then a single IMPLICIT
+        (the donor's is dropped — a second one in the same scope is an
+        error), then everything else."""
+        def bucket(decls, keep_implicit):
+            uses, imports, implicits, rest = [], [], [], []
+            for stmt in decls:
+                head = self._stmt_head(stmt)
+                if head == 'use':
+                    uses.append(stmt)
+                elif head == 'import':
+                    imports.append(stmt)
+                elif head == 'implicit':
+                    if keep_implicit:
+                        implicits.append(stmt)
+                else:
+                    rest.append(stmt)
+            return uses, imports, implicits, rest
+
+        h_use, h_imp, h_impl, h_rest = bucket(host_decls, True)
+        d_use, d_imp, _, d_rest = bucket(donor_decls, False)
+        return h_use + d_use + h_imp + d_imp + h_impl + h_rest + d_rest
+
+    def _weave_mains(self, host_code: str, donor_code: str) -> str:
+        """Weave the donor's main program into the host's, segment by
+        segment, and keep every other unit of both files alongside.
+
+        The generic four-segment weave in core/state_analysis.py cuts on
+        raw line indices, which in Fortran lands inside a specification
+        part, an INTERFACE block or a derived-type definition far more
+        often than not. Here the cut is taken in the *execution part* of
+        each main program, the only region where an arbitrary statement
+        boundary is legal, and the two specification parts are merged
+        under Fortran's ordering rules instead of being interleaved."""
+        units_h, ok_h = self._split_top_level(host_code)
+        units_d, ok_d = self._split_top_level(donor_code)
+        if not (ok_h and ok_d):
+            return self._concat_units(host_code, donor_code)
+
+        h_idx = next((i for i, (k, _) in enumerate(units_h) if k == 'program'), None)
+        d_idx = next((i for i, (k, _) in enumerate(units_d) if k == 'program'), None)
+        if h_idx is None or d_idx is None:
+            return self._concat_units(host_code, donor_code)
+
+        host_main = self._decompose_unit(units_h[h_idx][1])
+        donor_text = units_d[d_idx][1]
+
+        # A name the donor declares for itself and the host also declares
+        # would be a duplicate declaration once the two specification
+        # parts share a scope, so rename the donor's copy.
+        donor_probe = self._decompose_unit(donor_text)
+        host_declared = {n.upper() for n in self._declared_names(host_main["decls"])}
+        clashes = {n for n in self._declared_names(donor_probe["decls"])
+                   if n.upper() in host_declared}
+        if clashes:
+            donor_text = self._rename_names(donor_text, clashes, "_ffl")
+        donor_main = self._decompose_unit(donor_text)
+
+        h_exec, d_exec = host_main["execs"], donor_main["execs"]
+        p = random.randint(0, len(h_exec))
+        q = random.randint(0, len(d_exec))
+        tag = self._tag("state")
+
+        def tagged(seg):
+            """Mark the first real statement of a donor segment so a
+            reader (and the line-based reducer) can see what came from the
+            donor."""
+            seg = list(seg)
+            idx = next((i for i, st in enumerate(seg) if st.strip()), None)
+            if tag and idx is not None:
+                seg[idx] = seg[idx] + f"  {tag}"
+            return seg
+
+        woven = (list(h_exec[:p]) + tagged(d_exec[:q])
+                 + list(h_exec[p:]) + tagged(d_exec[q:]))
+
+        tail = list(host_main["tail"])
+        donor_tail = list(donor_main["tail"])
+        if donor_tail:
+            # Drop the donor's own CONTAINS keyword when the host already
+            # opened one; otherwise reuse it verbatim.
+            if tail:
+                donor_tail = donor_tail[1:]
+            tail = tail + donor_tail
+
+        parts = []
+        if host_main["header"]:
+            parts.append(host_main["header"])
+        parts.extend(self._merge_decls(host_main["decls"], donor_main["decls"]))
+        parts.extend(woven)
+        parts.extend(tail)
+        if host_main["footer"]:
+            parts.append(host_main["footer"])
+        fused_main = '\n'.join(x for x in parts if x is not None)
+
+        rest_h = [(k, t) for i, (k, t) in enumerate(units_h) if i != h_idx]
+        rest_d = [(k, t) for i, (k, t) in enumerate(units_d) if i != d_idx]
+        mods = ([t for k, t in rest_h if k == 'module']
+                + [t for k, t in rest_d if k == 'module'])
+        others = ([t for k, t in rest_h if k != 'module']
+                  + [t for k, t in rest_d if k != 'module'])
+        return '\n'.join(mods + [fused_main] + others)
+
+    def _build_state_fused(self, host: Seed, donor: Seed, direction: str) -> Seed:
+        host_code, donor_code, _ = self._state_prepare(host, donor)
+        fused = self._weave_mains(host_code, donor_code)
+        return Seed(content=fused, metadata={
+            "parents": [host.id, donor.id],
+            **self._state_seed_metadata(host, donor),
+            "mode": f"state4_{direction}",
+            "description": f"State-fused {host.id} <- {donor.id} ({direction})",
+        })
+
     def fuse(self, parent_a: Seed, parent_b: Seed) -> Seed:
         return self._build_state_fused(parent_a, parent_b, "ab")
 
@@ -7686,7 +8271,7 @@ class FlangDeclarationFusionStrategy(FlangFusionStrategy):
             donor_name = random.choice(donor_names)
             fused_host, applied = self._inject_extends(host_code, donor_name)
 
-        fused = f"{donor_code}\n{fused_host}"
+        fused = self._concat_units(donor_code, fused_host)
 
         ext = host.metadata.get('extension', '.f90')
         seed_type = host.metadata.get('type', 'fortran')

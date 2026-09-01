@@ -258,11 +258,65 @@ class DockerDriver(BaseDriver):
         return res
 
 
-def cleanup_stale_processes(project_name: str):
+#: Extra process names (exact `comm`) a project's frontend may leave
+#: behind, beyond the obvious one named after the project itself.
+PROJECT_PROCESS_NAMES = {
+    "swift": ["swift-frontend"],
+    "rust": ["rustc"],
+    "clang": ["clang", "clang++"],
+    "flang": ["flang", "flang-22", "flang-new"],
+    "lfortran": ["lfortran"],
+}
+
+#: Command-line substrings identifying a project's frontend where its
+#: process name is too generic to match on (cpython's interpreter is just
+#: `python3`, which every other tool on the box is also called).
+PROJECT_PROCESS_PATTERNS = {
+    "cpython": ["build/python"],
+}
+
+#: A process younger than this (seconds) is assumed to be a *live*
+#: execution, not a leak, and is left alone.
+DEFAULT_STALE_AFTER = 120.0
+
+
+def _process_table():
+    """[(pid, ppid, etimes, comm, args)] for every process on this host."""
+    try:
+        res = subprocess.run(
+            ["ps", "-eo", "pid=,ppid=,etimes=,comm=,args="],
+            capture_output=True, text=True, timeout=30,
+        )
+    except Exception:
+        return []
+    rows = []
+    for line in res.stdout.splitlines():
+        parts = line.split(None, 4)
+        if len(parts) < 4:
+            continue
+        try:
+            pid, ppid, etimes = int(parts[0]), int(parts[1]), int(parts[2])
+        except ValueError:
+            continue
+        rows.append((pid, ppid, etimes, parts[3], parts[4] if len(parts) > 4 else ""))
+    return rows
+
+
+def _protected_pids(table):
+    """This process and every ancestor of it — killing any of them takes
+    the fuzzer (or the watchdog that restarts it) down with the leak."""
+    parents = {pid: ppid for pid, ppid, _, _, _ in table}
+    protected, pid = set(), os.getpid()
+    while pid and pid not in protected:
+        protected.add(pid)
+        pid = parents.get(pid, 0)
+    return protected
+
+
+def cleanup_stale_processes(project_name: str, min_age: float = DEFAULT_STALE_AFTER):
     """
-    Kill potential zombie/leaked compiler-or-interpreter-frontend processes
-    for `project_name`, to free resources between seed executions. Refined
-    to avoid killing user tools (editors, git, etc.) or self.
+    Kill leaked compiler-or-interpreter-frontend processes for
+    `project_name` to free resources between seed executions.
 
     Why this exists: BaseDriver._run_command's subprocess timeout only
     guarantees the *host*-side process (and its process group) is killed —
@@ -275,125 +329,56 @@ def cleanup_stale_processes(project_name: str):
     fuzzing loop, or during --dry-run/--pre-analysis) appear to hang even
     though each individual subprocess call still respected its own timeout.
 
+    Only processes older than `min_age` are killed. An unconditional
+    `pkill -9 -x flang` also kills the frontends the fuzzer's own worker
+    threads are running *right now*: each one comes back as return code
+    -9, which the analyzer cannot tell from a rejected test case, so every
+    sweep silently books a batch of valid tests as syntax errors. The same
+    applies to the by-path sweep below, which additionally used to match
+    (and SIGKILL) any other tool invoked with the project's path on its
+    command line — `python3 projects/flang/prune_corpus.py`, for instance.
+
     Shared by core/orchestrator.py's periodic in-loop cleanup and core/
     dryrun.py's --dry-run/--pre-analysis pass.
     """
-    print("cleanup zombie process")
-    # 1. Swift Cleanup
-    if project_name == "swift":
+    table = _process_table()
+    if not table:
+        return
+    protected = _protected_pids(table)
+    names = set(PROJECT_PROCESS_NAMES.get(project_name, []))
+    names.add(project_name)
+    patterns = list(PROJECT_PROCESS_PATTERNS.get(project_name, []))
+    # A driver may also run the frontend out of the project's own tree
+    # rather than under a well-known binary name.
+    tree_marker = f"projects/{project_name}"
+    safe_bins = ("vim", "nvim", "nano", "code", "git", "emacs", "less",
+                 "tail", "ps", "grep", "docker")
+    # The project's own tree also holds the tools that maintain it, and
+    # those run under an interpreter — `python3 projects/flang/
+    # prune_corpus.py` matches the by-tree sweep but is not a leaked
+    # frontend. (A project whose frontend genuinely *is* an interpreter
+    # names it in PROJECT_PROCESS_PATTERNS, which is not filtered here.)
+    interpreters = ("python", "python3", "bash", "sh", "perl", "ruby")
+
+    killed = 0
+    for pid, _ppid, etimes, comm, args in table:
+        if pid in protected or etimes < min_age:
+            continue
+        if any(comm.startswith(s) for s in safe_bins):
+            continue
+        by_name = comm in names
+        by_pattern = any(pat in args for pat in patterns)
+        by_tree = tree_marker in args and comm not in interpreters
+        if not (by_name or by_pattern or by_tree):
+            continue
         try:
-            subprocess.run(
-                ["pkill", "-f", "swift-frontend"],
-                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
-            )
-        except Exception:
+            os.kill(pid, 9)
+            killed += 1
+        except OSError:
             pass
 
-    # 2. Rust Cleanup
-    if project_name == "rust":
-        try:
-            subprocess.run(
-                ["pkill", "-f", "rustc"],
-                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
-            )
-        except Exception:
-            pass
-
-    # 3. CPython Cleanup
-    if project_name == "cpython":
-        try:
-            subprocess.run(
-                ["pkill", "-9", "-f", "build/python"],
-                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
-            )
-        except Exception:
-            pass
-
-    # 3b. Clang Cleanup
-    # NOTE: must NOT use `-f` (full command-line match) here — the
-    # orchestrator's own process is `python3 main.py --project clang
-    # ...`, and the watchdog wrapping it is `bash ./watchdog --project
-    # clang ...`. Both contain the substring "clang", so `pkill -9 -f
-    # clang` matched and SIGKILL'd the orchestrator (and watchdog) that
-    # was calling it, every ~2000 iterations. `-x` matches the exact
-    # process name only (clang/clang++), never python3 or bash.
-    if project_name == "clang":
-        try:
-            subprocess.run(
-                ["pkill", "-9", "-x", "clang"],
-                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
-            )
-            subprocess.run(
-                ["pkill", "-9", "-x", "clang++"],
-                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
-            )
-        except Exception:
-            pass
-
-    # 3c. Flang Cleanup — same `-x` (exact process name) requirement as
-    # clang above: the orchestrator's own cmdline is `python3 main.py
-    # --project flang ...`, so `pkill -f flang` would self-kill.
-    if project_name == "flang":
-        try:
-            subprocess.run(
-                ["pkill", "-9", "-x", "flang"],
-                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
-            )
-            subprocess.run(
-                ["pkill", "-9", "-x", "flang-22"],
-                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
-            )
-        except Exception:
-            pass
-
-    # 3d. LFortran Cleanup — same `-x` requirement as flang/clang above:
-    # the orchestrator's own cmdline is `python3 main.py --project
-    # lfortran ...`, so `pkill -f lfortran` would self-kill.
-    if project_name == "lfortran":
-        try:
-            subprocess.run(
-                ["pkill", "-9", "-x", "lfortran"],
-                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
-            )
-        except Exception:
-            pass
-
-    # 4. Local Process Cleanup
-    pattern = f"projects/{project_name}"
-
-    try:
-        # List full command lines matching the pattern
-        # pgrep -f -a output: PID COMMAND_LINE
-        res = subprocess.run(["pgrep", "-f", "-a", pattern], capture_output=True, text=True)
-
-        if res.returncode == 0:
-            my_pid = str(os.getpid())
-            safe_list = ["vim", "nvim", "nano", "code", "git", "emacs", "less", "tail"]
-
-            for line in res.stdout.splitlines():
-                parts = line.strip().split(" ", 1)
-                if len(parts) < 2: continue
-
-                pid, cmdline = parts[0], parts[1]
-
-                # Don't kill self
-                if pid == my_pid:
-                    continue
-
-                # Don't kill editors or safe tools
-                # Check if the command binary name contains any safe keyword
-                cmd_bin = cmdline.split(" ")[0]
-                if any(safe in cmd_bin for safe in safe_list):
-                    continue
-
-                # Kill the target
-                try:
-                    os.kill(int(pid), 9) # SIGKILL
-                except OSError:
-                    pass
-
-    except Exception:
-        pass
+    if killed:
+        logger.info(f"Reaped {killed} stale {project_name} process(es)")
 
 
 def get_driver(config):

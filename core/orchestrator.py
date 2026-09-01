@@ -851,10 +851,16 @@ class FusionFuzzLoop:
             logger.error(f"Failed to write README.md: {e}")
 
     def _cleanup_stale_processes(self):
-        """Kill potential zombie processes from the target project to free
-        resources — see core/driver.py's cleanup_stale_processes (shared
-        with core/dryrun.py's --dry-run/--pre-analysis pass)."""
-        cleanup_stale_processes(self.project_name)
+        """Kill leaked processes from the target project to free resources —
+        see core/driver.py's cleanup_stale_processes (shared with core/
+        dryrun.py's --dry-run/--pre-analysis pass).
+
+        The age threshold is derived from the per-seed execution timeout:
+        anything younger than a few timeouts is a compile a worker thread
+        still has in flight, and killing it books a valid test as a syntax
+        error."""
+        timeout = float(self.config.get("execution", {}).get("timeout", 10) or 10)
+        cleanup_stale_processes(self.project_name, min_age=max(3 * timeout, 60.0))
 
 
     # Strip ANSI/VT100 escape codes so pattern matching works even when the

@@ -95,8 +95,11 @@ class BaseParser:
                     metadata TEXT
                 )
             """)
+            pruned = pruned_identifiers(db_path)
             count = 0
             for seed in seeds:
+                if seed["identifier"] in pruned:
+                    continue
                 try:
                     cursor.execute(
                         "INSERT INTO seeds (identifier, content, metadata) VALUES (?, ?, ?)",
@@ -121,7 +124,56 @@ class BaseParser:
         cursor.execute("SELECT identifier, content, metadata FROM seeds")
         rows = cursor.fetchall()
         conn.close()
+        pruned = pruned_identifiers(db_path)
         return [
             {"filename": r[0], "content": r[1], "metadata": json.loads(r[2])}
-            for r in rows
+            for r in rows if r[0] not in pruned
         ]
+
+
+PRUNED_TABLE = "pruned_seeds"
+
+
+def pruned_identifiers(db_path: str) -> set:
+    """Identifiers a project's prune pass has rejected (e.g. seeds the
+    target itself won't accept — see projects/flang/prune_corpus.py).
+
+    Kept as a table of its own rather than by deleting rows, because the
+    seed sources are re-scanned on every `--setup` and re-injected by
+    `--bug-corpus`: deletion alone is undone on the next start, which is
+    how a pruned corpus quietly grew back to its unfiltered size.
+    """
+    if not os.path.exists(db_path):
+        return set()
+    try:
+        conn = sqlite3.connect(db_path)
+        try:
+            rows = conn.execute(f"SELECT identifier FROM {PRUNED_TABLE}").fetchall()
+        finally:
+            conn.close()
+    except sqlite3.Error:
+        return set()
+    return {r[0] for r in rows}
+
+
+def record_pruned(db_path: str, identifiers, reason: str = "") -> int:
+    """Mark `identifiers` as pruned and drop their rows. Returns the number
+    newly recorded."""
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.execute(
+            f"CREATE TABLE IF NOT EXISTS {PRUNED_TABLE} ("
+            "identifier TEXT PRIMARY KEY, reason TEXT)"
+        )
+        before = conn.execute(f"SELECT COUNT(*) FROM {PRUNED_TABLE}").fetchone()[0]
+        conn.executemany(
+            f"INSERT OR IGNORE INTO {PRUNED_TABLE} (identifier, reason) VALUES (?, ?)",
+            ((i, reason) for i in identifiers),
+        )
+        conn.executemany("DELETE FROM seeds WHERE identifier = ?",
+                         ((i,) for i in identifiers))
+        after = conn.execute(f"SELECT COUNT(*) FROM {PRUNED_TABLE}").fetchone()[0]
+        conn.commit()
+    finally:
+        conn.close()
+    return after - before

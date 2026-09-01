@@ -393,6 +393,11 @@ if __name__ == "__main__":
             dst_conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_seeds_identifier ON seeds(identifier)")
             dst_conn.commit()
 
+        # Seeds a prune pass rejected must not come back on the next run
+        # (see core/parser.py's pruned_identifiers).
+        from core.parser import pruned_identifiers
+        pruned = pruned_identifiers(project_corpus_path)
+
         added = skipped = 0
         for row in rows:
             trans = json.loads(row[3])
@@ -400,6 +405,9 @@ if __name__ == "__main__":
             if not code:
                 continue
             identifier = f"bug_corpus_{row[0]}_{row[1]}_{row[2] or row[0]}"
+            if identifier in pruned:
+                skipped += 1
+                continue
             try:
                 dst_conn.execute(
                     "INSERT INTO seeds (identifier, content, metadata) VALUES (?, ?, ?)",

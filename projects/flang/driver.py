@@ -49,7 +49,13 @@ class FlangDriver(BaseDriver):
         flags.extend(self._lang_flags(ext))
         if random.random() > 0.5:
             flags.append(f"-std={random.choice(self.STD_VALUES)}")
-        flags.extend(random.sample(self.MISC_FLAGS, random.randint(0, 3)))
+        misc = random.sample(self.MISC_FLAGS, random.randint(0, 3))
+        # flang rejects -fdefault-double-8 on its own ("requires
+        # -fdefault-real-8"), so drawing it alone makes the run fail for a
+        # reason that has nothing to do with the test case.
+        if "-fdefault-double-8" in misc and "-fdefault-real-8" not in misc:
+            misc.append("-fdefault-real-8")
+        flags.extend(misc)
         return " ".join(flags)
 
     def execute(self, seed):
