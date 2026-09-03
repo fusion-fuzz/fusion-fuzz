@@ -32,7 +32,7 @@ foreach ($fusion as $str) //foreach ($values as $str)
 
 - **State fusion** — bridge behaviors at the *interesting program points - the point holding more live variables* via interleaving program statements.
 
-```clang
+```c++
 /* seed A */
 struct D {
 friend bool operator==(const D&, const D&) = default;
