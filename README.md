@@ -32,19 +32,37 @@ foreach ($fusion as $str) //foreach ($values as $str)
 
 - **State fusion** — bridge behaviors at the *interesting program points - the point holding more live variables* via interleaving program statements.
 
-```c++
-/* seed A */
-struct D {
-friend bool operator==(const D&, const D&) = default;
-};
-/* seed B */
-export module foo:bar; // state fusion
-/* seed A */
-struct TestD {
-friend constexpr bool operator==(const D&, const D&);
-bool operator==(const G&, const G&);
-};
-// Assertion: DeclModule && "hidden decl.." failed
+```php
+<?php
+function dump($dom, $name) {
+$list = $dom->getElementsByTagName($name)[0]
+->getInScopeNamespaces();
+foreach ($list as $entry) {
+	/* self state fusion */ /* more live variables */
+	$dom = Dom\XMLDocument::createFromString(<<<XML
+	<root xmlns="urn:a">
+	<child xmlns="">
+	<c:child xmlns:c="urn:c"/> </child>
+	<b:sibling xmlns:b="urn:b" xmlns:d="urn:d" d:foo="bar">
+	</b:sibling>
+	</root>
+	XML);
+	dump($dom, 'c:child');
+	dump($dom, 'child');
+}
+}
+$dom = Dom\XMLDocument::createFromString(<<<XML
+<root xmlns="urn:a">
+<child xmlns="">
+<c:child xmlns:c="urn:c"/> </child>
+<b:sibling xmlns:b="urn:b" xmlns:d="urn:d" d:foo="bar">
+<d:child xmlns:d="urn:d2"/>
+</b:sibling>
+</root>
+XML);
+dump($dom, 'c:child');
+dump($dom, 'child');
+// SUMMARY: AddressSanitizer: double-free
 ```
 
 - **Declaration fusion** — enforce *declaration dependencies* instead of variables or statements. 
