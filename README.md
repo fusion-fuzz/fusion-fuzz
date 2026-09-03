@@ -61,9 +61,20 @@ Supported projects are:
 | ![Flang](https://img.shields.io/badge/Flang-supported-brightgreen?logo=llvm&logoColor=white) | **Supported** | ✅ | ✅ | ✅ |
 | ![LFortran](https://img.shields.io/badge/LFortran-supported-brightgreen?logo=fortran&logoColor=white) | **Supported** | ✅ | ✅ | ✅ |
 | ![Haskell](https://img.shields.io/badge/GHC-supported-brightgreen?logo=haskell&logoColor=white) | **Supported** | ✅ | ✅ | ✅ |
-| ![Rust](https://img.shields.io/badge/Rust-experimental-orange?logo=rust&logoColor=white) | **Experimental** | ✅ | — | ✅ |
-| ![GCC](https://img.shields.io/badge/GCC-planned-lightgrey?logo=gnu&logoColor=white) | **Planned** | - | - | - |
-| ![JavaScript](https://img.shields.io/badge/JavaScript-planned-lightgrey?logo=javascript&logoColor=white) | **Planned** | - | - | - |
+| ![Rust](https://img.shields.io/badge/Rust-experimental-orange?logo=rust&logoColor=white) | **Experimental** | ✅ | ✅ | ✅ |
+| ![GCC](https://img.shields.io/badge/GCC-experimental-orange?logo=gnu&logoColor=white) | **Experimental** | ✅ | ✅ | ✅ |
+| ![Go](https://img.shields.io/badge/Go-experimental-orange?logo=go&logoColor=white) | **Experimental** | ✅ | ✅ | ✅ |
+| ![V8](https://img.shields.io/badge/V8-experimental-orange?logo=googlechrome&logoColor=white) | **Experimental** | ✅ | ✅ | ✅ |
+| ![SpiderMonkey](https://img.shields.io/badge/SpiderMonkey-experimental-orange?logo=firefoxbrowser&logoColor=white) | **Experimental** | ✅ | ✅ | ✅ |
+| ![Naga](https://img.shields.io/badge/Naga-experimental-orange?logo=webgpu&logoColor=white) | **Experimental** | ✅ | ✅ | ✅ |
+| ![Tint](https://img.shields.io/badge/Tint-experimental-orange?logo=webgpu&logoColor=white) | **Experimental** | ✅ | ✅ | ✅ |
+| ![Triton](https://img.shields.io/badge/Triton-experimental-orange?logo=nvidia&logoColor=white) | **Experimental** | ✅ | ✅ | ✅ |
+
+**Supported** means the adapter has been run at length, its valid-fusion rate
+measured, and real bugs reported from it. **Experimental** means all three
+fusion strategies are wired and the adapter runs end to end, but it has had far
+less fuzzing time, so its valid-fusion rate and its oracle's false-positive
+behaviour are not yet well characterised.
 
 **Bugs found by Fusion Fuzz are tracked at https://fusion-fuzz.github.io (updated periodically).**
 
