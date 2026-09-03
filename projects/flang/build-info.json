@@ -1,0 +1,8 @@
+{
+  "binary": "/home/fuzz/WorkSpace/fusion-fuzz/projects/flang/llvm-flang-build/bin/flang",
+  "sanitizers": "Address;Undefined",
+  "assertions": true,
+  "expensive_checks": false,
+  "commit": "957aee8a62e3b9b06d413322fa8fbbe36a3965e9",
+  "source": "/home/fuzz/WorkSpace/fusion-fuzz/projects/flang/llvm-project"
+}

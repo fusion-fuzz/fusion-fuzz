@@ -1,0 +1,77 @@
+{
+ "key": "/home/fuzz/WorkSpace/fusion-fuzz/projects/flang/llvm-flang-build/bin/flang@1788336161.2003636",
+ "accepted": {
+  "MISC_FLAGS": [
+   "-fdefault-real-8",
+   "-fdefault-integer-8",
+   "-fno-automatic",
+   "-finit-global-zero",
+   "-fsave-main-program",
+   "-flarge-sizes",
+   "-fstack-arrays",
+   "-fbackslash",
+   "-fimplicit-none",
+   "-falternative-parameter-statement",
+   "-flogical-abbreviations",
+   "-fxor-operator",
+   "-funderscoring",
+   "-fno-underscoring",
+   "-fhermetic-module-files",
+   "-ffast-math",
+   "-freciprocal-math",
+   "-fno-signed-zeros",
+   "-fapprox-func",
+   "-ffp-contract=fast",
+   "-ffp-contract=off",
+   "-fcomplex-arithmetic=basic",
+   "-fcomplex-arithmetic=improved",
+   "-fcomplex-arithmetic=full",
+   "-funroll-loops",
+   "-fno-unroll-loops",
+   "-floop-interchange",
+   "-fversion-loops-for-stride",
+   "-frealloc-lhs",
+   "-fno-realloc-lhs",
+   "-pedantic"
+  ],
+  "DRIVER_ONLY_FLAGS": [
+   "-fdefault-double-8",
+   "-fassociative-math",
+   "-fno-honor-nans",
+   "-fno-honor-infinities",
+   "-fvectorize",
+   "-fno-vectorize",
+   "-g",
+   "-gline-tables-only"
+  ],
+  "LOWERING_FLAGS": [],
+  "VERIFIER_FLAGS": [
+   "-mllvm -verify-dom-info",
+   "-mllvm -verify-loop-info",
+   "-mllvm -verify-scev",
+   "-mllvm -verify-region-info",
+   "-mllvm -verify-machineinstrs"
+  ],
+  "TARGETS": [
+   "--target=x86_64-unknown-linux-gnu",
+   "--target=aarch64-unknown-linux-gnu",
+   "--target=powerpc64le-unknown-linux-gnu",
+   "--target=riscv64-unknown-linux-gnu"
+  ],
+  "FC1_ACTIONS": [
+   "-fsyntax-only",
+   "-fdebug-unparse",
+   "-fdebug-unparse-with-symbols",
+   "-fdebug-dump-symbols",
+   "-fdebug-dump-parse-tree",
+   "-fdebug-dump-provenance",
+   "-fdebug-dump-all",
+   "-fdebug-pre-fir-tree",
+   "-fdebug-dump-pft",
+   "-emit-hlfir -o /dev/null",
+   "-emit-fir -o /dev/null",
+   "-emit-mlir -o /dev/null",
+   "-emit-llvm -o /dev/null"
+  ]
+ }
+}

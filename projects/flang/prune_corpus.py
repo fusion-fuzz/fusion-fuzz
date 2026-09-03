@@ -33,19 +33,20 @@ sys.path.insert(0, os.path.abspath(
     os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..")))
 
 from core.parser import record_pruned  # noqa: E402
+from projects.flang.driver import FlangDriver  # noqa: E402
 
 FIXED_FORM_EXTS = ('.f', '.F')
-TIMEOUT = 20
+TIMEOUT = 60  # an ASan-instrumented flang runs several times slower
 
 
 def _check(args):
-    workdir, seed_id, identifier, content, ext = args
+    workdir, seed_id, identifier, content, ext, prefix, binary = args
     path = os.path.join(workdir, f"s{seed_id}{ext}")
     try:
         with open(path, "w", encoding="utf-8") as fh:
             fh.write(content)
         proc = subprocess.run(
-            f"ulimit -v 3145728; flang -fsyntax-only {path}",
+            f"{prefix}{binary} -fsyntax-only {path}",
             shell=True, capture_output=True, text=True,
             timeout=TIMEOUT, cwd=workdir,
         )
@@ -68,8 +69,16 @@ def main():
     ap.add_argument("--dry-run", action="store_true")
     args = ap.parse_args()
 
-    if not shutil.which("flang"):
-        sys.exit("flang not found in PATH — run this inside the fuzzing container.")
+    # The pruning oracle has to be the *same* compiler the campaign fuzzes:
+    # trunk flang accepts a different set of programs from a packaged one,
+    # and a seed pruned against the wrong compiler is either a lost seed or
+    # a permanently invalid one.
+    driver = FlangDriver({"project_name": "flang", "execution": {}})
+    binary, prefix = driver.flang_bin, driver._env_prefix()
+    if binary == FlangDriver.FLANG_BIN and not shutil.which("flang"):
+        sys.exit("No flang: run projects/flang/setup.py first, "
+                 "and run this inside the fuzzing container.")
+    print(f"oracle: {binary}" + (" (sanitized)" if driver.sanitized else ""))
 
     conn = sqlite3.connect(args.db)
     rows = conn.execute("SELECT id, identifier, content, metadata FROM seeds").fetchall()
@@ -93,7 +102,8 @@ def main():
     try:
         with cf.ThreadPoolExecutor(args.jobs) as pool:
             results = list(pool.map(
-                _check, ((workdir, i, ident, c, e) for i, ident, c, e in todo)))
+                _check, ((workdir, i, ident, c, e, prefix, binary)
+                         for i, ident, c, e in todo)))
     finally:
         shutil.rmtree(workdir, ignore_errors=True)
 

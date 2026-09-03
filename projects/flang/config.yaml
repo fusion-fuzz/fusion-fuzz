@@ -4,13 +4,25 @@ execution:
   # The driver picks flags dynamically per seed; this template is only
   # used as a BaseDriver fallback.
   command: "flang -fsyntax-only {seed_path}"
-  timeout: 10
+  # Sized for the sanitizer-instrumented compiler projects/flang/setup.py
+  # builds: ASan+UBSan makes flang several times slower, and at 10s roughly
+  # one execution in seven was timing out at -O3 — each one booked as a
+  # syntax error, since a timeout is indistinguishable from a rejected
+  # program to the analyzer.
+  timeout: 40
   concurrency: 16
 
 analysis:
   crash_patterns:
+    # Both the SUMMARY and the ERROR line: a sanitizer report normally ends
+    # with SUMMARY, but ASan's allocator hard-errors (an absurd allocation
+    # size, which in a compiler means a size was computed wrong) print only
+    # the ERROR line. setup.py builds flang with ASan+UBSan by default, so
+    # these are live oracles, not dead patterns.
     - "SUMMARY: AddressSanitizer"
+    - "ERROR: AddressSanitizer"
     - "SUMMARY: UndefinedBehaviorSanitizer"
+    - "runtime error: "
     - "LLVM ERROR"
     - "Assertion `"
     - "Stack dump:"
