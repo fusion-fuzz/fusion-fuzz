@@ -609,7 +609,27 @@ def mlir_strip_outer_module(src: str) -> str:
             break
     if not s.startswith("module"):
         return src
+    # `module attributes {...} { ... }` has *two* brace groups, and the
+    # first belongs to the attribute dictionary, not to the module body.
+    # Taking `find("{")` returns the attribute list as if it were the
+    # body: the operations are dropped and a bare `"ttg.num-warps" = 4 :
+    # i32, ...` is spliced in where code should be, which then fails to
+    # parse with `expected '(' to start operand list`. Triton's corpus is
+    # mostly this form — 230 of its 297 tests — so the wrong brace was
+    # taken almost every time.
     lb = s.find("{")
+    if lb != -1 and re.match(r'module\s+attributes\b', s):
+        depth = 0
+        for i, ch in enumerate(s[lb:], start=lb):
+            if ch == "{":
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+                if depth == 0:
+                    # First `{` after the attribute dictionary closes.
+                    nxt = s.find("{", i + 1)
+                    lb = nxt if nxt != -1 else -1
+                    break
     if lb == -1:
         return src
     depth = 0
@@ -3487,8 +3507,19 @@ class MLIRFusionStrategy(FusionStrategy):
         # Invalid MLIR types that never exist in any registered dialect
         re.compile(r':\s*!(?:string|void|llvm\.str(?:ing)?|object)\b'),
     ]
+    # Evidence that a body really is MLIR, used to reject LLM-generated
+    # pseudo-code. The list must name every dialect a *project* using this
+    # strategy can produce, not just upstream MLIR's: the Triton adapter
+    # feeds in IR whose operations are all `tt.`/`ttg.`/`ttng.`, and with
+    # only the upstream dialects listed every Triton module was judged
+    # implausible and dropped whole — the fused output became an empty
+    # shell carrying `// (seed A not plausible MLIR — omitted)`, which
+    # then failed to parse because triton-opt does not register `func`.
     _HAS_MLIR_STRUCTURE = re.compile(
         r'func\.func\b|arith\.\w|scf\.\w|memref\.\w|module\s*\{|cf\.\w|linalg\.\w'
+        # Triton and its GPU dialects (triton-opt --show-dialects).
+        r'|tt\.\w|ttg\.\w|ttng\.\w|tti\.\w|nvws\.\w|gluon\.\w|proton\w*\.\w'
+        r'|amdg\.\w|nvg\.\w'
     )
 
     def _is_plausible_mlir(self, body: str) -> bool:
@@ -9116,6 +9147,15 @@ STRATEGY_REGISTRY = {
     "cpython":  _StrategySet("projects/cpython",  CPythonFusionStrategy,
                              CPythonDeclarationFusionStrategy, CPythonStateFusionStrategy),
     "mlir":     _StrategySet("projects/mlir",     MLIRFusionStrategy,
+                             MLIRDeclarationFusionStrategy, MLIRStateFusionStrategy),
+    # Triton's triton-opt is an MLIR pass driver reading and writing the
+    # same textual IR, so it reuses MLIR's three strategies verbatim — the
+    # arrangement GCC has with clang's and tint has with naga's. The
+    # strategies are source-to-source and never invoke a compiler; nothing
+    # in them is specific to a dialect. What differs between the two
+    # targets is the driver (which pass pipeline to run) and the crash
+    # oracle.
+    "triton":   _StrategySet("projects/triton",   MLIRFusionStrategy,
                              MLIRDeclarationFusionStrategy, MLIRStateFusionStrategy),
     "swift":    _StrategySet("projects/swift",    SwiftFusionStrategy,
                              SwiftDeclarationFusionStrategy, SwiftStateFusionStrategy),

@@ -59,6 +59,7 @@ LANGUAGE_ALIASES: Dict[str, str] = {
     "haskell": "haskell", "hs": "haskell", "ghc": "haskell",
     "flang": "flang", "fortran": "flang", "f90": "flang",
     "mlir": "mlir",
+    "triton": "mlir",
     "naga": "naga", "wgsl": "naga",
     "tint": "naga",
     "javascript": "javascript", "js": "javascript",

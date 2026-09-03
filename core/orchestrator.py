@@ -421,6 +421,14 @@ class FusionFuzzLoop:
         # letters and would match any project name containing them.
         elif self.project_name == "go" or "golang" in self.project_name:
             ext = meta.get("extension") or ".go"
+        # Anything the chain above does not name falls back to what the
+        # project's parser recorded. Without this a new adapter silently
+        # gets ".txt": its test.sh names the extension the compiler needs
+        # (tint requires .wgsl, triton .mlir) while the file beside it is
+        # test.txt, so the saved reproducer cannot be re-run — the same
+        # defect the clang branch above documents.
+        elif meta.get("extension"):
+            ext = meta["extension"]
         return ext
 
     def _fuse_pair(self, host_seed, donor_seed):

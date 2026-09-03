@@ -771,6 +771,7 @@ _COLLECTORS: Dict[str, BaseMetadataCollector] = {
     "v8":      JavaScriptMetadataCollector(),
     "spidermonkey": JavaScriptMetadataCollector(),
     "mlir":    MLIRMetadataCollector(),
+    "triton":  MLIRMetadataCollector(),
     "wgsl":    WGSLMetadataCollector(),
     "naga":    WGSLMetadataCollector(),
     "wgslc":   WGSLMetadataCollector(),

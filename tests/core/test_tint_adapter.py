@@ -288,3 +288,102 @@ def test_two_distinct_ices_do_not_collapse_under_asan():
     other = ICE_UNDER_ASAN.replace("ir_to_program.cc:1110", "builder.cc:42")
     assert (analyzer.crash_signature(ICE_UNDER_ASAN)
             != analyzer.crash_signature(other))
+
+
+def test_bundle_uses_the_wgsl_extension():
+    """A saved reproducer must carry the extension its compiler needs.
+
+    _seed_extension names a handful of projects explicitly and fell back to
+    ".txt" for everything else, so every tint bundle was written as
+    test.txt while its own test.sh named a .wgsl path — the reproducer
+    could not be re-run without renaming it by hand. The parser already
+    records the right extension; the fallback now uses it.
+    """
+    from core.orchestrator import FusionFuzzLoop
+
+    class _Loop:
+        project_name = "tint"
+
+    class _Seed:
+        metadata = {"extension": ".wgsl"}
+
+    assert FusionFuzzLoop._seed_extension(_Loop(), _Seed()) == ".wgsl"
+
+
+def test_unknown_project_still_falls_back_to_txt():
+    """The fallback only fires when the parser recorded an extension."""
+    from core.orchestrator import FusionFuzzLoop
+
+    class _Loop:
+        project_name = "some-new-target"
+
+    class _Seed:
+        metadata = {}
+
+    assert FusionFuzzLoop._seed_extension(_Loop(), _Seed()) == ".txt"
+
+
+# ---------------------------------------------------------------------------
+# Sanitizer signatures must name tint's code, not libstdc++
+# ---------------------------------------------------------------------------
+
+SEGV_THROUGH_STDLIB = (
+    "/b/dawn/src/tint/lang/wgsl/writer/ir_to_program/ir_to_program.cc:369:64: "
+    "runtime error: member call on null pointer of type 'struct StatementList'\n"
+    "AddressSanitizer:DEADLYSIGNAL\n"
+    "==1==ERROR: AddressSanitizer: SEGV on unknown address 0x000000000058\n"
+    "    #0 0x55 in std::__atomic_base<unsigned int>::load(std::memory_order) const "
+    "/usr/include/c++/13/bits/atomic_base.h:505\n"
+    "    #2 0x55 in tint::Vector<x>::Push(y) /b/dawn/src/tint/utils/containers/vector.h:697\n"
+    "SUMMARY: AddressSanitizer: SEGV /usr/include/c++/13/bits/atomic_base.h:505 "
+    "in std::__atomic_base<unsigned int>::load(std::memory_order) const\n")
+
+
+def test_sanitizer_signature_names_tint_not_the_standard_library():
+    """ASan's SUMMARY names wherever the faulting instruction happened to
+    be. For a null dereference through a container that is a libstdc++
+    header, so the signature became
+    `atomic_base.h:505 in std::__atomic_base<unsigned int>::load` for a bug
+    whose real location is ir_to_program.cc:369 — grouping by standard
+    library internals rather than by the defect. UBSan's own line, or the
+    first tint frame in the backtrace, is used instead.
+    """
+    sig = analyzer.crash_signature(SEGV_THROUGH_STDLIB)
+    assert "atomic_base" not in sig, sig
+    assert "src/tint/lang/wgsl/writer/ir_to_program/ir_to_program.cc:369" in sig
+
+
+def test_null_deref_gets_one_signature_whichever_sanitizer_reports_it():
+    """A null dereference through a container is always reported by UBSan
+    and *sometimes* also by ASan as a SEGV, depending on whether ASan gets
+    to print before the process dies.
+
+    Keying the two cases differently filed one bug under two names — a
+    16-hour run produced both `AddressSanitizer__SEGV_at_...:369` and
+    `UBSAN__member_call_on_null_pointer_of_type__struct_StatementList_`
+    for the same fault at the same line.
+    """
+    ubsan_only = SEGV_THROUGH_STDLIB.split("AddressSanitizer:DEADLYSIGNAL")[0]
+    assert (analyzer.crash_signature(ubsan_only)
+            == analyzer.crash_signature(SEGV_THROUGH_STDLIB))
+    assert "ir_to_program.cc:369" in analyzer.crash_signature(ubsan_only)
+
+
+def test_a_real_use_after_free_keeps_its_own_kind():
+    """Unifying the null-deref case must not blur distinct memory bugs."""
+    sig = analyzer.crash_signature(ASAN)
+    assert "heap-use-after-free" in sig
+    assert "NULL-DEREF" not in sig
+
+
+def test_sanitizer_signature_keeps_the_fault_kind():
+    """The kind comes from ASan's ERROR line, not from SUMMARY's first
+    token, which is a path when SUMMARY already points into tint."""
+    sig = analyzer.crash_signature(ASAN)
+    assert "heap-use-after-free" in sig, sig
+
+
+def test_distinct_memory_bugs_do_not_collide():
+    other = ASAN.replace("src/tint/lang/core/ir/module.cc:88",
+                         "src/tint/lang/hlsl/writer/printer/printer.cc:570")
+    assert analyzer.crash_signature(ASAN) != analyzer.crash_signature(other)

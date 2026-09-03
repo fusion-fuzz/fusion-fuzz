@@ -63,6 +63,26 @@ _RESOURCE_RE = re.compile(
     re.IGNORECASE | re.M)
 
 _ASAN_RE = re.compile(r"SUMMARY: (\w+Sanitizer):\s*([^\n]+)")
+
+# The first frame inside tint's own code, from an ASan backtrace. ASan's
+# SUMMARY names wherever the fault instruction happened to be, which for a
+# null dereference through a container is a standard-library header —
+# `atomic_base.h:505 in std::__atomic_base<unsigned int>::load` was the
+# signature for a bug whose real location is ir_to_program.cc:369. That
+# groups by libstdc++ internals rather than by the defect, so two distinct
+# tint bugs can collide and one bug can land under two names.
+# The fault kind, taken from ASan's own ERROR line rather than from
+# SUMMARY: "heap-use-after-free", "SEGV", "heap-buffer-overflow".
+_ASAN_KIND_RE = re.compile(r"ERROR: \w+Sanitizer:\s*([\w-]+)")
+
+_TINT_FRAME_RE = re.compile(
+    r"^\s*#\d+\s+\S+\s+in\s+.*?((?:\.\./)*[\w./-]*src/tint/[\w./-]+:\d+)", re.M)
+
+# UBSan prints the offending source location directly, before ASan reports
+# the signal. When present it is the most precise answer available.
+_UBSAN_LOC_RE = re.compile(
+    r"^((?:\.\./)*[\w./-]*src/tint/[\w./-]+:\d+):\d+:\s*runtime error:\s*([^\n]+)",
+    re.M)
 _UBSAN_RE = re.compile(r"runtime error:\s*([^\n]+)")
 
 # src/tint/utils/ice/ice.cc:
@@ -180,7 +200,40 @@ def classify(output):
     # ICE first cannot swallow one.
     m = _ASAN_RE.search(text)
     if m:
-        return hit("sanitizer", f"{m.group(1)}: {_normalize(m.group(2))}")
+        kind_name, detail = m.group(1), _normalize(m.group(2))
+        # Prefer a location inside tint over whatever SUMMARY named; see
+        # _TINT_FRAME_RE for why SUMMARY alone groups badly.
+        loc = _UBSAN_LOC_RE.search(text)
+        where = _short_path(loc.group(1)) if loc else None
+        if where is None:
+            frame = _TINT_FRAME_RE.search(text)
+            where = _short_path(frame.group(1)) if frame else None
+        if where:
+            km = _ASAN_KIND_RE.search(text)
+            fault = km.group(1) if km else "fault"
+            # A null dereference through a container is reported by UBSan
+            # and *sometimes* also by ASan as a SEGV, depending on whether
+            # ASan gets to print before the process dies. Both name the
+            # same fault at the same line, so key them the same way — the
+            # location leads, and the reporting sanitizer does not enter
+            # the signature for that case.
+            if fault == "SEGV" and _UBSAN_LOC_RE.search(text):
+                return hit("sanitizer", f"NULL-DEREF at {where}")
+            return hit("sanitizer", f"{kind_name}: {fault} at {where}")
+        return hit("sanitizer", f"{kind_name}: {detail}")
+    # UBSan alone, with no ASan report after it. Group by *location*, the
+    # same way the sanitizer branch above does: whether ASan also manages
+    # to print before the process dies varies between runs, and keying the
+    # UBSan case on its message text alone gave the same fault two
+    # different signatures depending on which sanitizer got there first.
+    m = _UBSAN_LOC_RE.search(text)
+    if m:
+        msg = _normalize(m.group(2)).split(" of type")[0]
+        where = _short_path(m.group(1))
+        # Same key the ASan branch uses when the two coincide.
+        if "null pointer" in msg:
+            return hit("ubsan", f"NULL-DEREF at {where}")
+        return hit("ubsan", f"UBSAN: {msg} at {where}")
     m = _UBSAN_RE.search(text)
     if m:
         return hit("ubsan", f"UBSAN: {_normalize(m.group(1))}")
