@@ -143,4 +143,9 @@ rq2-clang.py
 tempcwd/
 junk*.zip
 *.patch
-projects/triton/
+# The fetched sources and the build, not the adapter itself. A blanket
+# `projects/triton/` here hid the seven adapter files from git entirely.
+projects/triton/triton-src/
+projects/triton/triton-build/
+projects/triton/deps/
+projects/triton/seeds/

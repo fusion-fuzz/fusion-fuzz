@@ -1,0 +1,72 @@
+project_name: "triton"
+
+execution:
+  # projects/triton/driver.py builds the real command (pass pipeline,
+  # flags, ulimit) per seed; this is only BaseDriver's fallback.
+  command: "triton-opt {seed_path}"
+  # triton-opt runs a pipeline over a small module in milliseconds, but a
+  # fused module can send a pass into deep recursion. Enough to be sure a
+  # timeout means a hang, not slow lowering.
+  timeout: 30
+  concurrency: 16
+  # Address-space cap per execution, with `ulimit -v`. Safe here — unlike
+  # the V8/SpiderMonkey/tint adapters, this triton-opt links a prebuilt
+  # LLVM that is *not* sanitiser-instrumented, so nothing reserves a 20 TB
+  # shadow mapping for `-v` to collide with.
+  mem_limit_mb: 4096
+
+analysis:
+  # The coarse net. projects/triton/analyzer.py makes the actual decision
+  # and *subtracts* the shapes that match here but say nothing about
+  # Triton — above all out-of-memory, which LLVM reports through the same
+  # `LLVM ERROR:` channel as a genuine fatal error.
+  crash_patterns:
+    - "Assertion `"
+    - "UNREACHABLE executed"
+    - "LLVM ERROR:"
+    - "PLEASE submit a bug report"
+    - "Stack dump:"
+    - "Segmentation fault"
+    - "AddressSanitizer"
+    - "runtime error:"
+  # A fused MLIR module is usually ill-typed — two modules' tensor layouts
+  # rarely agree — so an ordinary verifier diagnostic is the expected
+  # outcome, not a finding.
+  syntax_patterns:
+    - "error: "
+    - "expected "
+    - "failed to legalize"
+    - "op requires"
+    - "invalid kind of type"
+    - "custom op 'tt."
+    - "custom op 'ttg."
+
+paths:
+  seed_source: "projects/triton/seeds"
+  seed_corpus: "projects/triton/corpus.db"
+
+  seed_exclude_patterns:
+    # Tests whose declared correct outcome is a failure. Like clang's
+    # -verify tests, the diagnostic *is* the expected result:
+    # `-verify-diagnostics` makes triton-opt exit non-zero unless every
+    # error marked with `expected-error` fires. Fusing them produces a
+    # module whose success criterion no longer exists, so each one is a
+    # guaranteed finding that says nothing about the compiler.
+    # setup.py already skips these at collection time; this is the guard
+    # for a corpus built some other way.
+    - pattern: 'expected-error|verify-diagnostics'
+      reason: "declares a specific failure as its correct outcome"
+    # `split-file` tests are several files bundled into one, separated by
+    # `//--- name` markers, with the RUN line feeding triton-opt a single
+    # member. The bundle as a whole is not valid IR.
+    - pattern: '(?m)^//\s*RUN:\s*split-file'
+      reason: "a bundle of several files; not valid IR on its own"
+    # External resources the seed no longer sits next to.
+    - pattern: '(?m)^//\s*RUN:.*%[tT]/'
+      reason: "reads a companion file that is not in the corpus"
+
+llm:
+  provider: "deepseek"
+  model: "deepseek-v4-flash"
+  api_key: ""
+  timeout: 30
