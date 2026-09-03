@@ -70,13 +70,13 @@ dump($dom, 'child');
 Example of declaration fusion:
 
 ```swift
-/* seed A */
+// seed A
 class C: P {}
-/* seed B */ 
+// seed B  
 class Generic<T> : Concrete {
   typealias GenericAlias = (T, T)
 }
-protocol BaseProto: C {} /* declaration dependency from A to B */
+protocol BaseProto: C {} // declaration dependency from A to B
 protocol ProtoRefinesClass where Self : Generic<Int>, Self : BaseProto {
   func requirementUsesClassTypes(_: ConcreteAlias, _: GenericAlias)
 }
