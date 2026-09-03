@@ -30,18 +30,35 @@ foreach ($fusion as $str) //foreach ($values as $str)
 // AddressSanitizer: heap-use-after-free ..
 ```
 
-- **State fusion** — bridge behaviors at the *most complex state - the state holding most live variables* via interleaving program statements.
+- **State fusion** — bridge behaviors at the *interesting program points - the point holding more live variables* via interleaving program statements.
 
-- **Declaration fusion** — bridges *declarations* instead of runtime values. 
+```clang
+/* seed A */
+struct D {
+friend bool operator==(const D&, const D&) = default;
+};
+/* seed B */
+export module foo:bar; // state fusion
+/* seed A */
+struct TestD {
+friend constexpr bool operator==(const D&, const D&);
+bool operator==(const G&, const G&);
+};
+// Assertion: DeclModule && "hidden decl.." failed
+```
+
+- **Declaration fusion** — enforce *declaration dependencies* instead of variables or statements. 
 
 Example of declaration fusion:
 
 ```swift
+/* seed A */
 class C: P {}
+/* seed B */ 
 class Generic<T> : Concrete {
   typealias GenericAlias = (T, T)
 }
-protocol BaseProto: C {}
+protocol BaseProto: C {} /* declaration dependency from A to B */
 protocol ProtoRefinesClass where Self : Generic<Int>, Self : BaseProto {
   func requirementUsesClassTypes(_: ConcreteAlias, _: GenericAlias)
 }
@@ -80,7 +97,7 @@ behaviour are not yet well characterised.
 
 Try fusion-fuzz: 
 
-() fusion-fuzz is tested in ubuntu 22.04 and ubuntu 24.04.
+(fusion-fuzz is tested in ubuntu 22.04 and ubuntu 24.04)
 
 (i) before cloning fusion-fuzz, please install *git-lfs*, which is necessary to download our translated corpus (hundreds of MBs).
 
@@ -95,5 +112,4 @@ Try fusion-fuzz:
 (vi) create a tmux bash and start the fuzzer in the docker. `python3 main.py --project php --setup --pre-analysis --dataflow-fusion --state-fusion --declaration-fusion`
 
 
-
-You should be able to see bugs found by fusion-fuzz in ./output/bugs/<project-name>
+You should be able to see bugs found by fusion-fuzz in ./output/bugs/<project-name>.
