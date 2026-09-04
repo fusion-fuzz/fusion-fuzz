@@ -39,6 +39,18 @@ class LLMGenerator:
         self.timeout = llm_config.get("timeout", 60) # Increased timeout for reasoning models
 
         # Initialize OpenAI Client if applicable (DeepSeek is OpenAI API-compatible)
+        # The last transport-level failure, so a caller can tell a rate
+        # limit apart from a malformed request. Every _call_* below returns
+        # None on failure, which on its own says nothing about whether
+        # retrying would help.
+        self.last_error = None
+        self.last_status = None
+        # Token usage of the last call, taken from the provider's own
+        # accounting rather than estimated: a daily quota is counted by the
+        # provider, so anything we compute ourselves would drift from the
+        # number that actually matters.
+        self.last_usage = None
+
         self.openai_client = None
         if self.provider in ("openai", "deepseek"):
             if HAS_OPENAI_LIB and self.api_key:
@@ -48,6 +60,57 @@ class LLMGenerator:
                     logger.error(f"Failed to initialize OpenAI client: {e}")
             elif not HAS_OPENAI_LIB:
                 logger.warning(f"{self.provider} provider selected but 'openai' library not found. Falling back to requests.")
+
+    def _record_usage(self, data):
+        """Pull token counts out of a response, whatever shape it has."""
+        u = None
+        if data is None:
+            u = None
+        elif isinstance(data, dict):
+            u = data.get("usage") or data.get("usageMetadata")
+        else:
+            u = getattr(data, "usage", None)
+        if u is None:
+            self.last_usage = None
+            return
+        get = (u.get if isinstance(u, dict) else lambda k, d=0: getattr(u, k, d))
+        prompt = (get("prompt_tokens", 0) or get("promptTokenCount", 0) or 0)
+        completion = (get("completion_tokens", 0) or get("candidatesTokenCount", 0) or 0)
+        total = (get("total_tokens", 0) or get("totalTokenCount", 0) or 0)
+        self.last_usage = {
+            "prompt": int(prompt or 0),
+            "completion": int(completion or 0),
+            "total": int(total or 0) or int(prompt or 0) + int(completion or 0),
+        }
+
+    def _record_error(self, exc):
+        """Remember what went wrong, and the HTTP status when there is one.
+
+        Providers surface a status in three different places depending on
+        the client: a `requests` HTTPError carries `response.status_code`,
+        the openai library raises objects with `status_code`, and some
+        wrappers only put the number in the message."""
+        self.last_error = exc
+        status = None
+        resp = getattr(exc, "response", None)
+        if resp is not None:
+            status = getattr(resp, "status_code", None)
+        if status is None:
+            status = getattr(exc, "status_code", None)
+        if status is None:
+            m = re.search(r"\b(4\d\d|5\d\d)\b", str(exc))
+            if m:
+                status = int(m.group(1))
+        self.last_status = status
+        # Honour Retry-After when the server sends one.
+        self.retry_after = None
+        if resp is not None:
+            try:
+                ra = resp.headers.get("Retry-After")
+                if ra:
+                    self.retry_after = float(ra)
+            except Exception:
+                pass
 
     def _clean_response(self, text):
         """
@@ -82,6 +145,7 @@ class LLMGenerator:
             response = requests.post(url, json=payload, timeout=self.timeout)
             response.raise_for_status()
             data = response.json()
+            self._record_usage(data)
             
             candidates = data.get("candidates", [])
             if not candidates:
@@ -91,6 +155,7 @@ class LLMGenerator:
             return raw_text
 
         except Exception as e:
+            self._record_error(e)
             logger.error(f"Gemini API Error: {e}")
             return None
 
@@ -116,6 +181,7 @@ class LLMGenerator:
             response = requests.post(url, headers=headers, json=payload, timeout=self.timeout)
             response.raise_for_status()
             data = response.json()
+            self._record_usage(data)
             
             choices = data.get("choices", [])
             if not choices:
@@ -125,6 +191,7 @@ class LLMGenerator:
             return raw_text
 
         except Exception as e:
+            self._record_error(e)
             logger.error(f"vLLM API Error: {e}")
             return None
 
@@ -145,9 +212,11 @@ class LLMGenerator:
             response = requests.post(url, json=payload, timeout=self.timeout)
             response.raise_for_status()
             data = response.json()
+            self._record_usage(data)
             return data.get("response", "")
 
         except Exception as e:
+            self._record_error(e)
             logger.error(f"Ollama API Error: {e}")
             return None
 
@@ -181,8 +250,10 @@ class LLMGenerator:
 
             try:
                 response = self.openai_client.chat.completions.create(**kwargs)
+                self._record_usage(response)
                 return response.choices[0].message.content
             except Exception as e:
+                self._record_error(e)
                 logger.error(f"{provider_label} API Error (Library): {e}")
                 return None
 
@@ -211,6 +282,7 @@ class LLMGenerator:
             response = requests.post(url, headers=headers, json=payload, timeout=self.timeout)
             response.raise_for_status()
             data = response.json()
+            self._record_usage(data)
 
             choices = data.get("choices", [])
             if not choices:
@@ -220,6 +292,7 @@ class LLMGenerator:
             return raw_text
 
         except Exception as e:
+            self._record_error(e)
             logger.error(f"{provider_label} API Error (Requests): {e}")
             return None
 
