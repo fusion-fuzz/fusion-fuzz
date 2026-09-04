@@ -86,6 +86,8 @@ _REPORTING_FRAMES = (
     "cmd/compile/internal/base.AssertfAt",
     "cmd/compile/internal/base.ErrorfAt",
     "cmd/compile/internal/ssa.(*Func).Fatalf",
+    "cmd/compile/internal/ssa.(*Func).FatalfWithPos",
+    "cmd/compile/internal/ssagen.(*ssafn).Fatalf",
     "cmd/compile/internal/ssa.(*Value).Fatalf",
     "cmd/compile/internal/ssa.(*Block).Fatalf",
     # Panic plumbing. The compiler converts a panic into an ICE by
@@ -102,12 +104,39 @@ _REPORTING_FRAMES = (
 # values, temporary paths, autotmp numbering, goroutine ids.
 _VOLATILE = [
     (re.compile(r"0x[0-9a-f]{4,}"), "0xADDR"),
+    # Fusion renames symbols by appending a short hash ("main_dbb0557") and
+    # names synthesised packages after a full content hash. Both are per-test.
+    #
+    # Both patterns demand at least one a-f. Decimal digits are a subset of
+    # the hex alphabet, so a bare [0-9a-f]{16,} also matches a long decimal
+    # number, and Go puts those in ICE messages that we group on:
+    #   "bad type: struct { b [1214748364700000000]byte }"
+    # would normalize to "[HASH]byte", merging defects that differ only in
+    # the array length. The cost of the restriction is losing an all-digit
+    # hash, which is (10/16)**7 ~ 4% of the short ones.
+    (re.compile(r"\b(?=[0-9a-f]{16,}\b)[0-9a-f]*[a-f][0-9a-f]*\b"), "HASH"),
+    (re.compile(r"([A-Za-z_]\w*)_(?=[0-9a-f]{6,8}\b)[0-9a-f]*[a-f][0-9a-f]*\b"),
+     r"\1_HASH"),
     (re.compile(r"\b\.autotmp_\d+"), ".autotmp_N"),
     (re.compile(r"\bgoroutine \d+"), "goroutine N"),
     (re.compile(r"/tmp/[\w./-]+"), "TMP"),
     (re.compile(r"\bv\d+\b"), "vN"),            # SSA value names
     (re.compile(r"\bb\d+\b"), "bN"),            # SSA block names
 ]
+
+
+# base.FatalfAt prefixes an ICE with the enclosing function's symbol:
+#   "internal compiler error: 'main_dbb0557': unknown aux type for LoweredZero"
+# The symbol is a property of the input, not of the bug, so the same defect
+# arrives under a different name from every test. Strip it before grouping.
+# No length bound: a generic instantiation symbol carries its full shape
+# types and runs to several hundred characters, e.g.
+#   'EqualMap[go.shape.map[go.shape.struct { main.hi uint64; ... }]struct {},...]'
+_SYMBOL_PREFIX_RE = re.compile(r"^'[^']*':\s*")
+
+
+def _strip_symbol_prefix(detail):
+    return _SYMBOL_PREFIX_RE.sub("", detail)
 
 
 def _normalize(text):
@@ -168,7 +197,7 @@ def classify(output):
     m = _ICE_RE.search(text)
     if m:
         frame = _failing_frame(text)
-        detail = _normalize(m.group(1))
+        detail = _normalize(_strip_symbol_prefix(m.group(1).strip()))
         # The frame is the better grouping key when there is one: the same
         # broken invariant reached from two places is two bugs, and the
         # message often embeds the offending type or value.
