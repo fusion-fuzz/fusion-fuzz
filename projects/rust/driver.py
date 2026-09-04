@@ -87,7 +87,26 @@ class RustDriver(BaseDriver):
 
     # -Z flags that check rustc's own output. Weighted so the two verifiers
     # are common and the rest sample the space.
-    VERIFIERS = ["-Zvalidate-mir", "-Zverify-llvm-ir=yes"]
+    VERIFIERS = [
+        "-Zvalidate-mir",
+        "-Zverify-llvm-ir=yes",
+        # Complements the two above rather than repeating them:
+        # validate-mir checks MIR is well-formed after each transform,
+        # lint-mir runs the MIR linter before and after each one, and
+        # lint-llvm-ir lints the IR that verify-llvm-ir only verifies.
+        "-Zlint-mir=yes",
+        "-Zlint-llvm-ir=yes",
+        # Const-evaluation has its own UB rules and its own checker.
+        "-Zextra-const-ub-checks=yes",
+    ]
+
+    # Whole alternative code paths, in the spirit of Go's GOEXPERIMENT:
+    # not a check bolted onto the usual pipeline but a different
+    # implementation of one stage. Polonius is the next-generation borrow
+    # checker; contract-checks emits runtime pre/post-condition checks.
+    # Drawn sparingly because they are the slow ones.
+    ALT_PATH_FLAGS = ["-Zpolonius=next", "-Zcontract-checks=yes"]
+    ALT_PATH_RATE = 0.15
 
     # Every entry is checked against the built rustc, because an unknown
     # -Z flag makes rustc reject the whole invocation — the execution is
@@ -173,6 +192,8 @@ class RustDriver(BaseDriver):
             if random.random() < 0.6:
                 flags.append(v)
         flags.extend(random.sample(self.NIGHTLY_FLAGS, random.randint(0, 3)))
+        if random.random() < self.ALT_PATH_RATE:
+            flags.append(random.choice(self.ALT_PATH_FLAGS))
 
         if random.random() < 0.4:
             flags.append(f"-Clto={random.choice(self.LTO)}")
