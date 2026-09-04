@@ -14,9 +14,113 @@ INSTALL_PREFIX = "/opt/lfortran"
 LFORTRAN_BIN = os.path.join(INSTALL_PREFIX, "bin", "lfortran")
 
 
+#: Sanitizers to build lfortran *itself* with. Debug already gives us
+#: LFORTRAN_ASSERT/LCOMPILERS_ASSERT — the invariants the developers wrote
+#: checks for. This adds the memory errors nobody wrote a check for: a
+#: use-after-free in the ASR passes otherwise only surfaces as a segfault
+#: on the runs where it happens to touch an unmapped page. lfortran is a
+#: plain CMake C++ project, so the sanitizers go in through the compile and
+#: link flags. Set FFL_LFORTRAN_SANITIZERS=none to opt out.
+DEFAULT_SANITIZERS = "address,undefined"
+
+
+def _can_sanitize(cc):
+    """Whether this compiler can actually build sanitized code.
+
+    Existing is not enough: a clang built from `LLVM_ENABLE_PROJECTS` alone
+    has no compiler-rt, so it has no sanitizer headers or runtime and fails
+    only once something includes <sanitizer/asan_interface.h>, thousands of
+    objects into the build. gcc ships those headers with libasan and
+    handles Address;Undefined, so it is a real fallback."""
+    if not cc:
+        return False
+    src = "#include <sanitizer/asan_interface.h>\nint main(void){return 0;}\n"
+    try:
+        r = subprocess.run([cc, "-fsanitize=address", "-x", "c", "-",
+                            "-o", os.devnull],
+                           input=src, text=True, capture_output=True,
+                           timeout=120)
+        return r.returncode == 0
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
+def _sanitizer_toolchain():
+    """The first (cc, cxx) that passes _can_sanitize, or (None, None)."""
+    pairs = []
+    c, x = shutil.which("clang"), shutil.which("clang++")
+    if c and x:
+        pairs.append((c, x))
+    g, gx = shutil.which("gcc"), shutil.which("g++")
+    if g and gx:
+        pairs.append((g, gx))
+    for c, x in pairs:
+        if _can_sanitize(c):
+            return c, x
+        print(f"  ({c} cannot build sanitized code; trying the next)")
+    return None, None
+
+
+def _sanitizer_cmake_opts():
+    value = os.environ.get("FFL_LFORTRAN_SANITIZERS", DEFAULT_SANITIZERS).strip()
+    if value.lower() in ("", "none", "off", "0"):
+        return []
+    # -fno-omit-frame-pointer keeps the ASan report's stack readable.
+    #
+    # -fno-sanitize-recover is deliberately NOT set. It would make the first
+    # UBSan finding abort, which sounds like the stronger oracle but makes
+    # lfortran unbuildable: the build bootstraps its Fortran runtime with
+    # the lfortran it just built, and that run trips UB in lfortran's own
+    # parser —
+    #     parser.yy:670:118: runtime error: member access within null
+    #     pointer of type 'AST::ast_t'
+    # — so the build aborts before producing a compiler. Letting UBSan
+    # print and continue costs nothing here, because the oracle matches on
+    # the "UndefinedBehaviorSanitizer" text in the output (see
+    # config.yaml's crash_patterns) rather than on the exit status.
+    flags = f"-fsanitize={value} -fno-omit-frame-pointer"
+    cc, cxx = _sanitizer_toolchain()
+    if not (cc and cxx):
+        print("  (no compiler here can build sanitized code: "
+              "building without sanitizers)")
+        return []
+    return [f"-DCMAKE_C_FLAGS={flags}",
+            f"-DCMAKE_CXX_FLAGS={flags}",
+            f"-DCMAKE_EXE_LINKER_FLAGS=-fsanitize={value}",
+            f"-DCMAKE_C_COMPILER={cc}",
+            f"-DCMAKE_CXX_COMPILER={cxx}"]
+
+
+def _build_env():
+    """Environment for the build steps.
+
+    The build bootstraps lfortran's Fortran runtime with the lfortran it has
+    just built, so a sanitized compiler runs as part of its own build. Two
+    of ASan/UBSan's defaults then stop the build rather than instrument it:
+
+      detect_leaks   LeakSanitizer runs at exit and makes the process exit
+                     non-zero. A compiler that frees nothing on the way out
+                     is normal, not a bug, and every bootstrap step would
+                     fail on it.
+      halt_on_error  UBSan finding aborts the step. lfortran's parser has
+                     real UB (member access within a null AST::ast_t at
+                     parser.yy:670), so the bootstrap never completes.
+
+    Both are relaxed here and here only. The fuzzing driver sets its own
+    ASAN_OPTIONS per execution, where leak detection and halting are the
+    caller's choice again."""
+    env = dict(os.environ)
+    env["ASAN_OPTIONS"] = (env.get("ASAN_OPTIONS", "") +
+                           ":detect_leaks=0").lstrip(":")
+    env["UBSAN_OPTIONS"] = (env.get("UBSAN_OPTIONS", "") +
+                            ":halt_on_error=0:print_stacktrace=1").lstrip(":")
+    return env
+
+
 def _run(cmd, cwd=None, env=None):
     print(f"[run] {' '.join(cmd)}")
-    subprocess.run(cmd, check=True, cwd=cwd, env=env)
+    subprocess.run(cmd, check=True, cwd=cwd, env=env if env is not None
+                   else _build_env())
 
 
 def _ninja_job_count():
@@ -151,6 +255,7 @@ def _clone_and_build(project_root, ref):
         "-DWITH_STACKTRACE=yes",
         f"-DLLVM_DIR={llvm_dir}",
         f"-DCMAKE_INSTALL_PREFIX={INSTALL_PREFIX}",
+        *_sanitizer_cmake_opts(),
         src_dir,
     ], cwd=build_dir)
 

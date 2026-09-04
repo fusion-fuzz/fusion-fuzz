@@ -13,6 +13,11 @@ ARG DEBIAN_FRONTEND=noninteractive
 # plus git/curl to fetch the source and python3 for FFL/LLVM build scripts.
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
+    # LLVM_USE_SANITIZER emits clang-specific flags that gcc
+    # rejects, and the clang this adapter builds has no
+    # compiler-rt. A distro clang is what makes the sanitized
+    # build possible at all — see setup.py's _sanitizer_toolchain.
+    clang \
     cmake \
     ninja-build \
     git \

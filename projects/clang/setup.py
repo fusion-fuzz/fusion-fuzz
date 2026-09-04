@@ -5,6 +5,96 @@ import shutil
 import subprocess
 
 
+#: Sanitizers to build the compiler *itself* with (LLVM_USE_SANITIZER).
+#: Without it a use-after-free or an out-of-bounds read inside the compiler
+#: only becomes a finding when it happens to segfault, and any
+#: ASAN_OPTIONS/UBSAN_OPTIONS the driver exports do nothing at all.
+#: Assertions catch broken invariants the developers thought to check for;
+#: this catches the memory errors nobody wrote a check for. Costs roughly
+#: 2x build time and 2-4x compile time — set FFL_CLANG_SANITIZERS=none to opt out.
+DEFAULT_SANITIZERS = "Address;Undefined"
+
+
+def _sanitizers():
+    value = os.environ.get("FFL_CLANG_SANITIZERS", DEFAULT_SANITIZERS).strip()
+    return "" if value.lower() in ("", "none", "off", "0") else value
+
+
+def _sanitizer_toolchain():
+    """A (cc, cxx) that can actually build sanitized code, or (None, None).
+
+    Candidates in order: a clang on PATH, a clang this adapter built
+    earlier (FFL_CLANG_BOOTSTRAP overrides its location, which is what to
+    point at a copy of the previous install when this build overwrites it
+    in place), then gcc.
+
+    Each candidate is probed rather than assumed, and gcc is deliberately
+    not among them. LLVM_USE_SANITIZER makes LLVM's cmake emit
+    clang-specific flags — `-fno-sanitize=function`, `-fsanitize-blacklist=`
+    — that gcc rejects outright, so a gcc "sanitized" build dies a few
+    objects in even though gcc itself handles -fsanitize=address perfectly
+    well. The clang this adapter builds is no good either: it comes from
+    `LLVM_ENABLE_PROJECTS=clang` with no compiler-rt, so it has no sanitizer
+    headers at all. What is needed is a clang shipping compiler-rt, which on
+    Ubuntu means the `clang` package.
+    """
+    candidates = []
+    cc, cxx = shutil.which("clang"), shutil.which("clang++")
+    if cc and cxx:
+        candidates.append((cc, cxx))
+    roots = []
+    if os.environ.get("FFL_CLANG_BOOTSTRAP"):
+        roots.append(os.environ["FFL_CLANG_BOOTSTRAP"])
+    roots.append(os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                              "llvm-clang-install"))
+    for root in roots:
+        c = os.path.join(root, "bin", "clang")
+        x = os.path.join(root, "bin", "clang++")
+        if os.access(c, os.X_OK) and os.access(x, os.X_OK):
+            candidates.append((c, x))
+    for c, x in candidates:
+        if _can_sanitize(c):
+            print(f"  (sanitized build using {c})")
+            return c, x
+        print(f"  ({c} cannot build sanitized code; trying the next)")
+    return None, None
+
+
+def _can_sanitize(cc):
+    """Whether this compiler can actually build sanitized code. Probing
+    costs one compile and turns a late build failure into a clear message
+    here. See _sanitizer_toolchain."""
+    if not cc:
+        return False
+    src = "#include <sanitizer/asan_interface.h>\nint main(void){return 0;}\n"
+    try:
+        r = subprocess.run([cc, "-fsanitize=address,undefined",
+                            # the flags LLVM's cmake adds; gcc rejects them
+                            "-fno-sanitize=function",
+                            "-x", "c", "-", "-o", os.devnull],
+                           input=src, text=True, capture_output=True,
+                           timeout=120)
+        return r.returncode == 0
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
+def _sanitizer_opts():
+    """cmake flags selecting a sanitized build, plus the host toolchain it
+    needs."""
+    san = _sanitizers()
+    if not san:
+        return ""
+    cc, cxx = _sanitizer_toolchain()
+    if not (cc and cxx):
+        print("  (no compiler here can build sanitized code: "
+              "building without sanitizers)")
+        return ""
+    return ('-DLLVM_USE_SANITIZER="%s" \\\n    '
+            '-DCMAKE_C_COMPILER=%s \\\n    '
+            '-DCMAKE_CXX_COMPILER=%s \\\n    ' % (san, cc, cxx))
+
+
 def _run(cmd_str, cwd=None):
     print(f"[run] {cmd_str[:160]}")
     subprocess.run(["sh", "-c", cmd_str], check=True, cwd=cwd)
@@ -96,7 +186,7 @@ cmake -S {src_root}/llvm -B {build_dir} -G Ninja \\
     -DCMAKE_BUILD_TYPE=Release \\
     -DLLVM_ENABLE_PROJECTS=clang \\
     -DLLVM_ENABLE_ASSERTIONS=ON \\
-    -DLLVM_TARGETS_TO_BUILD="{targets}" \\
+    {_sanitizer_opts()}    -DLLVM_TARGETS_TO_BUILD="{targets}" \\
     -DLLVM_OPTIMIZED_TABLEGEN=ON \\
     -DLLVM_PARALLEL_LINK_JOBS=2 \\
     -DCMAKE_INSTALL_PREFIX={install_dir}

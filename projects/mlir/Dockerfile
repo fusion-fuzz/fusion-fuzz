@@ -9,6 +9,10 @@ RUN apt-get update && \
     apt-get install -y --no-install-recommends \
     wget git curl sudo tmux vim \
     build-essential pkg-config unzip \
+    # LLVM_USE_SANITIZER emits clang-specific flags that gcc rejects,
+    # so a distro clang with compiler-rt is what makes the sanitized
+    # build possible — see setup.py's _sanitizer_toolchain.
+    clang \
     python3 python3-pip python3-dev python3-setuptools \
     cmake ninja-build \
     zlib1g-dev libxml2-dev libedit-dev libncurses-dev \
