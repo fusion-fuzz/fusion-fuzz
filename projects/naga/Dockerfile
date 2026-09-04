@@ -20,7 +20,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
 
-RUN cargo install --git https://github.com/gfx-rs/wgpu.git --branch trunk naga-cli
+# naga-cli is NOT installed here. `cargo install` builds in release mode,
+# which compiles out every debug_assert! and every overflow check —
+# both of naga's internal oracles. setup.py builds it instead, from the
+# wgpu checkout it clones anyway, with those turned back on.
+# See projects/naga/setup.py.
 
 RUN useradd -m fuzz && \
     echo "fuzz:fuzz" | chpasswd && \

@@ -13,6 +13,23 @@ class NagaDriver(BaseDriver):
     remains the common path.
     """
 
+    def __init__(self, config):
+        super().__init__(config)
+        # setup.py builds naga-cli with debug assertions and overflow
+        # checks on; the copy the Dockerfile's `cargo install` leaves on
+        # PATH has both compiled out. Prefer the built one, and say so
+        # loudly when falling back, because the difference is the whole
+        # oracle rather than a detail of where the binary lives.
+        built = os.path.join(self.ffl_root, "projects", "naga",
+                             "wgpu", "target", "release", "naga")
+        if os.path.exists(built):
+            self.naga_bin = built
+        else:
+            self.naga_bin = shutil.which("naga") or "naga"
+            print(f"[naga] built binary not found at {built}; using "
+                  f"{self.naga_bin} — its debug assertions and overflow "
+                  f"checks are compiled out")
+
     BACKENDS = [
         ("validate", ""),
         ("spv", ".spv"),
@@ -46,7 +63,7 @@ class NagaDriver(BaseDriver):
                 "ASAN_OPTIONS='abort_on_error=1:detect_leaks=0:symbolize=1' "
                 "UBSAN_OPTIONS='print_stacktrace=1:halt_on_error=1'"
             )
-            cmd = f"{env} naga {seed_file} {output_arg}".strip()
+            cmd = f"{env} {self.naga_bin} {seed_file} {output_arg}".strip()
             rc, stdout, stderr = self._run_command(cmd, cwd=workdir)
         finally:
             shutil.rmtree(workdir, ignore_errors=True)
