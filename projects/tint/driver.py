@@ -90,7 +90,37 @@ class TintDriver(BaseDriver):
         "--disable-robustness",
         "--allow-non-uniform-derivatives",
         "--disable-workgroup-init",
+        "--disable-demote-to-helper true",
     ]
+
+    # Per-backend target versions. Each selects a different path through
+    # that writer — the HLSL writer is where the resource_type.cc and
+    # printer.cc findings came from, and a shader model changes which
+    # intrinsics it may emit — so the version is drawn whenever its backend
+    # is. Every value here was run against a trivial compute shader and
+    # checked for TINT_UNIMPLEMENTED first, per the caution above.
+    BACKEND_VERSIONS = {
+        "hlsl": ["--hlsl-shader-model 6.0", "--hlsl-shader-model 6.2",
+                 "--hlsl-shader-model 6.4", "--hlsl-shader-model 6.6",
+                 "--hlsl-shader-model 6.10"],
+        "msl": ["--msl-version 2.3", "--msl-version 2.4",
+                "--msl-version 3.2", "--msl-version 4.0"],
+        # 1.5 is excluded for the reason given above; 1.3 and 1.4 are clean.
+        "spirv": ["--spirv-version 1.3", "--spirv-version 1.4"],
+        "glsl": ["--glsl-desktop true"],
+    }
+    BACKEND_VERSION_RATE = 0.45
+
+    # Backend-specific feature toggles, drawn less often than the versions.
+    BACKEND_FEATURES = {
+        "msl": ["--enable-tensors true", "--use-argument-buffers true"],
+        "spirv": ["--use-storage-input-output-16 true"],
+        "hlsl": ["--treat-samplers-as-filtering true"],
+        # Both rewrite the emitted WGSL rather than the IR, so they only
+        # mean anything for the WGSL writer.
+        "wgsl": ["--rename-all true", "--minify true"],
+    }
+    BACKEND_FEATURE_RATE = 0.20
 
     # A fused shader can drive tint into unbounded work. Enforced through
     # ASan's hard_rss_limit_mb, NOT `ulimit -v`: an ASan build reserves
@@ -128,6 +158,15 @@ class TintDriver(BaseDriver):
         if not facts.get("entry_stages"):
             args[0] = "--format wgsl"
             backend = "wgsl"
+
+        # Drawn after the entry-point steering above, so the version and
+        # feature always match the backend actually used.
+        versions = self.BACKEND_VERSIONS.get(backend)
+        if versions and random.random() < self.BACKEND_VERSION_RATE:
+            args.append(random.choice(versions))
+        features = self.BACKEND_FEATURES.get(backend)
+        if features and random.random() < self.BACKEND_FEATURE_RATE:
+            args.append(random.choice(features))
         return backend, args
 
     def _sanitizer_env(self):
