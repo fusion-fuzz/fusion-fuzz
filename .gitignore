@@ -40,7 +40,14 @@ projects/cpython/cpython/
 projects/cpython/cpython-fuzzing-corpus/
 
 # Clang Project
-projects/clang/
+# The build artefacts and fetched sources, not the adapter itself. A
+# blanket `projects/clang/` here hid every new adapter file from git —
+# the six tracked ones survive only because they predate the rule.
+projects/clang/llvm-project/
+projects/clang/llvm-clang-build/
+projects/clang/llvm-clang-install/
+projects/clang/llvm-clang-install.pre-asan/
+projects/clang/rebuild.log
 
 # GCC Project
 projects/gcc/seeds/
