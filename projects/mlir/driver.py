@@ -64,7 +64,16 @@ class MLIRDriver(BaseDriver):
             seed_file = os.path.join(workdir, f"{seed.id}.mlir")
             with open(seed_file, "w", encoding="utf-8") as f:
                 f.write(self._preprocess(seed.content))
-            asan_opts = "abort_on_error=1:detect_leaks=0:symbolize=1"
+            # hard_rss_limit_mb, not `ulimit -v`: ASan reserves ~16 TB of
+            # shadow address space at startup and `ulimit -v` makes that
+            # reservation fail, killing every execution before it reads the
+            # seed. Capping resident memory bounds the thing worth bounding
+            # and leaves the reservation alone. Without any cap a runaway
+            # pass under ASan — which needs roughly 3x the memory — can take
+            # the whole machine down.
+            rss_mb = getattr(self, "mem_limit_kb", 0) // 1024 or 4096
+            asan_opts = ("abort_on_error=1:detect_leaks=0:symbolize=1"
+                         f":hard_rss_limit_mb={max(64, rss_mb)}")
             ubsan_opts = "print_stacktrace=1:halt_on_error=1"
             base = " ".join(self.BASE_FLAGS)
             flags = self._get_random_flags()

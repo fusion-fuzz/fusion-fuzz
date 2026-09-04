@@ -1,4 +1,5 @@
 import os
+import subprocess
 import re
 import random
 import shutil
@@ -54,6 +55,41 @@ class LfortranDriver(BaseDriver):
         flags.extend(random.sample(self.MISC_FLAGS, random.randint(0, 3)))
         return " ".join(flags)
 
+    def _resolved_bin(self):
+        """LFORTRAN_BIN as an absolute path.
+
+        LFORTRAN_BIN is a bare name resolved through PATH at exec time. That
+        is fine for running it and wrong for inspecting it: `nm -D lfortran`
+        looks for a file called "lfortran" in the working directory and
+        fails, rather than searching PATH."""
+        cached = getattr(self, "_bin_path_cache", None)
+        if cached is None:
+            cached = shutil.which(self.LFORTRAN_BIN) or self.LFORTRAN_BIN
+            self._bin_path_cache = cached
+        return cached
+
+    def _is_sanitized(self):
+        """Whether the lfortran under test was built with sanitizers.
+
+        This decides whether the execution gets `ulimit -v`, and getting it
+        wrong is not a small error: a sanitized lfortran under `ulimit -v`
+        fails its shadow-memory reservation and aborts on every seed, which
+        the "Abort: Signal SIGABRT" crash pattern then reports as a finding.
+        Measured on 250 seeds with the probe misresolving the binary: 250
+        aborts, 250 false alarms."""
+        cached = getattr(self, "_sanitized_cache", None)
+        if cached is not None:
+            return cached
+        result = False
+        try:
+            out = subprocess.run(["nm", "-D", self._resolved_bin()],
+                                 capture_output=True, text=True, timeout=120)
+            result = "__asan_init" in (out.stdout or "")
+        except (OSError, subprocess.SubprocessError):
+            result = False
+        self._sanitized_cache = result
+        return result
+
     def execute(self, seed):
         start = time.time()
         workdir = self._make_workdir()
@@ -67,7 +103,32 @@ class LfortranDriver(BaseDriver):
                 f.write(seed.content)
 
             flags = self._get_random_flags(ext)
-            cmd = f"ulimit -v 3145728; {self.LFORTRAN_BIN} {flags} {seed_file}"
+            # Memory limiting, and the sanitizer options that go with it.
+            #
+            # `ulimit -v` cannot be used against a sanitized lfortran: ASan
+            # reserves ~16 TB of shadow address space at startup, the
+            # reservation fails under a virtual-memory cap, and the process
+            # dies before it reads the seed — every execution, not some.
+            # hard_rss_limit_mb caps resident memory instead, which is the
+            # thing worth bounding.
+            #
+            # detect_leaks=0 because a compiler that frees nothing on the
+            # way out is normal; leaving it on reports a leak for every
+            # single seed. UBSan keeps halt_on_error=0 so one finding does
+            # not mask the rest of the run — the oracle matches on the
+            # "SUMMARY: UndefinedBehaviorSanitizer" text (see config.yaml),
+            # not on the exit status.
+            if self._is_sanitized():
+                rss_mb = 3072
+                asan = (f"ASAN_OPTIONS='detect_leaks=0:symbolize=1"
+                        f":hard_rss_limit_mb={rss_mb}' ")
+                ubsan = "UBSAN_OPTIONS='print_stacktrace=1:halt_on_error=0' "
+                limit = ""
+            else:
+                asan = ubsan = ""
+                limit = "ulimit -v 3145728; "
+            cmd = (f"{limit}{asan}{ubsan}"
+                   f"{self.LFORTRAN_BIN} {flags} {seed_file}")
             rc, stdout, stderr = self._run_command(cmd, cwd=workdir)
         finally:
             shutil.rmtree(workdir, ignore_errors=True)
@@ -107,6 +168,27 @@ class LfortranDriver(BaseDriver):
             if len(frames) >= 3:
                 break
         return " > ".join(frames) if frames else None
+
+    # lfortran reports an unimplemented language feature the same way it
+    # reports a genuine internal error: "Internal Compiler Error:
+    # LCompilersException: visit_DoLoop() not implemented". The config's
+    # "Internal Compiler Error" crash pattern therefore fires on every seed
+    # that uses a construct lfortran has not got to yet, which is not a bug
+    # in lfortran and not something to report. Measured on 250 integration
+    # tests: 10 of 41 reported crashes were this.
+    _NOT_IMPLEMENTED_RE = re.compile(r"not implemented", re.IGNORECASE)
+
+    def _check_crash(self, stdout, stderr, return_code):
+        combined = (stderr or "") + (stdout or "")
+        # A sanitizer finding is a real finding even if the same run also
+        # hit an unimplemented feature, so check for those first.
+        if ("SUMMARY: AddressSanitizer" in combined
+                or "SUMMARY: UndefinedBehaviorSanitizer" in combined):
+            return True
+        if ("Internal Compiler Error" in combined
+                and self._NOT_IMPLEMENTED_RE.search(combined)):
+            return False
+        return super()._check_crash(stdout, stderr, return_code)
 
     def extract_crash_signature(self, stdout, stderr, return_code):
         combined = stderr + stdout

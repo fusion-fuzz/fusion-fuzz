@@ -1,4 +1,5 @@
 import os
+import subprocess
 import re
 import random
 import shutil
@@ -157,6 +158,26 @@ class ClangDriver(BaseDriver):
             flags.append(target_flags)
         return binname, " ".join(flags)
 
+    def _is_sanitized(self):
+        """Whether the clang under test was built with sanitizers.
+
+        Cached: it is one nm/strings pass, and the answer decides how every
+        subsequent execution is memory-limited. Probing the binary rather
+        than reading a config keeps the two in step when someone rebuilds
+        with FFL_CLANG_SANITIZERS=none."""
+        cached = getattr(self, "_sanitized_cache", None)
+        if cached is not None:
+            return cached
+        result = False
+        try:
+            out = subprocess.run(["nm", "-D", self.clang_bin],
+                                 capture_output=True, text=True, timeout=120)
+            result = "__asan_init" in (out.stdout or "")
+        except (OSError, subprocess.SubprocessError):
+            result = False
+        self._sanitized_cache = result
+        return result
+
     def execute(self, seed):
         start = time.time()
         workdir = self._make_workdir()
@@ -170,10 +191,31 @@ class ClangDriver(BaseDriver):
                 f.write(seed.content)
 
             binname, flags = self._get_random_flags(ext, seed.content)
-            asan_opts = "abort_on_error=1:detect_leaks=0:symbolize=1"
+            # Memory limiting, and why it is not `ulimit -v` when the
+            # compiler is sanitized.
+            #
+            # ASan reserves ~16 TB of shadow address space at startup. Under
+            # `ulimit -v` that reservation fails and the process dies before
+            # it reads the seed:
+            #     ReserveShadowMemoryRange failed while trying to map
+            #     0xdfff0001000 bytes. Perhaps you're using ulimit -v
+            # That is every execution, not an occasional one, and the abort
+            # matches the "Aborted" crash pattern — so an assertions-only
+            # build silently turns into a 100% false-alarm rate the moment
+            # LLVM_USE_SANITIZER is switched on.
+            #
+            # ASan's own hard_rss_limit_mb caps *resident* memory instead,
+            # which is the thing actually worth bounding, and leaves the
+            # address-space reservation alone. `ulimit -v` stays for the
+            # uninstrumented build, where it costs nothing.
+            rss_mb = max(64, self.mem_limit_kb // 1024)
+            asan_opts = ("abort_on_error=1:detect_leaks=0:symbolize=1"
+                         f":hard_rss_limit_mb={rss_mb}")
             ubsan_opts = "print_stacktrace=1:halt_on_error=1"
+            limit = ("ulimit -c 0; " if self._is_sanitized()
+                     else f"ulimit -v {self.mem_limit_kb}; ulimit -c 0; ")
             cmd = (
-                f"ulimit -v {self.mem_limit_kb}; ulimit -c 0; "
+                f"{limit}"
                 f"ASAN_OPTIONS='{asan_opts}' UBSAN_OPTIONS='{ubsan_opts}' "
                 f"{binname} {flags} {seed_file}"
             )
