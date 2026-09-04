@@ -131,6 +131,14 @@ class GoDriver(BaseDriver):
         # rest take milliseconds.
         self.gocache = os.path.join(self.ffl_root, ".fused", "go-cache")
         os.makedirs(self.gocache, exist_ok=True)
+        # Scratch space for the toolchain's own temporaries (see _build_command).
+        # Shared and persistent rather than per-execution: the command recorded
+        # in a crash bundle's test.sh names this directory, and a reproducer
+        # pointing at a directory deleted the moment the run ended is not a
+        # reproducer -- `go build` fails with "creating work dir: no such file
+        # or directory" before it ever reads the program.
+        self.gotmp = os.path.join(self.ffl_root, ".fused", "go-tmp")
+        os.makedirs(self.gotmp, exist_ok=True)
 
         # Disk containment. 0 (or negative) disables the cap entirely.
         self.cache_limit_bytes = int(
@@ -215,10 +223,11 @@ class GoDriver(BaseDriver):
             # assembly steps write go-build* directories under /tmp, and any
             # execution alive when the orchestrator is SIGKILLed (which
             # cleanup_stale_processes does by pattern, with the watchdog
-            # restarting it) leaves them there permanently. Pointed at the
-            # per-execution workdir, they are removed by the rmtree in
-            # execute()'s finally along with everything else.
-            f"GOTMPDIR={workdir} "
+            # restarting it) leaves them there permanently. go removes its own
+            # work dir on a clean exit, so what collects here is only what a
+            # killed run left behind -- swept by _sweep_stale_workdirs at
+            # startup, same as the execution workdirs.
+            f"GOTMPDIR={self.gotmp} "
             f"GOOS={goos} GOARCH={goarch} "
             f"GOPROXY=off GOFLAGS=-mod=mod "
             # See GOEXPERIMENT_CANDIDATES. Empty means the default build,
@@ -295,20 +304,20 @@ class GoDriver(BaseDriver):
         else collects them. Safe to do here and only here: prepare_environment
         runs before any execution thread starts, so no live workdir exists yet.
         """
-        base = os.path.join(self.fused_base, self.project_name)
-        if not os.path.isdir(base):
-            return
         removed = 0
-        try:
-            with os.scandir(base) as it:
-                for entry in it:
-                    if entry.is_dir(follow_symlinks=False):
-                        shutil.rmtree(entry.path, ignore_errors=True)
-                        removed += 1
-        except OSError:
-            return
+        for base in (os.path.join(self.fused_base, self.project_name), self.gotmp):
+            if not os.path.isdir(base):
+                continue
+            try:
+                with os.scandir(base) as it:
+                    for entry in it:
+                        if entry.is_dir(follow_symlinks=False):
+                            shutil.rmtree(entry.path, ignore_errors=True)
+                            removed += 1
+            except OSError:
+                continue
         if removed:
-            print(f"[go] swept {removed} stale workdir(s) from {base}")
+            print(f"[go] swept {removed} stale scratch dir(s)")
 
     def _cache_shard_entries(self):
         """(mtime, size, path) for every file in the cache's 256 shards.
@@ -330,8 +339,16 @@ class GoDriver(BaseDriver):
                             st = e.stat(follow_symlinks=False)
                         except OSError:
                             continue
-                        entries.append((st.st_mtime, st.st_size, e.path))
-                        total += st.st_size
+                        # st_blocks, not st_size: the cap is about disk, and
+                        # the cache is overwhelmingly tiny files (measured at
+                        # 87% of 712k entries under 4 KB) that each still take a
+                        # whole filesystem block. Summing st_size undercounted
+                        # real consumption by 37% -- 6635 MiB apparent against
+                        # 9121 MiB actually used -- so an 8 GiB cap silently
+                        # cost ~11 GB of disk.
+                        size = st.st_blocks * 512
+                        entries.append((st.st_mtime, size, e.path))
+                        total += size
             except OSError:
                 continue
         return entries, total
