@@ -58,10 +58,12 @@ projects/lean/seeds/
 projects/haskell/ghc-src/
 projects/haskell/rosetta-src/
 projects/haskell/exercism-src/
+projects/haskell/nofib-src/
 projects/haskell/seeds/
 
 # MLIR Project
 projects/mlir/llvm-project/
+projects/flang/llvm-project/
 projects/mlir/llvm-mlir-build/
 projects/mlir/llvm-mlir-install/
 projects/mlir/seeds
