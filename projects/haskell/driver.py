@@ -29,6 +29,13 @@ class HaskellDriver(BaseDriver):
 
     # Diversifies optimization level / strictness across runs, mirroring
     # GoDriver's GCFLAGS pool.
+    #
+    # These only mean anything when GHC actually generates code. Every
+    # execution used to pass `-fno-code`, which stops after typechecking:
+    # measured on ghc 9.14, `-fno-code -O2 -ddump-simpl` dumps no Core at
+    # all where `-O2` alone dumps 23 lines, so the simplifier — and with it
+    # every flag in this list — never ran. The adapter was fuzzing the
+    # parser and typechecker only. See CODEGEN_MODES.
     GHC_FLAG_SETS = [
         [],
         ["-O0"],
@@ -41,6 +48,23 @@ class HaskellDriver(BaseDriver):
         ["-feager-blackholing"],
         ["-XBangPatterns"],
     ]
+
+    # GHC's internal IR validators — the counterpart of Go's
+    # `-d=ssa/check/on` and LLVM's assertions. -dcore-lint typechecks Core
+    # after each pass, -dstg-lint checks STG, -dcmm-lint checks the Cmm the
+    # backend emits. A pass that builds ill-typed Core is a real GHC bug and
+    # otherwise shows up, if at all, as wrong runtime behaviour much later.
+    # Measured cost on a single module: 78ms without, 80ms with both.
+    LINT_FLAGS = ["-dcore-lint", "-dstg-lint", "-dcmm-lint"]
+    LINT_RATE = 0.75
+
+    # `-c` compiles through the whole pipeline and writes a .o into the
+    # per-execution workdir; `-fno-code` stops after typechecking. The
+    # second is kept as a minority draw because it is the only way to reach
+    # the frontend on a seed whose backend errors out early, but it must not
+    # be the common case again.
+    CODEGEN_MODES = ["-c", "-fno-code"]
+    CODEGEN_WEIGHTS = [85, 15]
 
     def __init__(self, config):
         super().__init__(config)
@@ -59,7 +83,14 @@ class HaskellDriver(BaseDriver):
         return "ghc"
 
     def _get_random_flags(self):
-        return " ".join(random.choice(self.GHC_FLAG_SETS))
+        flags = list(random.choice(self.GHC_FLAG_SETS))
+        mode = random.choices(self.CODEGEN_MODES,
+                              weights=self.CODEGEN_WEIGHTS, k=1)[0]
+        flags.append(mode)
+        # Core lint is meaningless without Core to lint.
+        if mode != "-fno-code" and random.random() < self.LINT_RATE:
+            flags += self.LINT_FLAGS
+        return " ".join(flags)
 
     def execute(self, seed):
         start = time.time()
@@ -72,7 +103,9 @@ class HaskellDriver(BaseDriver):
             with open(seed_file, "w", encoding="utf-8") as f:
                 f.write(seed.content)
             flags = "" if seed.metadata.get("type") == "llm_translated" else self._get_random_flags()
-            cmd = f"{self.ghc_bin} -fno-code -v0 {flags} {seed_file}".strip()
+            # The codegen mode now comes from _get_random_flags; -fno-code
+            # is no longer forced on every execution.
+            cmd = f"{self.ghc_bin} -v0 {flags} {seed_file}".strip()
             rc, stdout, stderr = self._run_command(cmd, cwd=workdir)
         finally:
             shutil.rmtree(workdir, ignore_errors=True)

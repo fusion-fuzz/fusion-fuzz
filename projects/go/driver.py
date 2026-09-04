@@ -29,6 +29,7 @@ target costs a environment variable and buys the whole backend surface.
 import os
 import random
 import shutil
+import subprocess
 import threading
 import time
 
@@ -77,6 +78,26 @@ class GoDriver(BaseDriver):
     # full optimisation exercise very different code, so both are drawn.
     OPT_FLAGS = ["", "-N", "-l", "-N -l", "-m", "-m -m", "-B", "-S"]
 
+    # GOEXPERIMENT gates whole code paths in the compiler rather than
+    # tuning one that always runs: a new inliner, a different map
+    # implementation, a different loop-variable scope. Each is a large body
+    # of compiler code that the default build never executes, and each has
+    # historically shipped with its own ICEs. Which names a given toolchain
+    # accepts depends on its version — an unknown one makes `go` refuse to
+    # run at all — so the set is probed once at startup and the survivors
+    # are what gets drawn from. The empty string is the default build and
+    # stays the common case.
+    GOEXPERIMENT_CANDIDATES = [
+        "newinliner",       # the rewritten inliner
+        "loopvar",          # per-iteration loop variable scoping
+        "swissmap",         # the Swiss-table map implementation
+        "cgocheck2",        # stricter cgo pointer checking
+        "aliastypeparams",  # generic alias types
+        "regabiargs",       # register-based calling convention
+        "arenas",           # arena allocation
+    ]
+    GOEXPERIMENT_RATE = 0.35
+
     # A single fused file can drive the compiler into unbounded type
     # instantiation. Without a cap the OOM killer fires and can take the
     # orchestrator with it; with one, Go reports "out of memory" and exits,
@@ -122,11 +143,37 @@ class GoDriver(BaseDriver):
         # its own so that incrementing it never waits behind a trim in
         # progress, and the trim needs one that non-participating threads can
         # decline rather than queue on.
+        self._goexperiments = self._probe_goexperiments()
         self._cache_counter_lock = threading.Lock()
         self._cache_trim_lock = threading.Lock()
         self._execs_since_cache_check = 0
 
     # ── command construction ──────────────────────────────────────────
+
+    def _probe_goexperiments(self):
+        """Keep only the experiments this toolchain actually knows.
+
+        `go env` rejects an unknown GOEXPERIMENT outright, so an unprobed
+        name would not produce an interesting compile failure — it would
+        stop `go` before it ever read the seed, and every execution drawing
+        that name would be wasted."""
+        ok = []
+        for name in self.GOEXPERIMENT_CANDIDATES:
+            env = dict(os.environ, GOEXPERIMENT=name, GOROOT=self.goroot)
+            try:
+                r = subprocess.run([self.go_bin, "env", "GOEXPERIMENT"],
+                                   capture_output=True, env=env, timeout=30)
+                if r.returncode == 0:
+                    ok.append(name)
+            except (OSError, subprocess.SubprocessError):
+                break
+        return ok
+
+    def _goexperiment(self):
+        """The GOEXPERIMENT for one execution, or "" for the default build."""
+        if self._goexperiments and random.random() < self.GOEXPERIMENT_RATE:
+            return random.choice(self._goexperiments)
+        return ""
 
     def _gcflags(self):
         # Mandatory: without it an ICE on a file that also has ordinary
@@ -174,6 +221,9 @@ class GoDriver(BaseDriver):
             f"GOTMPDIR={workdir} "
             f"GOOS={goos} GOARCH={goarch} "
             f"GOPROXY=off GOFLAGS=-mod=mod "
+            # See GOEXPERIMENT_CANDIDATES. Empty means the default build,
+            # and `GOEXPERIMENT=` is how you spell that.
+            f"GOEXPERIMENT={self._goexperiment()} "
             # CGO off unless the seed asks for it: it needs a target C
             # toolchain that does not exist for the cross targets.
             f"CGO_ENABLED={'1' if facts['has_cgo'] else '0'} "

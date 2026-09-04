@@ -1,4 +1,5 @@
 import os
+import random
 import re
 import stat
 import threading
@@ -27,6 +28,48 @@ class PHPDriver(BaseDriver):
         # Network — avoids hangs and external side-effects
         "fsockopen", "pfsockopen",
     ]
+
+    # ---------------------------------------------------------------
+    # Opcache and JIT
+    #
+    # PHP's JIT is where a large share of the engine's miscompilation and
+    # memory-safety bugs live, and none of it is reachable from the plain
+    # CLI: opcache is a zend_extension that has to be loaded, and the JIT
+    # is off until it is given a buffer. The build now passes
+    # `--enable-opcache=shared` so `modules/opcache.so` exists.
+    #
+    # The hot counters are lowered alongside the mode. Tracing JIT only
+    # compiles a loop or function once it has run `jit_hot_loop` /
+    # `jit_hot_func` times, and a fused seed is short, so the intent is to
+    # reach the compiler on the first execution rather than never. Measured
+    # on this build, a hot loop runs 1615ms with `jit=disable` and 92ms
+    # with `jit=tracing`, so the JIT is demonstrably compiling; lowering the
+    # thresholds did not change that number either way on a loop that hot.
+    # They are kept because a short seed is the case they are meant for,
+    # not because the speedup above is evidence for them.
+    #
+    # `opcache.jit` is a CRTO quadruple: C=CPU-specific opts, R=register
+    # allocation, T=trigger, O=optimisation level. The named modes are
+    # aliases — `tracing` is 1254 and `function` is 1205 — and the spread
+    # below walks the register allocator and the trigger independently,
+    # since those are the two digits that change which code the JIT emits.
+    JIT_MODES = [
+        None,          # opcache not loaded at all: the interpreter path
+        "disable",     # opcache loaded, JIT off: exercises the optimiser only
+        "tracing",     # 1254
+        "function",    # 1205
+        "1235",        # tracing trigger, no global register allocation
+        "1201",        # compile on first execution, minimal optimisation
+        "1254",
+        "0254",        # tracing without CPU-specific instruction selection
+    ]
+    JIT_WEIGHTS = [22, 10, 20, 14, 8, 8, 10, 8]
+
+    # opcache write-protects its shared memory when asked. A bug that
+    # writes through a stale pointer into that region becomes an immediate
+    # fault with a clean stack instead of silent corruption surfacing
+    # somewhere unrelated. It costs an mprotect per request.
+    JIT_PROTECT_RATE = 0.30
 
     # Clean up stale .php files every this many executions.
     _CLEANUP_INTERVAL = 500
@@ -178,12 +221,42 @@ class PHPDriver(BaseDriver):
             if os.path.isdir(self.phpt_deps_dir):
                 ini_args.append(f'-d include_path=".:{self.phpt_deps_dir}"')
 
-            use_jit = "opcache" in ini_content.lower() or "jit" in ini_content.lower()
-            if use_jit:
+            # A seed that names opcache or jit in its own INI section is
+            # asking for it and always gets it; every other seed draws a
+            # mode, so the JIT is exercised by the whole corpus rather than
+            # only by the handful of .phpt files written to test it.
+            seed_wants_jit = ("opcache" in ini_content.lower()
+                              or "jit" in ini_content.lower())
+            jit_mode = ("tracing" if seed_wants_jit
+                        else random.choices(self.JIT_MODES,
+                                            weights=self.JIT_WEIGHTS, k=1)[0])
+            if jit_mode is not None:
+                # opcache has been built by default since PHP 8 and this
+                # build has it linked in statically, so there is no
+                # opcache.so and nothing to load. Requiring one is what kept
+                # the JIT switched off for every execution, including the
+                # seeds whose own INI section asked for it. Load the module
+                # only when a shared build actually produced one.
                 opcache = os.path.join(self.modules_dir, "opcache.so")
                 if os.path.exists(opcache):
-                    ini_args.append(f'-d extension_dir="{self.modules_dir}"')
-                    ini_args.append(f'-d zend_extension="{opcache}"')
+                    ini_args += [
+                        f'-d extension_dir="{self.modules_dir}"',
+                        f'-d zend_extension="{opcache}"',
+                    ]
+                ini_args += [
+                    '-d opcache.enable=1',
+                    '-d opcache.enable_cli=1',
+                    f'-d opcache.jit={jit_mode}',
+                    '-d opcache.jit_buffer_size=64M',
+                    # Without these the tracing JIT never reaches its
+                    # threshold on a seed this short; see JIT_MODES.
+                    '-d opcache.jit_hot_loop=1',
+                    '-d opcache.jit_hot_func=1',
+                    '-d opcache.jit_hot_return=1',
+                    '-d opcache.jit_hot_side_exit=1',
+                ]
+                if random.random() < self.JIT_PROTECT_RATE:
+                    ini_args.append('-d opcache.protect_memory=1')
 
             for line in ini_content.splitlines():
                 line = line.strip()
