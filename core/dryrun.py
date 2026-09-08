@@ -164,9 +164,15 @@ PRE_ANALYSIS_KEYS = ("most_complex_states", "segment_boundaries")
 #   5: anywhere inside a string or comment. A triple-quoted string changes
 #      no paren depth and its prose is often unindented, so every docstring
 #      line looked like a legal boundary.
+#   6: after a C-family line that ends no statement (`_Float16` above its
+#      declarator, `template <...>` above its class), between Objective-C
+#      `@interface … @end` lines, and after `@attr`/`#pragma` directive
+#      lines. Found because a corpus stamped 5 kept serving the old
+#      indices to validrate and to the fuzzer for a day: readers now also
+#      ignore the keys when the stamp is not the current version.
 # A stale cache is worse than none here: it silently overrides the
 # corrected computation with the indices the old one produced.
-PRE_ANALYSIS_VERSION = 5
+PRE_ANALYSIS_VERSION = 6
 
 # Keys written by builds whose semantics no longer match what the code
 # reads. states_of_interest held only the maximum-live-variable points
@@ -994,9 +1000,14 @@ def run_dryrun_with_metadata(
         if not hasattr(_thread_local, "driver"):
             _thread_local.driver = driver_factory()
             _thread_local.driver.timeout = timeout
-            # Tell drivers that support it to use minimal/stable flags
-            if hasattr(_thread_local.driver, "dryrun_mode"):
-                _thread_local.driver.dryrun_mode = True
+            # Tell drivers that support it to use minimal/stable flags.
+            # Set unconditionally: a driver that reads the attribute with
+            # getattr(self, "dryrun_mode", False) (go, swift, naga) never
+            # *has* it beforehand, so the hasattr guard this replaced
+            # meant Go's pass drew random cross-targets and experiments
+            # for every seed and recorded the cold stdlib build's timeout
+            # as the seed's verdict.
+            _thread_local.driver.dryrun_mode = True
 
         language  = (seed.metadata or {}).get("type", "unknown")
         collector = get_collector(language)

@@ -303,13 +303,15 @@ def test_toplevel_collisions_are_fully_resolved():
                 if ln.strip() in ("struct Foo;", "trait Bar {}")]
 
 
-def test_inner_doc_comments_are_hoisted_like_inner_attributes():
+def test_inner_doc_comments_are_neutralised():
     """`//!` is crate-level in exactly the way `#![...]` is — legal only
-    before any item. Leaving one mid-body gives "expected outer doc
-    comment", which was the second-largest rejection class."""
+    before any item. Hoisting it worked once, but a chained fusion reads
+    its own output back and hoisted it again below the `use` lines
+    ("expected outer doc comment"). A doc comment has no semantics, so it
+    is kept as a plain `//` comment wherever it was."""
     strategy = get_strategies("rust", dataflow_fusion=True,
                               pre_analysis_enabled=True)[0]
     attrs, _uses, body, _main = strategy._process_seed(
         "//! crate docs\n#![feature(x)]\nfn main() {}\n", "s1")
-    assert any(a.strip().startswith("//!") for a in attrs)
-    assert "//!" not in body
+    assert not any(a.strip().startswith("//!") for a in attrs)
+    assert "//!" not in body and "// crate docs" in body

@@ -39,9 +39,11 @@ def _extract_display_code(content: str, ext: str) -> tuple[str, str]:
         in_file = False
         lines = []
         for line in content.splitlines(keepends=True):
-            tag = line.strip()
-            if tag.startswith("--") and tag.endswith("--"):
-                section = tag[2:-2]
+            # Anchored like run-tests.php: `-----END PRIVATE KEY-----`
+            # inside a PEM string is program text, not a section header.
+            m = re.match(r'^--([A-Z_]+)--\s*$', line)
+            if m:
+                section = m.group(1)
                 if section == "FILE":
                     in_file = True
                     continue
@@ -844,7 +846,10 @@ class FusionFuzzLoop:
                             src_name = meta.get("source_name", "?")
                             source_desc = f"Bug corpus (project: `{src_proj}`, name: `{src_name}`)"
                         else:
-                            identifier = meta.get("identifier", meta.get("description", ""))
+                            # Most parsers record the seed's path under
+                            # "filename"; only PHP sets "identifier".
+                            identifier = (meta.get("identifier") or meta.get("filename")
+                                          or meta.get("description", ""))
                             source_desc = (f"Project seed (`{identifier}`)"
                                            if identifier else "Project seed")
                         f.write(f"| `{label}` | `{pid}` | {source_desc} |\n")

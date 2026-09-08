@@ -603,6 +603,29 @@ _PHP_OPEN_RE = re.compile(r'^\s*<\?php\b')
 _PHP_CLOSE_RE = re.compile(r'\?>\s*$')
 
 
+
+def _tag_line(line: str, tag_comment: str) -> str:
+    """Append the fusion tag to `line`, or put it on its own line before
+    it when a trailing comment would change the statement: a PHP
+    heredoc/nowdoc opener (`<<<'EOD'  // tag` is a parse error), a
+    backslash line continuation, or a raw-string opener."""
+    if re.search(r'<<<[\'"]?\w+[\'"]?\s*$', line) or line.rstrip().endswith('\\'):
+        indent = line[:len(line) - len(line.lstrip())]
+        return f"{indent}{tag_comment}\n{line}"
+    # A line that opens a block comment it does not close (`/* This test
+    # ICEd because ...` continued on the next lines): a `/* tag */`
+    # appended there closes the comment at the tag, and the rest of the
+    # prose becomes code ("'between' does not name a type" — 4 of 6 gcc
+    # "does not name a type" children). The tag goes on its own line
+    # before it. Same for a line inside such a comment, which the tag's
+    # `*/` would also terminate; there the tag cannot be placed at all.
+    stripped_closed = re.sub(r'/\*.*?\*/', '', line)
+    if '/*' in stripped_closed and '*/' not in stripped_closed.split('/*', 1)[1]:
+        indent = line[:len(line) - len(line.lstrip())]
+        return f"{indent}{tag_comment}\n{line}"
+    return f"{line}  {tag_comment}"
+
+
 def graft_continuation(host_content: str, donor_content: str,
                         host_point: StatePoint, donor_point: Optional[StatePoint],
                         reindent: bool = True, tag_comment: Optional[str] = None) -> str:
@@ -643,7 +666,7 @@ def graft_continuation(host_content: str, donor_content: str,
 
     if tag_comment and continuation:
         idx = next((i for i, ln in enumerate(continuation) if ln.strip()), 0)
-        continuation[idx] = continuation[idx] + f"  {tag_comment}"
+        continuation[idx] = _tag_line(continuation[idx], tag_comment)
 
     insert_at = min(host_point.line_idx + 1, len(host_lines))
     fused_lines = host_lines[:insert_at] + continuation + host_lines[insert_at:]
@@ -700,6 +723,28 @@ _CONTINUATION_RE = re.compile(
     r'|^\}\s*(?:else|catch|finally|while)?\s*[;{]?\s*$')
 
 
+_C_LINE_COMMENT_RE = re.compile(r'//.*$|/\*.*?\*/')
+
+
+def _c_line_may_end_segment(line: str) -> bool:
+    """True when a C-family line, comments removed, is empty, a preprocessor
+    line, or ends with `;`, `{`, `}`, `:` or `)` (a bare macro invocation
+    such as `B (ceil)`; a K&R declarator is kept with its `{` by the
+    Allman rule). A line ending in an identifier, a `>` or a `,` is the
+    middle of a declaration."""
+    code = _C_LINE_COMMENT_RE.sub('', line).strip()
+    if not code or code.startswith('#'):
+        return True
+    if '/*' in code:            # an unterminated block comment opens here
+        code = code.split('/*', 1)[0].strip()
+        if not code:
+            return True
+    return code[-1] in ';{}:)'
+
+
+_DIRECTIVE_LINE_RE = re.compile(r'(?://go:\w|#\[|#!\[|#\s*pragma\b)|@\w')  # `@compute @workgroup_size(1)` (WGSL), `@main` (Swift), `@decorator` (Python): the line belongs to the declaration below
+
+
 def _compute_segment_boundaries(content: str, language: str) -> List[int]:
     """Line indices after which `content` can be cut into two independently
     well-formed statement sequences.
@@ -725,7 +770,11 @@ def _compute_segment_boundaries(content: str, language: str) -> List[int]:
         off += len(ln) + 1
     depth = _paren_depth_prefix(content, mask)
     lang = LANGUAGE_ALIASES.get(str(language).lower(), language)
-    indentation_scoped = lang == "cpython"
+    # Python's blocks and Haskell's layout rule both continue a
+    # declaration on the following indented lines: a cut before such a
+    # line separates a header from its body ("parse error on input '='"
+    # was 17% of Haskell's state-fusion failures).
+    indentation_scoped = lang in ("cpython", "haskell")
 
     def _next_nonblank(i):
         for j in range(i + 1, len(lines)):
@@ -734,9 +783,18 @@ def _compute_segment_boundaries(content: str, language: str) -> List[int]:
         return None
 
     out = []
+    # Objective-C class/protocol blocks (`@interface ... @end`) are not
+    # brace-delimited: a cut between them split the block ("'@end' must
+    # appear in an Objective-C context", 7% of clang's combined failures).
+    objc_depth = 0
     for i, line in enumerate(lines):
+        stripped_l = line.lstrip()
+        if re.match(r'@(?:interface|implementation|protocol)\b', stripped_l):
+            objc_depth += 1
+        elif stripped_l.startswith('@end'):
+            objc_depth = max(0, objc_depth - 1)
         end = min(offsets[i] + len(line), len(depth) - 1)
-        if depth[end] != 0:
+        if depth[end] != 0 or objc_depth != 0:
             continue
         # The cut must not land inside a string or comment. `mask` already
         # records that (it is what keeps parens inside strings out of the
@@ -765,6 +823,37 @@ def _compute_segment_boundaries(content: str, language: str) -> List[int]:
         nxt = _next_nonblank(i)
         if nxt is not None and _CONTINUATION_RE.match(nxt.lstrip()):
             continue
+        # Allman-style braces: `class A` / `function f()` on one line and
+        # its `{` on the next. The header line is at depth zero, so it
+        # passed every test above, yet cutting there separates a
+        # declaration from its body — "unexpected token, expecting '{'".
+        if nxt is not None and nxt.lstrip().startswith("{"):
+            continue
+        # C family: a declaration can span lines at depth zero without any
+        # delimiter (`_Float16` on one line, `f1 (_Float16 x)` on the
+        # next; `template <typename T>` above its class). A cut after such
+        # a line leaves a return type with no declarator on one side and a
+        # function with no return type on the other ("two or more data
+        # types in declaration specifiers", "does not name a type"). Only
+        # a line whose code part ends a statement, opens/closes a block,
+        # or is a bare macro invocation / label may end a segment.
+        if lang == "clang" and not _c_line_may_end_segment(line):
+            continue
+        # A compiler directive or attribute belongs to the declaration
+        # that follows it: Go's `//go:noinline`, Rust's `#[derive(..)]`,
+        # C's `#pragma`. Cutting between them yields "misplaced compiler
+        # directive" (25% of Go's state-fusion failures) or an attribute
+        # on nothing.
+        if _DIRECTIVE_LINE_RE.match(line.lstrip()):
+            continue
+        # ...and not after the blank line(s) that may follow it either:
+        # Go's `//go:noescape` must be *immediately* above its `func`.
+        if not line.strip():
+            j = i - 1
+            while j >= 0 and not lines[j].strip():
+                j -= 1
+            if j >= 0 and _DIRECTIVE_LINE_RE.match(lines[j].lstrip()):
+                continue
         out.append(i)
     return out
 
@@ -845,7 +934,7 @@ def interleave_segments(a_content: str, b_content: str,
         seg = list(seg)
         idx = next((i for i, ln in enumerate(seg) if ln.strip()), None)
         if idx is not None:
-            seg[idx] = seg[idx] + f"  {tag_comment}"
+            seg[idx] = _tag_line(seg[idx], tag_comment)
         return seg
 
     fused_lines = (list(a_prefix) + _tagged(b_prefix)

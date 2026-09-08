@@ -345,86 +345,6 @@ if __name__ == "__main__":
         replayer.execute_folder(args.execute, sample_log=sample_log, max_seconds=args.time)
         sys.exit(0)
 
-    # === BUG CORPUS MODE ===
-    # Maps project name to canonical language key stored in corpus translations JSON
-    _LANG_MAP = {
-        "cpython": "python", "gcc": "c", "clang": "c",
-        "go": "go", "rust": "rust", "php": "php",
-        "swift": "swift", "lean": "lean", "mlir": "mlir",
-        "naga": "rust", "wgslc": "wgsl", "sql": "sql",
-        "lfortran": "flang",
-    }
-    _tgt_lang = _LANG_MAP.get(args.project.lower(), args.project.lower())
-
-    if args.bug_corpus:
-        bug_corpus_db = os.path.join("corpus", "corpus.db")
-        if not os.path.exists(bug_corpus_db):
-            logger.error(f"Bug corpus DB not found at {bug_corpus_db}. Run corpus/main.py first.")
-            sys.exit(1)
-
-        project_corpus_path = os.path.join("projects", args.project, "corpus.db")
-        logger.info(f"Injecting bug corpus translations ({_tgt_lang}) → {project_corpus_path}")
-
-        try:
-            src_conn = sqlite3.connect(bug_corpus_db)
-            rows = src_conn.execute(
-                "SELECT id, project, name, translations FROM corpus WHERE translations != '{}'",
-            ).fetchall()
-            src_conn.close()
-        except Exception as e:
-            logger.error(f"Failed to read bug corpus: {e}")
-            sys.exit(1)
-
-        # Ensure target seeds DB exists (create if missing)
-        dst_conn = sqlite3.connect(project_corpus_path)
-        dst_conn.execute("""
-            CREATE TABLE IF NOT EXISTS seeds (
-                id         INTEGER PRIMARY KEY AUTOINCREMENT,
-                identifier TEXT UNIQUE,
-                content    TEXT,
-                metadata   TEXT
-            )
-        """)
-        dst_conn.commit()
-        # Add identifier column if the table pre-existed without it
-        existing_cols = {row[1] for row in dst_conn.execute("PRAGMA table_info(seeds)")}
-        if "identifier" not in existing_cols:
-            dst_conn.execute("ALTER TABLE seeds ADD COLUMN identifier TEXT")
-            dst_conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_seeds_identifier ON seeds(identifier)")
-            dst_conn.commit()
-
-        # Seeds a prune pass rejected must not come back on the next run
-        # (see core/parser.py's pruned_identifiers).
-        from core.parser import pruned_identifiers
-        pruned = pruned_identifiers(project_corpus_path)
-
-        added = skipped = 0
-        for row in rows:
-            trans = json.loads(row[3])
-            code = trans.get(_tgt_lang)
-            if not code:
-                continue
-            identifier = f"bug_corpus_{row[0]}_{row[1]}_{row[2] or row[0]}"
-            if identifier in pruned:
-                skipped += 1
-                continue
-            try:
-                dst_conn.execute(
-                    "INSERT INTO seeds (identifier, content, metadata) VALUES (?, ?, ?)",
-                    (identifier, code, json.dumps({
-                        "type": "bug_corpus",
-                        "source_project": row[1],
-                        "source_name": row[2],
-                        "bug_corpus_id": row[0],
-                    })),
-                )
-                added += 1
-            except sqlite3.IntegrityError:
-                skipped += 1
-        dst_conn.commit()
-        dst_conn.close()
-        logger.info(f"Bug corpus: {added} seeds injected, {skipped} already present")
-
     # === STANDARD FUZZING SETUP ===
     
     # Determine Corpus Path
@@ -532,6 +452,97 @@ if __name__ == "__main__":
             else:
                 logger.warning("Preprocessing requested but no script found.")
 
+    # === BUG CORPUS MODE ===
+    # After --setup, deliberately. Eight project setups (go, cpython, gcc,
+    # rust, tint, triton, v8, spidermonkey) rebuild corpus.db from the seed
+    # tree by deleting it first, so injecting the bug corpus *before* setup
+    # — as this used to — meant `--setup --bug-corpus` logged "2500 seeds
+    # injected" and then silently threw them away.
+    # Maps project name to canonical language key stored in corpus translations JSON
+    # Keys are what corpus/corpus.db actually stores under `translations`
+    # (haskell, mlir, fortran, wgsl, go, swift, ...). Three of the old
+    # entries named a language the corpus has never held — flang/lfortran
+    # were "flang" (stored as "fortran"), naga was "rust" and tint had no
+    # entry (both stored as "wgsl") — so `--bug-corpus` injected nothing
+    # for four adapters while logging success.
+    _LANG_MAP = {
+        "cpython": "python", "gcc": "c", "clang": "c",
+        "go": "go", "rust": "rust", "php": "php",
+        "swift": "swift", "lean": "lean", "mlir": "mlir",
+        "naga": "wgsl", "tint": "wgsl", "wgslc": "wgsl", "sql": "sql",
+        "flang": "fortran", "lfortran": "fortran",
+    }
+    _tgt_lang = _LANG_MAP.get(args.project.lower(), args.project.lower())
+
+    if args.bug_corpus:
+        bug_corpus_db = os.path.join("corpus", "corpus.db")
+        if not os.path.exists(bug_corpus_db):
+            logger.error(f"Bug corpus DB not found at {bug_corpus_db}. Run corpus/main.py first.")
+            sys.exit(1)
+
+        project_corpus_path = os.path.join("projects", args.project, "corpus.db")
+        logger.info(f"Injecting bug corpus translations ({_tgt_lang}) → {project_corpus_path}")
+
+        try:
+            src_conn = sqlite3.connect(bug_corpus_db)
+            rows = src_conn.execute(
+                "SELECT id, project, name, translations FROM corpus WHERE translations != '{}'",
+            ).fetchall()
+            src_conn.close()
+        except Exception as e:
+            logger.error(f"Failed to read bug corpus: {e}")
+            sys.exit(1)
+
+        # Ensure target seeds DB exists (create if missing)
+        dst_conn = sqlite3.connect(project_corpus_path)
+        dst_conn.execute("""
+            CREATE TABLE IF NOT EXISTS seeds (
+                id         INTEGER PRIMARY KEY AUTOINCREMENT,
+                identifier TEXT UNIQUE,
+                content    TEXT,
+                metadata   TEXT
+            )
+        """)
+        dst_conn.commit()
+        # Add identifier column if the table pre-existed without it
+        existing_cols = {row[1] for row in dst_conn.execute("PRAGMA table_info(seeds)")}
+        if "identifier" not in existing_cols:
+            dst_conn.execute("ALTER TABLE seeds ADD COLUMN identifier TEXT")
+            dst_conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_seeds_identifier ON seeds(identifier)")
+            dst_conn.commit()
+
+        # Seeds a prune pass rejected must not come back on the next run
+        # (see core/parser.py's pruned_identifiers).
+        from core.parser import pruned_identifiers
+        pruned = pruned_identifiers(project_corpus_path)
+
+        added = skipped = 0
+        for row in rows:
+            trans = json.loads(row[3])
+            code = trans.get(_tgt_lang)
+            if not code:
+                continue
+            identifier = f"bug_corpus_{row[0]}_{row[1]}_{row[2] or row[0]}"
+            if identifier in pruned:
+                skipped += 1
+                continue
+            try:
+                dst_conn.execute(
+                    "INSERT INTO seeds (identifier, content, metadata) VALUES (?, ?, ?)",
+                    (identifier, code, json.dumps({
+                        "type": "bug_corpus",
+                        "source_project": row[1],
+                        "source_name": row[2],
+                        "bug_corpus_id": row[0],
+                    })),
+                )
+                added += 1
+            except sqlite3.IntegrityError:
+                skipped += 1
+        dst_conn.commit()
+        dst_conn.close()
+        logger.info(f"Bug corpus: {added} seeds injected, {skipped} already present")
+
     # 4. Load Corpus into Memory
     if not os.path.exists(project_corpus_path):
         logger.error(f"Corpus DB not found at {project_corpus_path}. Setup failed.")
@@ -627,25 +638,55 @@ if __name__ == "__main__":
         from core.driver import get_driver
         from core.dryrun import run_dryrun_with_metadata
 
+        # The per-seed timeout is the project's own execution timeout, not
+        # a fixed 5 s. A sanitized compiler (clang, flang: 30-40 s in
+        # config.yaml) or a cold cross-target Go build takes far longer
+        # than that on a plain seed; with 5 s the pass recorded rc=124 on
+        # 55% of Go's seeds, and killing the build mid-way also left the
+        # shared build cache cold for the fuzzing run that followed.
+        _pre_timeout = max(5, int(config.get("execution", {}).get("timeout", 5) or 5))
         logger.info(
             f"Corpus pre-run pass: {len(initial_corpus)} seeds "
             f"(dry-run={args.dry_run}, pre-analysis={args.pre_analysis}, "
-            f"timeout=5s, workers={_max_workers})"
+            f"timeout={_pre_timeout}s, workers={_max_workers})"
         )
         _valid_corpus = run_dryrun_with_metadata(
             seeds            = initial_corpus,
             driver_factory   = lambda: get_driver(config),
             db_path          = project_corpus_path,
             concurrency      = _max_workers,
-            timeout          = 5,
+            timeout          = _pre_timeout,
             force            = args.setup,
             collect_metadata = args.pre_analysis,
             filter_valid     = args.dry_run,
             project_name     = args.project,
         )
+        # Config-driven equivalent of --dry-run for projects where a seed
+        # that fails on its own can only produce children that fail at
+        # the same point: every CPython seed is *executed*, so one that
+        # raises standalone (a missing fixture, a failing assertion, a
+        # port in use) raises identically inside every child. Measured on
+        # the CPython corpus, pairs with such a parent were 17% of all
+        # pairs and 45-75% of the invalid children.
+        _drop_failing = bool((config.get("analysis") or {}).get("drop_seeds_failing_alone"))
+        if _drop_failing and not args.dry_run:
+            _before = len(_valid_corpus)
+            _keep_rx = (config.get("analysis") or {}).get("drop_seeds_failing_alone_except")
+            _keep_rx = re.compile(_keep_rx) if _keep_rx else None
+            _valid_corpus = [
+                s for s in _valid_corpus
+                if (s.metadata or {}).get("rc") in (None, 0)
+                or (_keep_rx is not None and _keep_rx.search(s.content or ""))
+            ]
+            if _before != len(_valid_corpus):
+                logger.info(
+                    f"Dropped {_before - len(_valid_corpus)} seeds that fail on their own "
+                    f"(analysis.drop_seeds_failing_alone in {args.project}'s config.yaml)."
+                )
         logger.info(
             f"Using {len(_valid_corpus)}/{len(initial_corpus)} seeds for fuzzing"
-            + (" (filtered to rc=0)." if args.dry_run else " (unfiltered).")
+            + (" (filtered to rc=0)." if args.dry_run else
+               " (seeds failing alone dropped)." if _drop_failing else " (unfiltered).")
         )
     else:
         _valid_corpus = initial_corpus

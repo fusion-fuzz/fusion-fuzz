@@ -23,13 +23,21 @@ class BaseMutator:
         """Randomly mutate arithmetic operators (+, -, *, /, %, **)."""
         if random.random() > 0.001:
             return code
-        target_regex = r'\+\+|[-*/%]|\*\*'
+        # Only an operator standing on its own. `-` inside `->` and `=>`
+        # (PHP, C, Rust member/arrow syntax), `/` opening a `//` or `/*`
+        # comment, `*` closing one, or `--`/`++` halves are not
+        # arithmetic, and rewriting them is a guaranteed parse failure
+        # rather than a changed computation. The previous version also
+        # replaced the *first* occurrence of the victim text anywhere in
+        # the file rather than the one it drew — for `-` that is almost
+        # always the `->` of the first method call.
+        target_regex = r'(?<![-+*/%<>=!])(?:\+\+|\*\*|[-*/%])(?![-+*/%>=])'
         replacements = ['+', '-', '*', '/', '%', '**']
-        victims = re.findall(target_regex, code)
+        victims = list(re.finditer(target_regex, code))
         if len(victims) == 0:
             return code
-        code = code.replace(choice(victims), choice(replacements), 1)
-        return code
+        m = choice(victims)
+        return code[:m.start()] + choice(replacements) + code[m.end():]
 
     def _mr_assign_operators(self, code):
         """Randomly mutate assignment operators (+=, -=, *=, /=, %=)."""
@@ -69,30 +77,28 @@ class BaseMutator:
             return code
         target_regex = r'(?<![a-zA-Z0-9_])(?:0x[0-9a-fA-F]+|0[0-7]*|[1-9][0-9]*|0)(?![a-zA-Z0-9_])'
         replacements = ['-1', '0', '1', '-2147483648', '2147483647'] # Standard 32-bit limits
-        victims = re.findall(target_regex, code)
-        if len(victims) == 0:
+        victims = list(re.finditer(target_regex, code))
+        if not victims:
             return code
-        victim = choice(victims)
-        replace = choice(replacements)
-        code = re.sub(re.escape(victim), replace, code, 1)
-        return code
+        m = choice(victims)                       # its own span, not the first textual hit
+        return code[:m.start()] + choice(replacements) + code[m.end():]
 
     def _mr_string(self, code):
         """Randomly mutate string literals."""
         if random.random() > 0.01:
             return code
-        target_regex = r"'([^'\\]+(\\.[^'\\]*)*)'|\"([^\"\\]+(\\.[^\"\\]*)*)\""
-        # Generic string replacements
-        replacements = [f"'{chr(randint(0, 255))}'", "''", "'test\\0test'"] 
-        victims = re.findall(target_regex, code)
-        # Flatten tuple results from findall
-        victims = [match[0] if match[0] else match[2] for match in victims]
-        if len(victims) == 0:
+        # Whole literals, replaced at their own span (the content-text
+        # substitution this used to do hit the same text elsewhere in the
+        # code and produced `"'x'"` for a double-quoted victim).
+        target_regex = (r"//[^\n]*|/\*.*?\*/"                       # comments keep the scan in sync
+                        r"|'(?:[^'\\]|\\.)+'|\"(?:[^\"\\]|\\.)+\"")
+        victims = [m for m in re.finditer(target_regex, code, re.S) if m.group(0)[0] in "'\""]
+        if not victims:
             return code
-        victim = choice(victims)
-        replace = choice(replacements)
-        code = re.sub(re.escape(victim), replace, code, 1)
-        return code
+        m = choice(victims)
+        quote = m.group(0)[0]
+        body = choice([chr(randint(32, 126)).replace(quote, ""), "", "test\\0test"])
+        return code[:m.start()] + quote + body + quote + code[m.end():]
 
 class PHPMutator(BaseMutator):
     """
@@ -144,27 +150,35 @@ class PHPMutator(BaseMutator):
         """Override with PHP-specific boundary constants."""
         if random.random() > 0.002:
             return phpcode
-        target_regex = r'(?<![a-zA-Z0-9_])(?:0x[0-9a-fA-F]+|0[0-7]*|[1-9][0-9]*|0)(?![a-zA-Z0-9_])'
-        victims = re.findall(target_regex, phpcode)
+        target_regex = r'(?<![a-zA-Z0-9_$])(?:0x[0-9a-fA-F]+|0[0-7]*|[1-9][0-9]*|0)(?![a-zA-Z0-9_])'
+        # Replace the drawn match at its own span: substituting the first
+        # textual occurrence of the number hit digits inside strings and
+        # other literals.
+        victims = list(re.finditer(target_regex, phpcode))
         if not victims:
             return phpcode
-        victim = choice(victims)
-        phpcode = re.sub(re.escape(victim), choice(self.PHP_SPECIAL_INTS), phpcode, 1)
-        return phpcode
+        m = choice(victims)
+        return phpcode[:m.start()] + choice(self.PHP_SPECIAL_INTS) + phpcode[m.end():]
 
     def _mr_string(self, phpcode):
         """Override with PHP type-juggling string values."""
         if random.random() > 0.01:
             return phpcode
-        target_regex = r"'([^'\\]*(\\.[^'\\]*)*)'|\"([^\"\\]*(\\.[^\"\\]*)*)\""
-        victims = re.findall(target_regex, phpcode)
-        victims = [m[0] if m[0] else m[2] for m in victims]
+        # Whole literals, replaced at their own span. The old form
+        # substituted the literal's *content* wherever it first appeared —
+        # an empty string matched at offset 0 and `""` became `""-0""`,
+        # and content such as `] = ` was rewritten inside code (29% of PHP
+        # state-fusion failures were these parse errors).
+        # Scan comments, heredocs and strings together so an apostrophe in
+        # a `//` comment or a `"don't"` cannot desynchronise the scan (that
+        # turned `'name'] = 'Joe'` into `'name"NULL"Joe'`).
+        target_regex = (r"//[^\n]*|#[^\n]*|/\*.*?\*/|<<<['\"]?(\w+)['\"]?\n.*?\n\1;?"
+                        r"|'(?:[^'\\]|\\.)*'|\"(?:[^\"\\]|\\.)*\"")
+        victims = [m for m in re.finditer(target_regex, phpcode, re.S) if m.group(0)[0] in "'\""]
         if not victims:
             return phpcode
-        victim = choice(victims)
-        replace = choice(self.PHP_SPECIAL_STRINGS)
-        phpcode = re.sub(re.escape(victim), lambda _: replace, phpcode, count=1)
-        return phpcode
+        m = choice(victims)
+        return phpcode[:m.start()] + choice(self.PHP_SPECIAL_STRINGS) + phpcode[m.end():]
 
     def _mr_variable(self, phpcode):
         """Cross-assign PHP variables to expose type confusion across call sites."""
@@ -251,7 +265,10 @@ class PHPMutator(BaseMutator):
         if '<=>' in phpcode:
             phpcode = phpcode.replace('<=>', choice(['<', '>', '==']), 1)
         else:
-            cmp_matches = list(re.finditer(r'[<>]=?|==', phpcode))
+            # Not the `<` of `<?php`/`<<<`, the `>` of `->`/`=>`/`?>`,
+            # or one half of `===`/`<=>`/`!=`: those are not comparisons.
+            cmp_matches = list(re.finditer(
+                r'(?<![-=<>!?])(?:<=|>=|==|<|>)(?![=<>?])', phpcode))
             if cmp_matches:
                 m = choice(cmp_matches)
                 phpcode = phpcode[:m.start()] + '<=>' + phpcode[m.end():]

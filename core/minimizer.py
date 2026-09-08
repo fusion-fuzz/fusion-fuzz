@@ -1,3 +1,4 @@
+import re
 import logging
 import uuid
 import math
@@ -73,6 +74,21 @@ class DeltaDebugger:
                 # 1. Direct substring match on raw output (works for any user string)
                 if expected_sig in combined:
                     return True
+                # 1b. Adapters prefix signatures with their kind ("Stderr:",
+                #     "ICE:", "Rust panic:", "Assertion:", "Crash:"); the
+                #     text after the prefix is what the output contains.
+                body = re.sub(r'^(?:Stderr|ICE|Rust panic|Assertion|Crash|UBSAN|ASAN|LLVM ERROR|Stack dump)\s*:\s*',
+                              '', expected_sig).strip()
+                if len(body) >= 8 and body in combined:
+                    return True
+                # 1c. "Stack dump: <msg> [frame > frame > frame]" signatures
+                #     (clang): the frames are what identifies the crash site;
+                #     accept when the crash is there and its deepest frame is.
+                fr = re.search(r'\[([^\]]+)\]\s*$', expected_sig)
+                if fr and 'Stack dump:' in combined:
+                    frames = [f.strip() for f in fr.group(1).split('>') if f.strip()]
+                    if frames and any(f.split('(')[0] in combined for f in frames[:2]):
+                        return True
                 # 2. Keyword-level match on the extracted signature
                 if result.crashed:
                     sig = result.signature or self.driver.extract_crash_signature(

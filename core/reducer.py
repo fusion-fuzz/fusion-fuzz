@@ -47,6 +47,16 @@ class _ShellTestDriver:
         "Fatal Python error:",
         "LLVM ERROR:",
         "internal compiler error:",
+        "internal compiler error",
+        "panicked at",                 # Rust panics (naga, rustc)
+        "panic! (the 'impossible' happened)",   # GHC
+        "GHC error in",
+        "ICE:",
+        "Stack dump:",
+        "PLEASE submit a bug report",
+        "runtime error:",              # UBSan
+        "LCOMPILERS_ASSERT",
+        "Aborted",
     )
 
     def __init__(self, bug_dir: str, test_sh_path: str, test_fname: str, timeout: int = 30):

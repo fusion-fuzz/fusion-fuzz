@@ -194,7 +194,8 @@ def test_renaming_a_name_to_itself_is_a_noop():
 # ---------------------------------------------------------------------------
 
 COMMENT_TOKEN = {
-    "clang": "//", "gcc": "//", "php": "//", "rust": "//", "swift": "//",
+    # C uses the block form so the tag survives `-std=c90`/`-ansi`.
+    "clang": "/*", "gcc": "/*", "php": "//", "rust": "//", "swift": "//",
     "mlir": "//", "cpython": "#", "haskell": "--", "flang": "!",
     "go": "//",
 }
@@ -232,7 +233,7 @@ def test_only_changed_lines_are_tagged():
     after = "int a = 1;\nint z = 2;\nint c = 3;\n"
     out = strategy._tag_renamed_lines(before, after).splitlines()
     assert out[0] == "int a = 1;"
-    assert out[1] == "int z = 2;  // dataflow fusion"
+    assert out[1] == "int z = 2;  /* dataflow fusion */"
     assert out[2] == "int c = 3;"
 
 
@@ -246,7 +247,7 @@ def test_line_continuation_is_never_tagged():
     after = "#define M(y) \\\n    foo(y)\n"
     out = strategy._tag_renamed_lines(before, after)
     assert out.splitlines()[0].endswith("\\"), out
-    assert out.splitlines()[1].endswith("// dataflow fusion")
+    assert out.splitlines()[1].endswith("/* dataflow fusion */")
 
 
 def test_tagging_preserves_the_trailing_newline():
