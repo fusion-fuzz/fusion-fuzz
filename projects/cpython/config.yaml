@@ -20,6 +20,14 @@ execution:
   mem_limit_mb: 2048
 
 analysis:
+  # Every seed here is executed, so one that raises on its own — a missing
+  # fixture, an assertion the decomposition broke, a port already in use —
+  # raises identically inside every child. With --pre-analysis, drop such
+  # seeds for the run (rc recorded by the pre-run pass). Measured on the
+  # decomposed corpus: 9% of seeds, 17% of pairs, 45-75% of the invalid
+  # children; clean-parent pairs alone are valid 84/96/94% of the time
+  # (dataflow/state/declaration) against 77/84/84% overall.
+  drop_seeds_failing_alone: true
   # The coarse net. projects/cpython/analyzer.py makes the actual decision
   # and subtracts what these would over-match — chiefly MemoryError and
   # RecursionError, which are ordinary exceptions saying the fused program

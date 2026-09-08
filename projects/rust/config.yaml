@@ -11,6 +11,14 @@ execution:
   mem_limit_mb: 6144
 
 analysis:
+  # Two thirds of tests/ui does not compile on its own. The deliberate
+  # part — files carrying `//~ ERROR` annotations or a compile-fail
+  # directive — is kept, as the Go adapter keeps `// errorcheck` (error-
+  # recovery paths are where an ICE hides); the rest fails for reasons
+  # outside the compiler (an auxiliary crate, an edition, a feature the
+  # stage1 build lacks) and yields children rejected at the same line.
+  drop_seeds_failing_alone: true
+  drop_seeds_failing_alone_except: '(?m)//~\^*\s*(?:ERROR|WARN)|^//@\s*(?:compile-fail|check-fail|build-fail)\b'
   # The coarse net; projects/rust/analyzer.py makes the actual decision and
   # subtracts the resource shapes that match here but say nothing about
   # rustc (OOM, stack overflow, recursion/type-length limits).
@@ -54,6 +62,15 @@ paths:
     # seed leaves its original directory.
     - pattern: 'include(?:_str|_bytes)?!\s*\('
       reason: "includes a sibling file that cannot resolve outside its test directory"
+    # `mod foo;` names a sibling file; the corpus holds single files only,
+    # so this is "file not found for module" every time.
+    - pattern: '(?m)^\s*(?:pub(?:\([^)]*\))?\s+)?mod\s+\w+\s*;'
+      reason: "declares an external module whose file is not in the corpus"
+    # `extern crate foo;` for anything but the sysroot crates cannot be
+    # resolved without the crate on disk: "can't find crate" every time
+    # (12-16% of failures after the other prunes).
+    - pattern: '(?m)^\s*(?:pub\s+)?extern\s+crate\s+(?!(?:core|std|alloc|proc_macro|test|libc)\b)\w+'
+      reason: "extern crate that is not in the sysroot; unresolvable"
     # NOTE: `//@ check-fail` / `//@ build-fail` tests are deliberately NOT
     # excluded. They are ill-formed on purpose, and rustc's error-recovery
     # paths are a productive bug source — a `delayed_bug` that never gets

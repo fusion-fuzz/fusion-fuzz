@@ -133,6 +133,10 @@ class ClangDriver(BaseDriver):
         if stds and random.random() > 0.3:
             weights = self.STD_C_WEIGHTS if stds is self.STD_C else None
             std = random.choices(stds, weights=weights, k=1)[0] if weights else random.choice(stds)
+            # C89 rejects `//` comments and `for (int ...)` outright; a seed
+            # written with them cannot be valid under it (same rule as gcc).
+            if std in ("c89", "c90", "gnu89") and ("//" in content or re.search(r'\bfor\s*\(\s*(?:int|unsigned|long|size_t)\b', content)):
+                std = "c99"
             flags.append(f"-std={std}")
         if ext not in self._CXX_EXTS:
             flags.extend(self.C_LEGACY_FLAGS)
@@ -146,8 +150,15 @@ class ClangDriver(BaseDriver):
             # default (GCC legacy, fragile ABI) rejects weak references and
             # property synthesis without a matching ivar — both pervasive in
             # the Obj-C corpus — and refuses -fobjc-arc outright.
-            flags.append(f"-fobjc-runtime={random.choice(self.OBJC_ARC_RUNTIMES)}")
-            flags.append("-fobjc-arc" if random.random() > 0.5 else "-fno-objc-arc")
+            if target_flags and "apple" in target_flags:
+                # The seed's own darwin/ios triple picks the runtime; an
+                # old deployment target then refuses ARC ("-fobjc-arc is
+                # not supported on versions of OS X prior to 10.6": 3 of
+                # the 5% flag-induced rejections measured by flagnoise).
+                flags.append("-fno-objc-arc")
+            else:
+                flags.append(f"-fobjc-runtime={random.choice(self.OBJC_ARC_RUNTIMES)}")
+                flags.append("-fobjc-arc" if random.random() > 0.5 else "-fno-objc-arc")
         misc = random.sample(self.MISC_FLAGS, random.randint(0, 3))
         if cross:
             # No sanitizer runtime is built for the cross targets, and the
@@ -231,6 +242,19 @@ class ClangDriver(BaseDriver):
         res.seed_file = seed_file
         return res
 
+    # "fatal error: error in backend" lines that are a missing feature of
+    # the host target, not a compiler defect. They come with "PLEASE submit
+    # a bug report" and a stack dump, so the generic patterns flag them.
+    _BENIGN_BACKEND_RE = re.compile(
+        r'error in backend: (?:Objective-C support is unimplemented for object file format'
+        r'|.*not supported on this target|.*is not supported by the target'
+        r'|.*predicate\(s\) are not met)')
+
+    def _check_crash(self, stdout, stderr, return_code):
+        if self._BENIGN_BACKEND_RE.search((stderr or "") + (stdout or "")):
+            return False
+        return super()._check_crash(stdout, stderr, return_code)
+
     def extract_crash_signature(self, stdout, stderr, return_code):
         combined = stderr + stdout
 
@@ -246,7 +270,9 @@ class ClangDriver(BaseDriver):
         if m:
             return f"LLVM ERROR: {m.group(1).strip()}"
 
-        m = re.search(r"Assertion `([^']+)' failed", combined)
+        # The assertion text may itself contain a quote ("...' expected");
+        # take the whole line up to the closing `' failed`.
+        m = re.search(r"Assertion `(.+?)' failed\.?\s*$", combined, re.M)
         if m:
             return f"Assertion: {m.group(1).strip()}"
 
@@ -296,6 +322,10 @@ class ClangDriver(BaseDriver):
         # msg_lines[0] is "Program arguments: ..." — the crash-site message
         # (if any) is the next numbered line.
         message = msg_lines[1].strip() if len(msg_lines) > 1 else ""
+        # "current parser token 'int'" names the token under the cursor,
+        # which differs between two hits of the same crash; the frames say
+        # where it crashed.
+        message = re.sub(r"current parser token '.*?'", "current parser token", message)
 
         frames = []
         for fm in self._STACK_FRAME_RE.finditer(body):

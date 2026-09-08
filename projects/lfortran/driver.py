@@ -31,7 +31,9 @@ class LfortranDriver(BaseDriver):
         "--show-ast", "--show-asr", "--show-llvm", "--show-c",
         "--show-cpp", "--show-asm", "-S -o /dev/null", "-c -o /dev/null",
     ]
-    MODE_WEIGHTS = [15, 30, 15, 10, 5, 5, 10, 10]
+    # The C/C++ backends raise "not implemented" on most real programs
+    # (counted as invalid children, never as crashes): kept, at low weight.
+    MODE_WEIGHTS = [15, 30, 15, 4, 2, 6, 14, 14]
 
     STD_VALUES = ["lf", "f23", "legacy"]
 
@@ -39,7 +41,10 @@ class LfortranDriver(BaseDriver):
         "--implicit-typing", "--implicit-interface",
         "--implicit-argument-casting", "--logical-casting",
         "--use-loop-variable-after-loop", "--legacy-array-sections",
-        "--cpp", "-g",
+        "--cpp",
+        # `-g` dropped: this build has no runtime stacktrace support, so
+        # every -g run ends in "The `runtime stacktrace` is not enabled"
+        # (7 of 38 flag-induced rejections in tools/flagnoise.py).
     ]
 
     _FIXED_FORM_EXTS = (".f", ".F")
@@ -51,7 +56,12 @@ class LfortranDriver(BaseDriver):
         flags = [random.choices(self.MODES, weights=self.MODE_WEIGHTS, k=1)[0]]
         flags.extend(self._lang_flags(ext))
         if random.random() > 0.5:
-            flags.append(f"--std={random.choice(self.STD_VALUES)}")
+            # `--std=legacy` switches LFortran to fixed-form parsing: on a
+            # free-form .f90 every run is "tokenizer error: ICE: Cannot
+            # recognize global scope entity" at 1:1 — a third of the std
+            # draws, and 34% of all state-fusion "failures" before this.
+            stds = self.STD_VALUES if ext in self._FIXED_FORM_EXTS else [x for x in self.STD_VALUES if x != "legacy"]
+            flags.append(f"--std={random.choice(stds)}")
         flags.extend(random.sample(self.MISC_FLAGS, random.randint(0, 3)))
         return " ".join(flags)
 
@@ -200,6 +210,14 @@ class LfortranDriver(BaseDriver):
         m = re.search(r"SUMMARY: UndefinedBehaviorSanitizer:\s+([^\n]+)", combined)
         if m:
             return f"UBSAN: {m.group(1).strip()}"
+        # This build's UBSan prints only the report line, no SUMMARY:
+        #   parser.yy:812:19: runtime error: load of value 112, which is not a valid value for type 'bool'
+        # Key on site + message with the value removed, or every distinct
+        # garbage byte becomes its own "bug" (five bundles for one site).
+        m = re.search(r"([\w./+-]+:\d+(?::\d+)?): runtime error: ([^\n]+)", combined)
+        if m:
+            msg = re.sub(r"\b\d+\b", "N", m.group(2)).strip()
+            return f"UBSAN: {m.group(1)} {msg[:100]}"
 
         fp = self._stacktrace_fingerprint(combined)
 

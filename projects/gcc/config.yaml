@@ -12,6 +12,13 @@ execution:
   mem_limit_mb: 4096
 
 analysis:
+  # Half of the GCC testsuite does not compile on its own here (dg-error
+  # tests, target-specific options, missing headers). Files carrying a
+  # dg-error/dg-warning expectation are deliberate and kept, as Go keeps
+  # `// errorcheck`; the rest fails for environmental reasons and yields
+  # children rejected at the same line. Dropped after --pre-analysis.
+  drop_seeds_failing_alone: true
+  drop_seeds_failing_alone_except: '(?m)\{\s*dg-(?:error|warning|bogus|message)\b'
   # An ICE is the finding. GCC prints "internal compiler error:" for every
   # one of them, including those it catches from its own SIGSEGV handler,
   # so that string plus the sanitizer summaries is most of the oracle.
@@ -51,6 +58,19 @@ paths:
   seed_corpus: "projects/gcc/corpus.db"
 
   seed_exclude_patterns:
+    # `dg-options "-fself-test=<dir>"` runs GCC's own selftests against a
+    # directory the seed names; outside the testsuite that directory does
+    # not exist and cc1 aborts in selftest::fail_formatted — an ICE
+    # signature caused by the flag, not by the program (one of the first
+    # twelve findings).
+    - pattern: '-fself-test'
+      reason: "dg-options -fself-test: GCC selftest driven by the flag, not the program"
+    # Headers of other architectures' intrinsics (arm_sve.h, arm_neon.h,
+    # riscv_vector.h, altivec.h): "No such file or directory" on this x86
+    # host before the compiler reads a line of the seed — 10-15% of
+    # every strategy's failures.
+    - pattern: '(?m)^\s*#\s*include\s*<(?:arm_[a-z0-9_]+|riscv_vector|altivec|vecintrin|msa|spe|s390intrin|loongarch_[a-z0-9_]+)\.h>'
+      reason: "intrinsics header of another architecture; not present on this host"
     # NOTE: there is deliberately no exclusion for DejaGnu negative tests
     # (`{ dg-error "..." }`), even though the clang adapter excludes its
     # -verify equivalent. GCC's error-recovery paths are a productive bug
@@ -67,6 +87,11 @@ paths:
     # where cross-target assumptions break). The driver still filters
     # -m<arch> flags out of dg-options, because those fail in the *driver*
     # rather than the compiler and buy nothing.
+    # Hand-written GIMPLE (`__GIMPLE`, dg-options -fgimple) bypasses the
+    # front end; mutating it produces "SSA corruption" ICEs that say nothing
+    # about the compiler's own paths (one bundle so far).
+    - pattern: '__GIMPLE\s*\(|-fgimple\b'
+      reason: "hand-written GIMPLE input; fusion/mutation corrupts SSA form by construction"
 
     # Multi-file tests: the other half of the test is not in the corpus, so
     # these can never link or even parse standalone.

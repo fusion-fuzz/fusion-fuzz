@@ -7,12 +7,18 @@ execution:
   concurrency: 16
 
 analysis:
+  # 58% of the injected (LLM-translated) MLIR bug corpus and 11% of the
+  # mlir/test seeds do not parse/verify on their own; such a seed yields
+  # children rejected at the same line. Dropped after --pre-analysis
+  # records rc.
+  drop_seeds_failing_alone: true
   crash_patterns:
     - "AddressSanitizer"
     - "UndefinedBehaviorSanitizer"
     - "Segmentation fault"
     - "LLVM ERROR"
     - "Assertion failed"
+    - ": Assertion `"
     - "UNREACHABLE executed"
     - "report_fatal_error"
     - "Aborted"

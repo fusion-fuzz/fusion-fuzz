@@ -165,6 +165,15 @@ class RustDriver(BaseDriver):
         self.host_triple = mod.host_triple()
         self.sysroot = os.path.join(proj, "rust-src", "build",
                                     self.host_triple, "stage1")
+        # A cross target is only usable when its std/core was built into
+        # the sysroot (lib/rustlib/<triple>/lib); otherwise every seed
+        # that names `std` fails with "can't find crate for `std`" before
+        # the compiler does anything — 12% of all children were that.
+        self.cross_targets = [
+            t for t in self.CROSS_TARGETS
+            if t != self.host_triple
+            and os.path.isdir(os.path.join(self.sysroot, "lib", "rustlib", t, "lib"))
+        ]
 
     # ── command construction ──────────────────────────────────────────
 
@@ -183,6 +192,14 @@ class RustDriver(BaseDriver):
         return random.sample(self.UNSAFE_FLAGS, min(k, len(self.UNSAFE_FLAGS)))
 
     def _flags(self, facts, emit, target):
+        # --dry-run/--pre-analysis asks whether rustc accepts the seed at
+        # all: one deterministic answer, cheapest possible (no LTO, no
+        # sanitizers, no verifiers), the seed's own compile-flags kept.
+        if getattr(self, "dryrun_mode", False):
+            flags = [f"--edition={facts['edition'] or '2021'}", "-Copt-level=0"]
+            flags.extend(facts["compile_flags"])
+            flags.append(f"--emit={emit}")
+            return flags
         flags = [f"--edition={facts['edition'] or random.choice(self.EDITIONS)}",
                  f"-Copt-level={random.choice(self.OPT_LEVELS)}",
                  f"-Ccodegen-units={random.choice(self.CODEGEN_UNITS)}"]
@@ -221,9 +238,9 @@ class RustDriver(BaseDriver):
         # not installed; those failures happen outside the compiler.
         if emit == "link":
             return self.host_triple
-        if random.random() < 0.75:
+        if not self.cross_targets or random.random() < 0.75:
             return self.host_triple
-        return random.choice(self.CROSS_TARGETS)
+        return random.choice(self.cross_targets)
 
     def _should_run(self, facts, emit):
         """Whether to execute the built binary.
@@ -249,8 +266,11 @@ class RustDriver(BaseDriver):
             with open(seed_file, "w", encoding="utf-8") as f:
                 f.write(seed.content)
 
-            emit = random.choices(self.EMITS, weights=self.EMIT_WEIGHTS, k=1)[0]
-            target = self._pick_target(emit, facts)
+            if getattr(self, "dryrun_mode", False):
+                emit, target = "metadata", self.host_triple
+            else:
+                emit = random.choices(self.EMITS, weights=self.EMIT_WEIGHTS, k=1)[0]
+                target = self._pick_target(emit, facts)
             flags = self._flags(facts, emit, target)
             out_bin = os.path.join(workdir, "a.out")
             out = f"-o {out_bin}" if emit == "link" else f"--out-dir {workdir}"

@@ -10,6 +10,13 @@ analysis:
   crash_patterns:
     - "Please submit a bug report"
     - "Assertion failed:"
+  # 57% of the harvested swift-test seeds do not type-check on their own:
+  # `-verify` tests written around expected-error comments, imports of
+  # test-only modules (StdlibUnittest, OSLog), RUN-line-dependent files.
+  # Measured with the seed's own `-typecheck` run (--pre-analysis records
+  # rc); such a seed yields children rejected at the same line, so drop
+  # it for the run. Baseline before this: dataflow 8.7%, state 14.0%.
+  drop_seeds_failing_alone: true
 
 paths:
   # Update this if you have a local seed directory

@@ -1,7 +1,10 @@
 import os
 import random
 import re
+import shlex
+import shutil
 import stat
+import tempfile
 import threading
 import time
 from core.driver import BaseDriver, ExecutionResult
@@ -87,15 +90,22 @@ class PHPDriver(BaseDriver):
         self.phpt_deps_dir = os.path.join(
             self.ffl_root, "projects", "php", "phpt_deps"
         )
-        # Shared execution directory: deps symlinked once, PHP scripts written
-        # and removed per-execution. Avoids recreating ~964 symlinks every run.
-        self._exec_dir = os.path.join(self.fused_base, "php_exec_shared")
+        # Every execution gets its own directory under here, holding the
+        # program plus links to the fixtures of the php-src test
+        # directories its parents came from (seed metadata `dep_dirs` /
+        # `source_dir`, see projects/php/setup.py's collect_phpt). That is
+        # what makes `__DIR__ . '/foo.inc'` and `require 'foo.inc'`
+        # resolve the way they do under run-tests.php. The previous shared
+        # directory held one flat set of fixtures under mangled names, so
+        # no such include ever resolved.
+        self._exec_dir = os.path.join(self.fused_base, "php_exec")
 
         self._exec_count = 0
         self._cleanup_lock = threading.Lock()
+        self._dep_listing_cache = {}
+        self._dep_listing_lock = threading.Lock()
 
         self._ensure_exec_dir()
-        self._setup_exec_dir()
 
     # ------------------------------------------------------------------
     # Directory lifecycle
@@ -115,23 +125,11 @@ class PHPDriver(BaseDriver):
         # Remove orphaned .php files from previous sessions.
         self._remove_stale_php_files(max_age=0)
 
-    def _setup_exec_dir(self):
-        """Symlink all phpt_deps into the shared exec dir. Called once at init."""
-        if not os.path.isdir(self.phpt_deps_dir):
-            return
-        for name in os.listdir(self.phpt_deps_dir):
-            src = os.path.join(self.phpt_deps_dir, name)
-            dst = os.path.join(self._exec_dir, name)
-            if not os.path.exists(dst):
-                try:
-                    os.symlink(src, dst)
-                except OSError:
-                    pass
-
     def _remove_stale_php_files(self, max_age=None):
         """
-        Delete .php files in the exec dir that are older than max_age seconds.
-        max_age=0 removes ALL .php files (used at startup for a clean slate).
+        Delete per-execution directories older than max_age seconds — left
+        behind only when a run was killed between mkdtemp and rmtree.
+        max_age=0 removes ALL of them (used at startup for a clean slate).
         Also restores exec dir permissions in case PHP chmod'd it during the run.
         """
         if max_age is None:
@@ -144,16 +142,61 @@ class PHPDriver(BaseDriver):
                 os.chmod(self._exec_dir, 0o755)
 
             for name in os.listdir(self._exec_dir):
-                if not name.endswith(".php"):
-                    continue
                 path = os.path.join(self._exec_dir, name)
                 try:
                     if max_age == 0 or (now - os.path.getmtime(path)) > max_age:
-                        os.unlink(path)
+                        if os.path.isdir(path) and not os.path.islink(path):
+                            shutil.rmtree(path, ignore_errors=True)
+                        else:
+                            os.unlink(path)
                 except OSError:
                     pass
         except OSError:
             pass
+
+    def _dep_files(self, rel_dir: str):
+        """[(name, absolute path)] of the fixtures in one php-src test
+        directory, listed once and cached — a hot loop links them on
+        every execution."""
+        with self._dep_listing_lock:
+            cached = self._dep_listing_cache.get(rel_dir)
+        if cached is not None:
+            return cached
+        base = os.path.normpath(os.path.join(self.phpt_deps_dir, rel_dir))
+        files = []
+        if base.startswith(self.phpt_deps_dir) and os.path.isdir(base):
+            for name in os.listdir(base):
+                full = os.path.join(base, name)
+                if os.path.isfile(full):
+                    files.append((name, full))
+        with self._dep_listing_lock:
+            self._dep_listing_cache[rel_dir] = files
+        return files
+
+    def _link_fixtures(self, workdir: str, seed) -> list:
+        """Link the parents' fixtures beside the program. Returns the
+        directories used (relative to phpt_deps), first parent first, so
+        a name present in both keeps the first parent's file — the one
+        whose `__DIR__` semantics the host half was written against."""
+        meta = getattr(seed, "metadata", None) or {}
+        dirs = list(meta.get("dep_dirs") or [])
+        if meta.get("source_dir") and meta["source_dir"] not in dirs:
+            dirs.insert(0, meta["source_dir"])
+        used = []
+        for rel in dirs:
+            files = self._dep_files(rel)
+            if not files:
+                continue
+            used.append(rel)
+            for name, full in files:
+                dst = os.path.join(workdir, name)
+                if os.path.lexists(dst):
+                    continue
+                try:
+                    os.symlink(full, dst)
+                except OSError:
+                    pass
+        return used
 
     def _maybe_cleanup(self):
         """Periodically remove stale .php files without blocking the hot path."""
@@ -176,12 +219,21 @@ class PHPDriver(BaseDriver):
         safe = re.sub(r'[^A-Za-z0-9_\-]', '_', seed_id)
         return (safe[:64] or "seed") + ".php"
 
+    # A .phpt section header is `--NAME--` and nothing else. The previous
+    # test, "starts and ends with --", also matched a line of program text
+    # such as `-----END EC PRIVATE KEY-----` inside a PEM string, and cut
+    # the --FILE-- section off there: the executed program was truncated
+    # mid-string and booked as "Unclosed '('", while `php -l` on the same
+    # fused test passed. run-tests.php uses the same anchored form.
+    _PHPT_SECTION_RE = re.compile(r'^--([A-Z_]+)--\s*$')
+
     def _parse_phpt(self, content):
         sections = {}
         current = None
         for line in content.splitlines():
-            if line.startswith("--") and line.endswith("--"):
-                current = line.strip("-")
+            m = self._PHPT_SECTION_RE.match(line)
+            if m:
+                current = m.group(1)
                 sections[current] = ""
             elif current is not None:
                 sections[current] += line + "\n"
@@ -193,7 +245,7 @@ class PHPDriver(BaseDriver):
 
     def execute(self, seed):
         start = time.time()
-        workdir = self._exec_dir
+        workdir = None
         seed_file = None
         cmd = "unknown"
         rc, stdout, stderr = 1, "", ""
@@ -202,6 +254,8 @@ class PHPDriver(BaseDriver):
             php_code = sections.get("FILE", seed.content).strip()
             ini_content = sections.get("INI", "").strip()
 
+            workdir = tempfile.mkdtemp(prefix="x", dir=self._exec_dir)
+            dep_dirs = self._link_fixtures(workdir, seed)
             seed_file = os.path.join(workdir, self._safe_seed_filename(seed.id))
             with open(seed_file, "w", encoding="utf-8") as f:
                 f.write(php_code)
@@ -210,16 +264,20 @@ class PHPDriver(BaseDriver):
                 f'-d disable_functions={",".join(self.BLOCKED_FUNCTIONS)}',
                 # Restrict PHP file access to the exec dir and deps only.
                 # This is the primary sandbox that prevents PHP from touching
-                # anything outside its working directory.
+                # anything outside its working directory. open_basedir
+                # checks the *resolved* path, so the fixture tree the
+                # links point into has to be allowed as well.
                 f'-d open_basedir="{workdir}:{self.phpt_deps_dir}"',
                 # Disable network access to avoid hangs.
                 '-d allow_url_fopen=0',
                 '-d allow_url_include=0',
             ]
 
-            # Add phpt_deps to include_path as fallback for includes not in workdir.
-            if os.path.isdir(self.phpt_deps_dir):
-                ini_args.append(f'-d include_path=".:{self.phpt_deps_dir}"')
+            # `.` is the workdir (cwd), where the fixtures are linked; the
+            # parents' own directories follow for a fixture that resolves
+            # a further include relative to itself.
+            inc = [".", workdir] + [os.path.join(self.phpt_deps_dir, d) for d in dep_dirs]
+            ini_args.append("-d " + shlex.quote("include_path=" + ":".join(inc)))
 
             # A seed that names opcache or jit in its own INI section is
             # asking for it and always gets it; every other seed draws a
@@ -270,36 +328,113 @@ class PHPDriver(BaseDriver):
                 if key.lower() in ('open_basedir', 'disable_functions',
                                    'allow_url_fopen', 'allow_url_include'):
                     continue
-                ini_args.append(f"-d {key}={val}")
+                # run-tests.php substitutes these before handing the INI
+                # to php; without it `{PWD}/x.h` is a literal brace path.
+                val = val.replace('{PWD}', workdir).replace('{TMP}', workdir)
+                # The command line goes through `sh -c`, and a .phpt INI
+                # value is free to contain shell syntax: `error_reporting=
+                # E_ALL&~E_NOTICE` backgrounds php at the `&`, `sendmail_
+                # path="cat > /tmp/x"` redirects, `session.save_path=
+                # "a;b"` ends the command. Every such seed (130 with `;`,
+                # 50 with `&` in this corpus) ran a truncated command and
+                # was booked as invalid — as "sh: Syntax error" — for a
+                # defect in this harness, not in the fused program.
+                ini_args.append("-d " + shlex.quote(f"{key}={val}"))
 
             ini_flags = " ".join(ini_args)
-            cmd = f"{self.php_bin} {ini_flags} {seed_file}"
+            # Sanitizer runtime options, same spirit as the other adapters:
+            #   handle_abort=1     a plain abort() (libgmp's "overflow in
+            #                      mpz type", a zend_mm assertion) gets an
+            #                      ASan stack trace, so it is grouped by
+            #                      the frame that aborted instead of every
+            #                      abort in the corpus sharing one
+            #                      "SIGABRT" bucket
+            #   allocator_may_return_null=1
+            #                      a huge allocation returns NULL for PHP's
+            #                      own memory_limit machinery to report,
+            #                      rather than ASan aborting with a
+            #                      "requested allocation size exceeds
+            #                      maximum" that is not a PHP bug
+            #   detect_leaks=1     kept on: php-src fixes leaks; they are
+            #                      filed under output/bugs/php/leaks/ (see
+            #                      extract_crash_signature) so they never
+            #                      crowd out crashes
+            env = ("ASAN_OPTIONS='handle_abort=1:abort_on_error=1:allocator_may_return_null=1:"
+                   "detect_leaks=1:symbolize=1:print_stacktrace=1' "
+                   "UBSAN_OPTIONS='print_stacktrace=1:halt_on_error=1' ")
+            cmd = f"{env}{self.php_bin} {ini_flags} {seed_file}"
             rc, stdout, stderr = self._run_command(cmd, cwd=workdir)
         finally:
-            # Only remove the seed script — the shared dir and its symlinks stay.
-            if seed_file:
-                try:
-                    os.unlink(seed_file)
-                except OSError:
-                    pass
+            if workdir:
+                shutil.rmtree(workdir, ignore_errors=True)
 
         duration = time.time() - start
         crashed = self._check_crash(stdout, stderr, rc)
         sig = self.extract_crash_signature(stdout, stderr, rc) if crashed else None
         res = ExecutionResult(rc, stdout, stderr, duration, crashed, sig)
-        res.command = cmd
-        res.seed_file = seed_file
+        # The recorded command is what goes into a crash bundle's
+        # test.sh, which core/orchestrator.py rewrites to run from the
+        # bundle directory. The per-execution workdir is gone by then,
+        # and with `open_basedir` still naming it the reproducer was
+        # refused with "open_basedir restriction in effect" — every
+        # bundle from the first verification run failed to reproduce for
+        # that reason alone. Point the sandbox at the bundle instead.
+        if workdir:
+            res.command = cmd.replace(workdir, "$SCRIPT_DIR")
+            res.seed_file = seed_file.replace(workdir, "$SCRIPT_DIR") if seed_file else seed_file
+        else:
+            res.command = cmd
+            res.seed_file = seed_file
 
         self._maybe_cleanup()
         return res
 
+    # First stack frame inside php-src itself, i.e. the allocation or
+    # crash site — skipping the allocator/interceptor frames above it.
+    _PHP_FRAME_RE = re.compile(
+        r"^\s+#\d+\s+0x[0-9a-f]+\s+in\s+([A-Za-z_]\w*)\s+\S*php-src/([^\s:]+)", re.M)
+
+    def _first_php_frame(self, text, skip=("malloc", "calloc", "realloc", "free",
+                                             "__zend_malloc", "__zend_calloc", "__zend_realloc",
+                                             "_emalloc", "_erealloc", "_ecalloc", "_efree",
+                                             "_safe_emalloc", "_estrdup", "_estrndup",
+                                             "abort", "raise", "kill", "__interceptor_abort",
+                                             "__assert_fail", "__assert_fail_base")):
+        for m in self._PHP_FRAME_RE.finditer(text):
+            func, path = m.group(1), m.group(2)
+            if func in skip or func.startswith(("zend_mm_", "__asan", "__interceptor", "__sanitizer")):
+                continue
+            return f"{func}_at_{path.rsplit('/', 1)[-1]}"
+        return None
+
     def extract_crash_signature(self, stdout, stderr, return_code):
+        combined = (stderr or "") + "\n" + (stdout or "")
         for text in (stderr, stdout):
             m = re.search(r"(Assertion: .*)", text)
             if m:
                 return m.group(1).strip()
+        # A leak report's SUMMARY line names a byte count, which is
+        # different for every run of the same leak, so every occurrence
+        # became a new "bug". Group by the php-src frame that allocated
+        # instead, under the ASAN:memory-leak prefix core/orchestrator.py
+        # files into output/bugs/php/leaks/.
+        if "LeakSanitizer" in combined or "leaked in" in combined:
+            site = self._first_php_frame(combined)
+            return f"ASAN:memory-leak_in_{site or 'unknown'}"
         for text in (stderr, stdout):
             m = re.search(r"(SUMMARY: .*)", text)
             if m:
-                return m.group(1).strip()
+                sig = m.group(1).strip()
+                # "SUMMARY: AddressSanitizer: ABRT on unknown address ..."
+                # (handle_abort=1) says nothing about *where*; the first
+                # php-src frame does.
+                k = re.match(r"SUMMARY: (\w+Sanitizer): (ABRT|SEGV|FPE|ILL|BUS)\b", sig)
+                if k:
+                    site = self._first_php_frame(combined)
+                    if site:
+                        # Drop the libc location (pthread_kill.c, the
+                        # kill() zend_mm raises on heap corruption): the
+                        # php-src frame is the bug's identity.
+                        return f"SUMMARY: {k.group(1)}: {k.group(2)} in {site}"
+                return sig
         return super().extract_crash_signature(stdout, stderr, return_code)

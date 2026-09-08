@@ -223,4 +223,8 @@ class TintDriver(BaseDriver):
             signature=verdict["signature"],
         )
         result.command = cmd
+        # The bundle writer substitutes this exact path with "$SCRIPT_DIR/
+        # test.wgsl"; without it, it replaced the seed *id* inside the path
+        # and test.sh pointed at "<workdir>/$SCRIPT_DIR/test.wgsl.wgsl".
+        result.seed_file = shader if 'shader' in locals() else None
         return result

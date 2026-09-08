@@ -1,8 +1,8 @@
 {
-  "binary": "/home/fuzz/WorkSpace/fusion-fuzz/projects/flang/llvm-flang-build/bin/flang",
-  "sanitizers": "Address;Undefined",
+  "binary": "/work/fusion-fuzz/projects/flang/llvm-flang-build/bin/flang",
+  "sanitizers": "",
   "assertions": true,
   "expensive_checks": false,
-  "commit": "957aee8a62e3b9b06d413322fa8fbbe36a3965e9",
-  "source": "/home/fuzz/WorkSpace/fusion-fuzz/projects/flang/llvm-project"
+  "commit": "73344b523c93f25c9dafcabf803295e92bf5cb5f",
+  "source": "/work/fusion-fuzz/projects/flang/llvm-project"
 }

@@ -17,6 +17,22 @@ analysis:
 paths:
   seed_source: "./projects/php/phpt_seeds/" # Where parser looks for initial seeds
   corpus: "./projects/php/corpus.db"
+  seed_exclude_patterns:
+    # ext/zend_test helpers that break an engine invariant *on purpose*
+    # so a test can check the diagnostic. Fusion then separates the
+    # break from its repair: a dataflow rename of `$str` left
+    # zend_create_unterminated_string()'s result without its
+    # zend_terminate_string(), and the resulting "String is not
+    # null-terminated" assertion was the first false finding of the
+    # first verification run.
+    - pattern: '\bzend_(?:create_unterminated_string|test_crash|leak_bytes|test_array_return|test_zend_ini_parse_quantity_warning|leak_variable)\s*\('
+      reason: "zend_test helper that violates an engine invariant by design"
+    # ext/zend_test's ZendTestFiber is a test double whose C code asserts
+    # on its own usage (start() twice -> "context.status ==
+    # ZEND_FIBER_STATUS_INIT"). Any fusion that reuses the object trips
+    # it, and an assertion inside the test extension is not an engine bug.
+    - pattern: '(?<![A-Za-z])_?ZendTestFiber\b'   # the class is spelled _ZendTestFiber in current php-src; \b missed the underscore
+      reason: "ext/zend_test test double; its assertions guard its own usage, not the engine"
 
 llm:
   provider: "openai" # Options: gemini, openai, vllm, ollama

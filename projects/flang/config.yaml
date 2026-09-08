@@ -13,6 +13,14 @@ execution:
   concurrency: 16
 
 analysis:
+  # flang's own test tree is the seed source, and a good part of it is
+  # negative tests (`!ERROR:` / `! expected-error` annotations) plus
+  # files that need a sibling module or a target the build lacks. The
+  # annotated files are deliberate and kept (error-recovery paths, as the
+  # Go/Rust/GCC adapters keep theirs); the rest fails standalone for
+  # environmental reasons and is dropped after --pre-analysis records rc.
+  drop_seeds_failing_alone: true
+  drop_seeds_failing_alone_except: '(?m)^\s*!\s*(?:ERROR|WARNING|expected-error|expected-warning)\b'
   crash_patterns:
     # Both the SUMMARY and the ERROR line: a sanitizer report normally ends
     # with SUMMARY, but ASan's allocator hard-errors (an absurd allocation

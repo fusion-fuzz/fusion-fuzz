@@ -1,3 +1,4 @@
+import re
 """
 projects/gcc/driver.py — run a fused program through GCC and report whether
 what came back is a bug.
@@ -38,13 +39,32 @@ except ImportError:  # pragma: no cover - direct-load fallback
     analyze_seed, classify = _analyzer.analyze_seed, _analyzer.classify
 
 
+
+# A diagnostic echoes the offending source line with a line-number gutter
+# (`53 |   return a; /* { dg-output "...runtime error: ..." } */`); a seed
+# whose comments quote a sanitizer message then matched the crash patterns
+# (two "UBSan" bundles that were echoes). Echo lines are dropped before
+# the analyzer sees the output.
+_GUTTER_ECHO_RE = re.compile(r'^\s*\d+\s*\|.*$', re.M)
+
+
+def _strip_echo(text):
+    return _GUTTER_ECHO_RE.sub('', text or "")
+
+
 class GCCDriver(BaseDriver):
     """Drives the gcc/g++ built by projects/gcc/setup.py."""
 
     STD_C = ["c89", "c99", "c11", "c17", "c23",
              "gnu89", "gnu99", "gnu11", "gnu17", "gnu23"]
-    STD_CXX = ["c++98", "c++11", "c++14", "c++17", "c++20", "c++23",
-               "gnu++11", "gnu++17", "gnu++20"]
+    STD_CXX = ["c++98", "c++11", "c++14", "c++17", "c++20", "c++23", "c++26",
+               "gnu++11", "gnu++17", "gnu++20", "gnu++26"]
+    # `// { dg-do compile { target c++26 } }` names the oldest standard the
+    # test is valid under; a random older -std rejects it before the front
+    # end runs ("'-freflection' only supported with '-std=c++26'" was 5 of
+    # 300 gcc state children on the dev sample).
+    _CXX_RANK = {"98": 0, "03": 0, "11": 1, "14": 2, "17": 3, "20": 4, "23": 5, "26": 6}
+    _TARGET_CXX_RE = re.compile(r'target\s+c\+\+(\d\d)')
     OPT_LEVELS = ["-O0", "-O1", "-O2", "-O3", "-Os", "-Og", "-Ofast"]
 
     # How far to push each invocation. -fsyntax-only is cheap and hammers
@@ -109,6 +129,19 @@ class GCCDriver(BaseDriver):
         flags = [random.choices(self.MODES, weights=self.MODE_WEIGHTS, k=1)[0],
                  random.choice(self.OPT_LEVELS)]
         if random.random() > 0.3:
+            # C89 rejects `//` comments and mixed declarations outright:
+            # a seed written with them cannot be valid under -std=c89/gnu89
+            # (tools/flagnoise.py: 1 in 3 of gcc's flag-induced rejects).
+            if not facts["is_cxx"] and ("//" in content or re.search(r'\bfor\s*\(\s*(?:int|unsigned|long|size_t)\b', content)):
+                stds = [x for x in stds if not x.endswith("89")]
+            if facts["is_cxx"]:
+                need = [self._CXX_RANK.get(v, 0) for v in self._TARGET_CXX_RE.findall(content)]
+                if "-freflection" in " ".join(facts["dg_options"]):
+                    need.append(self._CXX_RANK["26"])
+                if need:
+                    lo = max(need)
+                    newer = [x for x in stds if self._CXX_RANK.get(x[-2:], 0) >= lo]
+                    stds = newer or stds
             flags.append(f"-std={random.choice(stds)}")
         flags.extend(random.sample(self.MISC_FLAGS, random.randint(0, 3)))
         # The seed's own dg-options last, so they win any conflict: they are
@@ -151,7 +184,7 @@ class GCCDriver(BaseDriver):
         finally:
             shutil.rmtree(workdir, ignore_errors=True)
 
-        verdict = classify((stderr or "") + "\n" + (stdout or ""))
+        verdict = classify(_strip_echo((stderr or "") + "\n" + (stdout or "")))
         res = ExecutionResult(rc, stdout, stderr, time.time() - start,
                               verdict["is_bug"], verdict["signature"])
         res.command = cmd
@@ -170,8 +203,8 @@ class GCCDriver(BaseDriver):
     # analyzer, which is the point of keeping the logic there.
 
     def _check_crash(self, stdout, stderr, return_code):
-        return classify((stderr or "") + "\n" + (stdout or ""))["is_bug"]
+        return classify(_strip_echo((stderr or "") + "\n" + (stdout or "")))["is_bug"]
 
     def extract_crash_signature(self, stdout, stderr, return_code):
-        sig = classify((stderr or "") + "\n" + (stdout or ""))["signature"]
+        sig = classify(_strip_echo((stderr or "") + "\n" + (stdout or "")))["signature"]
         return sig or super().extract_crash_signature(stdout, stderr, return_code)

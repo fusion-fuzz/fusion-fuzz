@@ -28,6 +28,7 @@ target costs a environment variable and buys the whole backend surface.
 
 import os
 import random
+import re
 import shutil
 import subprocess
 import threading
@@ -152,6 +153,7 @@ class GoDriver(BaseDriver):
         # progress, and the trim needs one that non-participating threads can
         # decline rather than queue on.
         self._goexperiments = self._probe_goexperiments()
+        self._go_lang = self._probe_go_lang()
         self._cache_counter_lock = threading.Lock()
         self._cache_trim_lock = threading.Lock()
         self._execs_since_cache_check = 0
@@ -176,6 +178,27 @@ class GoDriver(BaseDriver):
             except (OSError, subprocess.SubprocessError):
                 break
         return ok
+
+    def _probe_go_lang(self):
+        """The `go X.Y` line for the per-execution go.mod.
+
+        It was a fixed `go 1.21`, and the go directive is the *language
+        version*: every feature newer than it is rejected by the frontend
+        ("cannot range over 10 ... requires go1.22 or later (-lang was set
+        to go1.21; check go.mod)"), so the trunk compiler under test was
+        being held to a three-year-old dialect on every seed that used
+        anything newer. Ask the toolchain what it is.
+        """
+        try:
+            r = subprocess.run([self.go_bin, "env", "GOVERSION"], capture_output=True,
+                               text=True, timeout=30,
+                               env=dict(os.environ, GOROOT=self.goroot))
+            m = re.match(r"go(\d+\.\d+)", (r.stdout or "").strip())
+            if m:
+                return m.group(1)
+        except (OSError, subprocess.SubprocessError):
+            pass
+        return "1.21"
 
     def _goexperiment(self):
         """The GOEXPERIMENT for one execution, or "" for the default build."""
@@ -206,7 +229,17 @@ class GoDriver(BaseDriver):
         if facts["has_cgo"]:
             goos, goarch = "linux", "amd64"
 
-        gcflags = self._gcflags()
+        # --dry-run/--pre-analysis (core/dryrun.py sets dryrun_mode) asks
+        # "does the toolchain accept this seed on its own", which has one
+        # answer: host target, default flags. Drawing a random cross
+        # target there instead made the pass build that target's standard
+        # library from cold, inside the per-seed timeout, and record the
+        # kill as the seed's own verdict.
+        dryrun = getattr(self, "dryrun_mode", False)
+        if dryrun:
+            goos, goarch = "linux", "amd64"
+
+        gcflags = "-d=panic" if dryrun else self._gcflags()
         # `go build -o /dev/null` is only legal for a main package; for a
         # library package `go build` compiles and discards on its own.
         out = "-o /dev/null " if facts["is_main"] else ""
@@ -232,7 +265,7 @@ class GoDriver(BaseDriver):
             f"GOPROXY=off GOFLAGS=-mod=mod "
             # See GOEXPERIMENT_CANDIDATES. Empty means the default build,
             # and `GOEXPERIMENT=` is how you spell that.
-            f"GOEXPERIMENT={self._goexperiment()} "
+            f"GOEXPERIMENT={'' if dryrun else self._goexperiment()} "
             # CGO off unless the seed asks for it: it needs a target C
             # toolchain that does not exist for the cross targets.
             f"CGO_ENABLED={'1' if facts['has_cgo'] else '0'} "
@@ -265,7 +298,7 @@ class GoDriver(BaseDriver):
             # looks — GOPROXY=off means nothing is fetched, and the build
             # cache is shared.
             with open(os.path.join(workdir, "go.mod"), "w") as f:
-                f.write("module fflfuzz\n\ngo 1.21\n")
+                f.write(f"module fflfuzz\n\ngo {self._go_lang}\n")
             seed_file = os.path.join(workdir, "main.go")
             with open(seed_file, "w", encoding="utf-8") as f:
                 f.write(seed.content)

@@ -8,6 +8,12 @@ execution:
   concurrency: 16
 
 analysis:
+  # The seeds are flang's test suite, and LFortran rejects 55% of them on
+  # its own (features it does not implement yet, plus flang's negative
+  # tests) — 38% of the injected Fortran bug corpus likewise. Such a
+  # seed yields children rejected at the same line; dropped after
+  # --pre-analysis records rc.
+  drop_seeds_failing_alone: true
   crash_patterns:
     - "SUMMARY: AddressSanitizer"
     - "SUMMARY: UndefinedBehaviorSanitizer"
@@ -17,6 +23,12 @@ analysis:
     - "AssertFailed"
     - "LCOMPILERS_ASSERT failed"
     - "runtime_error:"
+    # UBSan's report line (the build is sanitized). "parser.yy: runtime
+    # error: member access within null pointer" was 24-28% of every
+    # strategy's children on the flang-test corpus and matched nothing
+    # here — an LFortran bug reached on a quarter of all executions and
+    # never filed. One signature, deduplicated once.
+    - "runtime error:"
     - "std::exception:"
     - "Unknown Exception"
     - "terminate called after throwing"

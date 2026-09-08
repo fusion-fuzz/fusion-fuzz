@@ -6,6 +6,10 @@ execution:
   concurrency: 16
 
 analysis:
+  # 44% of the injected (LLM-translated) WGSL bug corpus does not
+  # validate on its own; such a seed yields children rejected at the
+  # same line. Dropped after --pre-analysis records rc.
+  drop_seeds_failing_alone: true
   crash_patterns:
     - "panicked at"
     - "thread 'main' panicked"

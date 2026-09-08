@@ -17,6 +17,10 @@ execution:
   mem_limit_mb: 4096
 
 analysis:
+  # Same reasoning as naga: the LLM-translated WGSL bug corpus and a few
+  # harvested seeds do not validate on their own and only yield children
+  # rejected at the same line. Dropped after --pre-analysis records rc.
+  drop_seeds_failing_alone: true
   # The coarse net. projects/tint/analyzer.py makes the actual decision and
   # subtracts the shapes that match here but say nothing about tint — above
   # all resource exhaustion.

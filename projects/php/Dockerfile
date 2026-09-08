@@ -63,6 +63,9 @@ RUN useradd -m fuzz && \
 
 RUN pecl install ast
 
+# FusionFuzz itself: main.py imports yaml/requests at startup.
+RUN pip3 install --no-cache-dir pyyaml requests
+
 RUN echo "extension=ast.so" >> /etc/php/8.1/cli/php.ini
 
 WORKDIR /home/fuzz/WorkSpace

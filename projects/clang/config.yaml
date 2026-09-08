@@ -8,6 +8,11 @@ execution:
   concurrency: 16
 
 analysis:
+  # Seeds clang rejects on their own (pre-analysis) are dropped, except
+  # `-verify` tests: their expected-error/warning lines mean the rejection
+  # is the test, and Sema's error-recovery paths are worth fuzzing.
+  drop_seeds_failing_alone: true
+  drop_seeds_failing_alone_except: 'expected-(?:error|warning)'
   crash_patterns:
     - "SUMMARY: AddressSanitizer"
     - "SUMMARY: UndefinedBehaviorSanitizer"
@@ -23,6 +28,25 @@ analysis:
     - "fatal error: "
 
 paths:
+  seed_exclude_patterns:
+    # `#include "x.inc"` / split-file tests: the sibling file is not in the
+    # corpus, so every child is "fatal error: file not found" (11-19% of
+    # all invalid children before this).
+    - pattern: '(?m)^\s*#\s*include\s+"'
+      reason: "includes a sibling file that is not in the corpus"
+    - pattern: '(?m)^//\s*RUN:.*split-file'
+      reason: "multi-file split-file test"
+    # `%S` is the test's source directory: `-I %S/Inputs`, `-isystem %S`
+    # mean the seed includes headers that live next to it, not here.
+    - pattern: '(?m)^//\s*RUN:.*(?:-I|-isystem|-include|-imacros)\s*%S\b'
+      reason: "includes headers from the test's own directory"
+    # Target-specific intrinsic headers and RUN lines that pair a non-x86
+    # triple with -target-feature: the types they use do not exist for the
+    # host target this driver compiles for.
+    - pattern: '#\s*include\s+<(?:arm_[a-z0-9_]+|riscv_[a-z0-9_]+|lasxintrin|lsxintrin|larchintrin|altivec|s390intrin|vecintrin|msa|htmintrin|htmxlintrin|__clang_hip[a-z_]*|__clang_cuda[a-z_]*|hlsl[a-z_/]*)\.h>'
+      reason: "target-specific intrinsic header; host target has no such types"
+    - pattern: '(?m)^//\s*RUN:(?=.*-triple\s+(?!x86_64|i[3-6]86|%))(?=.*-target-feature)'
+      reason: "needs a non-host target with target features"
   seed_source: "projects/clang/llvm-project/clang/test"
   seed_corpus: "projects/clang/corpus.db"
 

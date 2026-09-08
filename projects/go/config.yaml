@@ -25,6 +25,22 @@ execution:
   cache_check_every: 500
 
 analysis:
+  # `go build` exits 1 for every rejected program, and its diagnostics
+  # ("undefined: x", "cannot use ... as int value") carry no "error:"
+  # token for the generic validity check to key on — only "syntax
+  # error:" does. Without this, a child with three type errors was
+  # booked as *valid*: measured on the test corpus, state fusion showed
+  # 96.7% valid while 35% of its parents fail to compile on their own.
+  # Exit code 1 is the compiler's own verdict, so it is the metric's.
+  error_return_codes: [1]
+  # A seed the toolchain rejects on its own (an API removed since the
+  # test was written — `os.EOF` — or a directive the build refuses)
+  # produces children rejected at the same line. Drop those after
+  # --pre-analysis, *except* `// errorcheck` files, which are ill-formed
+  # by design and kept for the error-recovery paths (see the note under
+  # seed_exclude_patterns).
+  drop_seeds_failing_alone: true
+  drop_seeds_failing_alone_except: '(?m)^//\s*errorcheck'
   # These are the coarse net; projects/go/analyzer.py makes the actual
   # decision and *subtracts* the resource-exhaustion shapes that match
   # here but say nothing about Go (out of memory, signal: killed).
@@ -73,6 +89,26 @@ paths:
     # files are not in the corpus, so these can never resolve.
     - pattern: '(?m)^//\s*(?:rundir|compiledir|errorcheckdir|runindir)\b'
       reason: "directory-based test; its companion files are not in the corpus"
+    # Relative and non-standard-library imports. `import "./a"` is how
+    # Go's directory-based tests reach a sibling file; in module mode it
+    # is rejected before the compiler runs ("relative import paths are
+    # not supported in module mode"). A path whose first element has a
+    # dot (`github.com/...`, `issue46653.dir/...`) is never the standard
+    # library, and GOPROXY=off means it can never be fetched. Together
+    # these were 15% (dataflow) to 30% (state) of the invalid children,
+    # and none of them ever reached the compiler proper.
+    - pattern: '(?m)^\s*(?:import\s+)?(?:[\w.]+\s+)?"\.\.?/'
+      reason: "relative import; rejected in module mode before compiling"
+    - pattern: '(?m)^\s*(?:import\s+)?(?:[\w.]+\s+)?"[^"/]*\.[^"/]*/'
+      reason: "imports a non-stdlib module; GOPROXY=off can never resolve it"
+    # Only the standard library can use this directive; the seed fails
+    # identically on every run.
+    - pattern: '(?m)^//go:uintptrkeepalive\b'
+      reason: "//go:uintptrkeepalive is only allowed in the standard library"
+    # An import whose first path element is not a standard-library
+    # package (`test/x`, `issue1234/a`): never resolvable with GOPROXY=off.
+    - pattern: '(?m)^\s*(?:import\s+)?(?:[\w.]+\s+)?"(?!(?:archive|bufio|builtin|bytes|cmp|compress|container|context|crypto|database|debug|embed|encoding|errors|expvar|flag|fmt|go|hash|html|image|index|io|iter|log|maps|math|mime|net|os|path|plugin|reflect|regexp|runtime|slices|sort|strconv|strings|structs|sync|syscall|testing|text|time|unicode|unique|unsafe|weak|vendor|internal)(?:/|"))[^"./][^"]*"'
+      reason: "imports a package outside the standard library; unresolvable with GOPROXY=off"
     # NOTE: `// errorcheck` files are deliberately NOT excluded. They are
     # ill-formed on purpose, the way clang's -verify tests are, and the
     # clang adapter does exclude those — but Go's compiler swallows an ICE

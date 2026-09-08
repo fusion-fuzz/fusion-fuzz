@@ -25,6 +25,11 @@ analysis:
   # bug on its own. Nothing is ever executed, so this is the only non-zero
   # outcome that isn't potentially a compiler crash.
   error_return_codes: [1]
+  # The injected bug corpus is LLM-translated: 24% of it does not compile
+  # on its own (packages not installed — Text.Regex.TDFA, Network.Socket
+  # — or plain mistranslation), and such a seed produces children rejected
+  # at the same line. Dropped after --pre-analysis records rc.
+  drop_seeds_failing_alone: true
   syntax_patterns:
     - "parse error"
     - "error:"

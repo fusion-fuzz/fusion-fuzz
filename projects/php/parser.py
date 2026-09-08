@@ -208,6 +208,28 @@ def extract_sec(test, section):
 
 
 # ==========================================
+# Seed origins (which php-src test directory a seed came from)
+# ==========================================
+
+_ORIGINS_FILE = ".origins.json"
+
+
+def load_origins(seeds_root=None):
+    """flat seed filename -> php-src test directory (relative), as written
+    by projects/php/setup.py's collect_phpt. Empty when the seeds were
+    collected by an older setup, in which case seeds carry no source_dir
+    and the driver runs them without fixtures, as before."""
+    if seeds_root is None:
+        seeds_root = os.path.join(os.path.dirname(os.path.abspath(__file__)), "phpt_seeds")
+    path = os.path.join(seeds_root, _ORIGINS_FILE)
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return {}
+
+
+# ==========================================
 # Framework Integration Point
 # ==========================================
 
@@ -235,7 +257,8 @@ def collect_seeds(source_path, blacklist=None):
         return None
 
     print(f"Parsing {len(seed_paths)} PHPT files from {source_path}...")
-    
+    origins = load_origins(source_path)
+
     for file_path in seed_paths:
         # Use relative path for identifier to maintain structure info and uniqueness
         seed_identifier = os.path.relpath(file_path, source_path)
@@ -285,7 +308,11 @@ def collect_seeds(source_path, blacklist=None):
                     "variables": list(variables),  # Ensure JSON serializable
                     "dataflows": dataflows,        # Ensure JSON serializable
                     "secondary": secondary,
-                    "clean_code": clean_code
+                    "clean_code": clean_code,
+                    # php-src test directory this seed came from; the
+                    # driver links that directory's fixtures beside the
+                    # program so `__DIR__ . '/x.inc'` resolves.
+                    "source_dir": origins.get(os.path.basename(file_path)),
                 }
             }
             
@@ -338,6 +365,20 @@ def collect_seeds(source_path, blacklist=None):
         conn.commit()
         conn.close()
         print(f"Saved {count} seeds to {db_path}")
+
+        # Seeds php's own compiler rejects can never fuse into a valid
+        # child (see prune_corpus.py). Needs the built binary, so this is
+        # a no-op on a checkout without one.
+        try:
+            import importlib.util as _ilu
+            _spec = _ilu.spec_from_file_location(
+                "ffl_php_prune", os.path.join(current_dir, "prune_corpus.py"))
+            _prune = _ilu.module_from_spec(_spec)
+            _spec.loader.exec_module(_prune)
+            _prune.prune_lint_failures(db_path)
+            _prune.prune_runtime_fatal(db_path)
+        except Exception as e:
+            print(f"Lint prune skipped: {e}")
         return db_path # Return the path, not the list
         
     except Exception as e:
@@ -358,11 +399,20 @@ def load_corpus(db_path):
     rows = cursor.fetchall()
     conn.close()
 
+    # Backfill source_dir for a corpus.db written before origins were
+    # recorded, so the fixture layout works without re-parsing (and
+    # without discarding --pre-analysis metadata).
+    origins = load_origins()
     seeds = []
     for r in rows:
+        meta = json.loads(r[2])
+        if origins and not meta.get("source_dir"):
+            src = origins.get(os.path.basename(r[0]))
+            if src:
+                meta["source_dir"] = src
         seeds.append({
             "filename": r[0], # Map identifier back to filename for compatibility
             "content": r[1],
-            "metadata": json.loads(r[2])
+            "metadata": meta
         })
     return seeds
