@@ -122,6 +122,12 @@ class BaseDriver:
         # if return_code not in [0, 1, 124]: 
         #     return True
             
+        # A sanitizer that could not reserve its own memory (mmap ENOMEM
+        # under host pressure) reports nothing about the compiler; two
+        # such php bundles were dismissed by hand before this rule.
+        if re.search(r"Sanitizer failed to allocate .*errno: 12", stderr or "") or \
+           re.search(r"Sanitizer failed to allocate .*errno: 12", stdout or ""):
+            return False
         for pattern in self.config.get('analysis', {}).get('crash_patterns', []):
             if pattern in stdout or pattern in stderr:
                 return True

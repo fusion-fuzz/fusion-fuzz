@@ -62,7 +62,15 @@ LANGUAGE_ALIASES: Dict[str, str] = {
     "triton": "mlir",
     "naga": "naga", "wgsl": "naga",
     "tint": "naga",
+    "ruby": "ruby", "rb": "ruby",
+    "r": "r", "rscript": "r",
+    "julia": "julia", "jl": "julia",
     "javascript": "javascript", "js": "javascript",
+    # TypeScript is JavaScript plus type annotations: the comment and
+    # string tokens are identical, and a type annotation never changes
+    # brace/paren nesting, so the JavaScript lexicon, live-variable
+    # config and segment rules apply unchanged.
+    "typescript": "javascript", "ts": "javascript", "tsx": "javascript",
     "mjs": "javascript", "v8": "javascript",
     "spidermonkey": "javascript", "sm": "javascript",
 }
@@ -110,6 +118,43 @@ LIVE_VAR_CONFIGS: Dict[str, LiveVarConfig] = {
                  r'\bwith\b.*\bas\s+([A-Za-z_]\w*)\s*:'],
         decrement=[r'\bdel\s+([A-Za-z_]\w*)'],
         reset=[r'^(?:def|class)\s+\w+'],
+    ),
+    # Ruby scopes locals to def/class/module bodies (and shares them into
+    # blocks), never to if/while/case — flat, reset at each new unit.
+    # Block parameters and `rescue => e` bind names too. No decrement:
+    # nothing in Ruby ends a local's scope early.
+    # Julia scopes a `for`/`while`/`let`/`function` body, so an
+    # assignment inside one is local — but the live-variable count is a
+    # measure of how much state is in flight at a point, and the flat
+    # model (reset at each new top-level unit) tracks that well enough
+    # without a scope stack. `const`/`global` are counted like any other
+    # assignment.
+    "julia": LiveVarConfig(
+        mode="flat",
+        declare=[r'^\s*(?:const\s+|global\s+|local\s+)?([A-Za-z_][\w!]*)\s*(?:::[^=\n]+)?=(?![=>])',
+                 r'\bfor\s+([A-Za-z_][\w!]*)\s*(?:=|in\b)',
+                 r'^\s*(?:mutable\s+)?struct\s+([A-Za-z_]\w*)',
+                 r'^\s*function\s+([A-Za-z_][\w!]*)'],
+        reset=[r'^\s*(?:function|module|macro)\s+\w'],
+    ),
+    # R has no block scope: an assignment inside an `if`/`for`/`while`
+    # body at top level creates a global, and only a `function(...)`
+    # body is a new scope. Flat, reset at each function definition.
+    "r": LiveVarConfig(
+        mode="flat",
+        declare=[r'^\s*([A-Za-z._][\w._]*)\s*(?:<<?-|=(?!=))',
+                 r'->>?\s*([A-Za-z._][\w._]*)',
+                 r'\bfor\s*\(\s*([A-Za-z._][\w._]*)\s+in\b'],
+        decrement=[r'\brm\s*\(\s*([A-Za-z._][\w._]*)'],
+        reset=[r'^\s*[A-Za-z._][\w._]*\s*(?:<<?-|=)\s*function\s*\('],
+    ),
+    "ruby": LiveVarConfig(
+        mode="flat",
+        declare=[r'^\s*((?:@@|@|\$)?[a-z_]\w*)\s*(?:\|\||&&|\*\*|<<|>>|[-+*/%|&^])?=(?![=~>])',
+                 r'\bfor\s+([a-z_]\w*)\s+in\b',
+                 r'(?:\bdo|\{)\s*\|\s*\*?([a-z_]\w*)',
+                 r'\brescue\b[^\n]*=>\s*([a-z_]\w*)'],
+        reset=[r'^\s*(?:def|class|module)\s+\w'],
     ),
     "php": LiveVarConfig(
         mode="flat",
@@ -218,6 +263,15 @@ _LEXICON = {
     "javascript": {"line": ["//"], "block": [("/*", "*/")],
                    "quotes": ['"', "'", "`"]},
     "clang":   {"line": ["//"], "block": [("/*", "*/")], "quotes": ['"', "'"]},
+    # `=begin`/`=end` comment blocks; heredocs and %q literals are not
+    # modelled here (the ruby segment-boundary scan tracks heredocs itself).
+    "ruby":    {"line": ["#"], "block": [("\n=begin", "\n=end")], "quotes": ['"', "'", "`"]},
+    # R: no block comments; backticks quote a non-syntactic name.
+    "r":       {"line": ["#"], "block": [], "quotes": ['"', "'", "`"]},
+    # Julia: `#= ... =#` nests (not modelled; the outermost pair wins),
+    # `"""` is a docstring, a backtick is a command literal.
+    "julia":   {"line": ["#"], "block": [("#=", "=#")],
+                "quotes": ['"""', '"', "'", "`"]},
     "swift":   {"line": ["//"], "block": [("/*", "*/")], "quotes": ['"']},
     "haskell": {"line": ["--"], "block": [("{-", "-}")], "quotes": ['"']},
     # Fortran uses doubled-quote escaping ('' / "") rather than backslash
@@ -742,6 +796,108 @@ def _c_line_may_end_segment(line: str) -> bool:
     return code[-1] in ';{}:)'
 
 
+_R_TRAILING_CONT_RE = re.compile(
+    r'(?:[-+*/^<>=!&|~?,([{]|%[\w.]*%|<-|<<-|->|\bin\b|\belse\b)\s*$')
+_R_CONTINUATION_RE = re.compile(
+    r'^\s*(?:else\b|\)|\]|\}|,|\+|\||&|%[\w.]*%|\.\.\.)')
+
+
+# Ruby: blocks are `end`-delimited, so bracket depth alone says nothing
+# about whether a line closes every `def`/`if`/`do` it opened. The scan
+# below keeps a keyword depth per line: openers at statement start (or
+# after `=`, `(`, `,`, `[`, `|`, `then`) and `do` at the end of a line,
+# `end` tokens closing them. Modifier forms (`x if y`) do not match the
+# opener position; `while ... do` counts once; an endless `def f = 1`
+# opens nothing. Heredoc bodies are skipped by their terminator.
+# Julia: `end`-delimited like Ruby, with its own opener set. A cut is
+# legal only where every block is closed; the modifier forms (`x = y for
+# i in z`, `a[end]`) must not count as openers or closers.
+_JULIA_OPENER_RE = re.compile(
+    r'(?:^|[=({,]|\bdo\b)\s*'
+    r'(?:function|begin|if|for|while|let|try|quote|macro|module|'
+    r'mutable\s+struct|struct)\b')
+_JULIA_END_RE = re.compile(r'(?<![\w.\[])end\b(?!\s*[\]\)])')
+_JULIA_TRAILING_BEGIN_RE = re.compile(r'(?<![\w.])begin\s*$')
+_JULIA_ONELINE_RE = re.compile(r'^\s*(?:abstract|primitive)\s+type\b[^\n]*\bend\b')
+_JULIA_TRAILING_CONT_RE = re.compile(
+    r'(?:[-+*/^<>=!&|~?,([{]|\.\.|::|<:|\bwhere\b|\bdo\b)\s*$')
+_JULIA_CONTINUATION_RE = re.compile(
+    r'^\s*(?:else\b|elseif\b|catch\b|finally\b|end\b|\)|\]|\}|,|\.|\|>)')
+
+
+def _julia_line_state(lines, mask, offsets):
+    """(depth_after_line, unsafe) per line for Julia's `end` blocks."""
+    depths, unsafe = [], []
+    depth = 0
+    for i, line in enumerate(lines):
+        off = offsets[i]
+        code = "".join(c if (off + k < len(mask) and mask[off + k]) else " "
+                       for k, c in enumerate(line))
+        if not _JULIA_ONELINE_RE.match(code):
+            depth += len(_JULIA_OPENER_RE.findall(code))
+            # A trailing `begin` always opens a block, whatever precedes
+            # it — `@testset "name" begin` is the corpus's commonest
+            # opener and the pattern above cannot see it, because what
+            # comes before is a macro call and a string.
+            if _JULIA_TRAILING_BEGIN_RE.search(code):
+                depth += 1
+            depth -= len(_JULIA_END_RE.findall(code))
+        depth = max(depth, 0)
+        depths.append(depth)
+        unsafe.append(False)
+    return depths, unsafe
+
+
+_RUBY_OPENER_RE = re.compile(
+    r'(?:^|[=(,\[|]|\bthen\b|\band\b|\bor\b|\bnot\b)\s*'
+    r'(?:if|unless|while|until|case|begin|for|def|class|module)\b')
+_RUBY_DO_RE = re.compile(r'\bdo\b\s*(?:\|[^|]*\|)?\s*$')
+_RUBY_LOOP_DO_RE = re.compile(r'\b(?:while|until|for)\b')
+_RUBY_END_RE = re.compile(r'(?<![\w.:@$])end\b(?!\s*:(?!:))(?![?!])')
+_RUBY_ENDLESS_DEF_RE = re.compile(r'^\s*def\s+[\w.?!]+(?:\s*\([^)]*\))?\s*=(?!=)')
+_RUBY_HEREDOC_RE = re.compile(r'<<[~-]?(?:([\'"`])([^\'"`\n]+)\1|([A-Za-z_]\w*))')
+_RUBY_TRAILING_CONT_RE = re.compile(r'(?:[-+*/%<>=!&|^,.\\(\[{]|\b(?:and|or|not|then|do|else))\s*$')
+_RUBY_CONTINUATION_RE = re.compile(
+    r'^\s*(?:\.|&\.|&&|\|\||\)|\]|\}|(?:elsif|else|when|in|rescue|ensure|end|then|and|or)\b)')
+
+
+def _ruby_line_state(lines, mask, offsets):
+    """(depth_after_line, unsafe) per line: keyword block depth after the
+    line, and whether the line sits inside a heredoc body."""
+    depths, unsafe = [], []
+    depth = 0
+    heredoc_end = None
+    for i, line in enumerate(lines):
+        off = offsets[i]
+        code = "".join(c if (off + k < len(mask) and mask[off + k]) else " "
+                       for k, c in enumerate(line))
+        if heredoc_end is not None:
+            unsafe.append(True)
+            depths.append(depth)
+            if line.strip() == heredoc_end:
+                heredoc_end = None
+            continue
+        if not _RUBY_ENDLESS_DEF_RE.match(code):
+            depth += len(_RUBY_OPENER_RE.findall(code))
+        if _RUBY_DO_RE.search(code) and not _RUBY_LOOP_DO_RE.search(code):
+            depth += 1
+        depth -= len(_RUBY_END_RE.findall(code))
+        depth = max(depth, 0)
+        # The terminator is looked for in the raw line: a quoted one
+        # (`<<-"begin;"`) sits inside the string mask.
+        m = _RUBY_HEREDOC_RE.search(line)
+        if m:
+            heredoc_end = m.group(2) or m.group(3)
+        depths.append(depth)
+        unsafe.append(False)
+    return depths, unsafe
+
+
+_MLIR_CONTINUATION_RE = re.compile(
+    r'\s*(?::|->|\)|\]|\{|\}|to\b|into\b|iter_args\b|outs\b|ins\b|blocks\b|threads\b'
+    r'|dynamic_shared_memory_size\b|attributes\b|[A-Za-z_]\w*\s*=\s*[\[#"{@%]'
+    r'|"[^"]*"\s*[,\]]|%[A-Za-z0-9_$.]+\s*(?:,|$|:\s*[^\s=]))')
+
 _DIRECTIVE_LINE_RE = re.compile(r'(?://go:\w|#\[|#!\[|#\s*pragma\b)|@\w')  # `@compute @workgroup_size(1)` (WGSL), `@main` (Swift), `@decorator` (Python): the line belongs to the declaration below
 
 
@@ -775,6 +931,8 @@ def _compute_segment_boundaries(content: str, language: str) -> List[int]:
     # line separates a header from its body ("parse error on input '='"
     # was 17% of Haskell's state-fusion failures).
     indentation_scoped = lang in ("cpython", "haskell")
+    rb_depths, rb_unsafe = _ruby_line_state(lines, mask, offsets) if lang == "ruby" else (None, None)
+    jl_depths, _jl_unsafe = _julia_line_state(lines, mask, offsets) if lang == "julia" else (None, None)
 
     def _next_nonblank(i):
         for j in range(i + 1, len(lines)):
@@ -839,12 +997,55 @@ def _compute_segment_boundaries(content: str, language: str) -> List[int]:
         # or is a bare macro invocation / label may end a segment.
         if lang == "clang" and not _c_line_may_end_segment(line):
             continue
+        # MLIR: a multi-line op continues on lines that start with `:`,
+        # `->`, `ins(`/`outs(`, `{`, an operand list (`%a, %b, %c`) or an
+        # attribute; cutting before one leaves half an op on each side
+        # ("expected integer number of results", "expected '{' to begin
+        # a region": 12 of 126 mlir state failures).
+        if lang == "mlir" and i + 1 < len(lines) and _MLIR_CONTINUATION_RE.match(lines[i + 1]):
+            continue
+        # R: a line that ends mid-expression continues on the next one,
+        # and R (unlike C) will not accept a top-level `else` that opens
+        # its own line — cutting before one turns a valid if/else into
+        # "unexpected 'else'". The generic continuation rule below
+        # catches `else`; this catches the operator case.
+        if lang == "r":
+            code_part = "".join(c if (offsets[i] + k < len(mask) and mask[offsets[i] + k]) else " "
+                                for k, c in enumerate(line))
+            if _R_TRAILING_CONT_RE.search(code_part):
+                continue
+            if nxt is not None and _R_CONTINUATION_RE.match(nxt):
+                continue
+        # Julia: every `end`-delimited block closed, the line does not
+        # end mid-expression, and the next line does not continue this
+        # one (`else`, `catch`, `end`, a chained `.` or `|>`).
+        if lang == "julia":
+            if jl_depths[i] != 0:
+                continue
+            code_part = "".join(c if (offsets[i] + k < len(mask) and mask[offsets[i] + k]) else " "
+                                for k, c in enumerate(line))
+            if _JULIA_TRAILING_CONT_RE.search(code_part):
+                continue
+            if nxt is not None and _JULIA_CONTINUATION_RE.match(nxt):
+                continue
+        # Ruby: every `end`-delimited block closed, no heredoc open, the
+        # line does not end mid-expression, and the next line does not
+        # continue this one (`.method`, `elsif`, `rescue`, `end`).
+        if lang == "ruby":
+            if rb_depths[i] != 0 or rb_unsafe[i]:
+                continue
+            code_part = "".join(c if (offsets[i] + k < len(mask) and mask[offsets[i] + k]) else " "
+                                for k, c in enumerate(line))
+            if _RUBY_TRAILING_CONT_RE.search(code_part):
+                continue
+            if nxt is not None and _RUBY_CONTINUATION_RE.match(nxt):
+                continue
         # A compiler directive or attribute belongs to the declaration
         # that follows it: Go's `//go:noinline`, Rust's `#[derive(..)]`,
         # C's `#pragma`. Cutting between them yields "misplaced compiler
         # directive" (25% of Go's state-fusion failures) or an attribute
         # on nothing.
-        if _DIRECTIVE_LINE_RE.match(line.lstrip()):
+        if lang not in ("ruby", "julia") and _DIRECTIVE_LINE_RE.match(line.lstrip()):
             continue
         # ...and not after the blank line(s) that may follow it either:
         # Go's `//go:noescape` must be *immediately* above its `func`.
@@ -852,7 +1053,7 @@ def _compute_segment_boundaries(content: str, language: str) -> List[int]:
             j = i - 1
             while j >= 0 and not lines[j].strip():
                 j -= 1
-            if j >= 0 and _DIRECTIVE_LINE_RE.match(lines[j].lstrip()):
+            if j >= 0 and lang not in ("ruby", "julia") and _DIRECTIVE_LINE_RE.match(lines[j].lstrip()):
                 continue
         out.append(i)
     return out

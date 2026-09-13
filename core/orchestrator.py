@@ -129,7 +129,10 @@ class FusionFuzzLoop:
 
         # Matches **Signature:** `…` in both the new README.md inline format
         # and the old report.md bullet-list format.
-        sig_pattern = re.compile(r"\*\*Signature:\*\*\s*`([^`]+)`")
+        # The key may itself contain backticks (swift: `differentiable_function`,
+        # C: "expected `{`"): read up to the closing "` &nbsp;" or line end,
+        # or a stored key loads truncated and its crash re-bundles forever.
+        sig_pattern = re.compile(r"\*\*Signature:\*\*\s*`(.+?)`(?=\s*&nbsp;|\s*$)", re.M)
         
         loaded_count = 0
         # Check all markdown files in the bugs directory (recursive to handle bundle folders)
@@ -418,6 +421,10 @@ class FusionFuzzLoop:
         elif "flang" in self.project_name or "fortran" in self.project_name:
             ext = meta.get("extension") or ".f90"
         elif "haskell" in self.project_name: ext = ".hs"
+        elif self.project_name == "ruby": ext = ".rb"
+        elif "typescript" in self.project_name: ext = ".ts"
+        elif self.project_name == "r": ext = ".R"
+        elif "julia" in self.project_name: ext = ".jl"
         # Exact match, not a substring test: the other branches above can
         # afford `in` because their names are distinctive, but "go" is two
         # letters and would match any project name containing them.
@@ -1062,6 +1069,7 @@ class FusionFuzzLoop:
             signature = self._extract_crash_signature(result)
 
             if signature:
+                signature = signature.replace('`', "'")   # backticks break the README key format
                 if signature not in self.unique_crashes:
                     self.unique_crashes.add(signature)
                     sys.stdout.write("\n")

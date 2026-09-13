@@ -32,7 +32,8 @@ class FusionStrategy(abc.ABC):
     LINE_COMMENT_TOKENS: Dict[str, str] = {
         "php": "//", "cpython": "#", "clang": "//", "flang": "!",
         "swift": "//", "mlir": "//", "rust": "//", "haskell": "--",
-        "naga": "//", "wgsl": "//",
+        "naga": "//", "wgsl": "//", "ruby": "#", "typescript": "//", "r": "#",
+        "julia": "#",
     }
 
     def _tag(self, kind: str) -> str:
@@ -48,6 +49,15 @@ class FusionStrategy(abc.ABC):
             return f"/* {kind} fusion */"
         token = self.LINE_COMMENT_TOKENS.get(self.LANGUAGE, "//")
         return f"{token} {kind} fusion"
+
+    def _strip_comments(self, code: str) -> str:
+        """Code without its comments, for a bare-identifier scan: a
+        testsuite header (`Copyright`, `dg-options`) is not a name pool."""
+        code = re.sub(r'/\*.*?\*/', ' ', code, flags=re.S)
+        token = self.LINE_COMMENT_TOKENS.get(self.LANGUAGE, "//")
+        if token == "#":
+            return re.sub(r'#[^\n]*', ' ', code)
+        return re.sub(re.escape(token) + r'[^\n]*', ' ', code)
 
     def _tag_after(self, text: str, search_from: int, kind: str) -> str:
         """Return `text` with a trailing same-line comment tagging `kind`
@@ -127,6 +137,15 @@ class FusionStrategy(abc.ABC):
         """
         return replace_word_occurrences(code, old, new)
 
+    # Second-draw fallbacks of rename_across. The bare-identifier scan
+    # only makes sense where the language's names are bare identifiers
+    # (C family, Go): in PHP it renamed function names and keywords into
+    # `$`-code (dataflow 93 -> 84). The first-draw fallback to the
+    # file-scope names is switchable per adapter (WGSL: measured both
+    # ways, see NagaFusionStrategy).
+    _BARE_IDENT_FALLBACK = False
+    _FIRST_DRAW_VISIBLE_FALLBACK = True
+
     def rename_across(self, code_a: str, code_b: str,
                       names_a=None, names_b=None):
         """Dataflow fusion, entire. Returns `(code_a, code_b)`.
@@ -154,16 +173,64 @@ class FusionStrategy(abc.ABC):
         # of that (globals, module-scope vars), prefer those names; the
         # occasional out-of-scope rename is kept for the error paths.
         visible = self._visible_dataflow_names(code_a)
+        if visible is not None and not visible:
+            # The language distinguishes file-scope names and A has none
+            # to donate: every rename would target one of A's locals
+            # ("undefined: x" / "was not declared in this scope"). Donate
+            # from B into A when B has file-scope names; otherwise there
+            # is no edge to make (10% of draws keep the raw pool for the
+            # error paths). Same rule as the Haskell adapter.
+            if random.random() < self._VISIBLE_RENAME_SHARE:
+                if self._visible_dataflow_names(code_b):
+                    # B has file-scope names, so the swapped call does
+                    # not come back here (no recursion).
+                    new_b, new_a = self.rename_across(code_b, code_a, names_b, names_a)
+                    return new_a, new_b
+                return code_a, code_b
         if visible:
+            # The group rarely holds a file-scope name; when it does not,
+            # the file-scope names themselves are the pool ("was not
+            # declared in this scope" was still 49% of gcc's real-edge
+            # failures with the group's locals as the first draw).
             vis = [n for n in names_a if n in visible]
+            if not vis and self._FIRST_DRAW_VISIBLE_FALLBACK:
+                vis = sorted(visible)
             if vis and random.random() < self._VISIBLE_RENAME_SHARE:
                 names_a = vis
-        if not names_a or not names_b:
+        if names_a and names_b:
+            var_a = random.choice(names_a)
+            var_b = random.choice(names_b)
+            if var_a != var_b:           # renaming a name to itself is a no-op
+                renamed = self._dataflow_replace(code_b, var_b, var_a)
+                if renamed != code_b:
+                    return code_a, self._tag_renamed_lines(code_b, renamed)
+        # The co-occurrence group is often one or two names with no use
+        # site the rename accepts (a callee, a definition): measured on
+        # gcc/clang, 56-61% of the dataflow children were the plain
+        # combination of the parents. Second draw from the raw scan,
+        # restricted to B names that have a use site and to A names that
+        # are visible where the language knows the difference.
+        # A language's own scan may be declaration-based and find nothing
+        # in, say, a C++ template test; the bare-identifier scan (filtered
+        # by the language's veto) is the last resort.
+        def _raw(code):
+            names = self._dataflow_names(code)
+            if not names and self._BARE_IDENT_FALLBACK:
+                names = FusionStrategy._dataflow_names(self, self._strip_comments(code))
+            return [n for n in self._filter_dataflow_names(code, names) if n not in self._DATAFLOW_KEYWORDS]
+        raw_b = [n for n in _raw(code_b) if self._dataflow_replace(code_b, n, n + "_ffl_probe") != code_b]
+        raw_a = _raw(code_a)
+        if visible:
+            vis = [n for n in raw_a if n in visible] or sorted(visible)
+            if random.random() < self._VISIBLE_RENAME_SHARE:
+                raw_a = vis
+        raw_a = [n for n in raw_a if n not in raw_b] or raw_a
+        if not raw_a or not raw_b:
             return code_a, code_b
-        var_a = random.choice(names_a)
-        var_b = random.choice(names_b)
+        var_a = random.choice(raw_a)
+        var_b = random.choice(raw_b)
         if var_a == var_b:
-            return code_a, code_b        # renaming a name to itself is a no-op
+            return code_a, code_b
         renamed = self._dataflow_replace(code_b, var_b, var_a)
         return code_a, self._tag_renamed_lines(code_b, renamed)
 
@@ -2100,11 +2167,15 @@ class PHPFusionStrategy(GenericDataflowStrategy):
                 clean1, clean2, dataflow1, dataflow2,
                 extra_flows=extra_class_flows)
             inner = f"{_pre_cls}\n{new_code1}\n{new_code2}\n"
+            if (new_code1, new_code2) == (clean1, clean2):
+                mode = 'df_none_ab'      # no edge made: the plain combination
         elif mode == 'df_ba':
             new_code2, new_code1 = self.interleave_code_blocks(
                 clean2, clean1, dataflow2, dataflow1,
                 extra_flows=extra_class_flows)
             inner = f"{_pre_cls}\n{new_code1}\n{new_code2}\n"
+            if (new_code1, new_code2) == (clean1, clean2):
+                mode = 'df_none_ba'
         else:
             raise ValueError(f"Unknown mode: {mode}")
 
@@ -2277,9 +2348,67 @@ class PHPDeclarationFusionStrategy(PHPFusionStrategy):
     # corpus). Same rule Clang/Go/Naga already apply.
     _PHP_HAS_DECL_RE = re.compile(r'\b(?:class|interface|trait)\s+[A-Za-z_]\w*', re.M)
 
+    _PHP_PLAIN_CLASS_RE = re.compile(
+        r'(?m)^[ \t]*(?:final\s+)?class\s+(?P<name>[A-Za-z_]\w*)\s*\{')
+    _PHP_CTOR_RE = re.compile(r'function\s+__construct\s*\(([^)]*)\)')
+    _PHP_PUBLIC_METHOD_RE = re.compile(
+        r'(?m)^[ \t]*(?:public\s+)?(?:static\s+)?function\s+(?!__)(?P<name>[A-Za-z_]\w*)\s*\(([^)]*)\)')
+
+    @staticmethod
+    def _all_defaulted(params: str) -> bool:
+        params = params.strip()
+        return not params or all('=' in p or p.strip().startswith('...') for p in params.split(','))
+
+    def _instantiable_classes(self, code: str):
+        """(name, method) for each plain class (`class X {`: no extends,
+        implements, abstract) whose constructor takes no required
+        argument; `method` is a public, non-static, non-magic method with
+        no required argument, or None."""
+        out = []
+        for m in self._PHP_PLAIN_CLASS_RE.finditer(code):
+            body = code[m.end():]
+            nxt = re.search(r'(?m)^[ \t]*(?:abstract\s+|final\s+)*(?:class|interface|trait|enum)\s', body)
+            body = body[:nxt.start()] if nxt else body
+            cm = self._PHP_CTOR_RE.search(body)
+            if cm and not self._all_defaulted(cm.group(1)):
+                continue
+            method = None
+            for mm in self._PHP_PUBLIC_METHOD_RE.finditer(body):
+                line = body[body.rfind('\n', 0, mm.start()) + 1:mm.end()]
+                if 'static' in line or 'private' in line or 'protected' in line or 'abstract' in line:
+                    continue
+                if self._all_defaulted(mm.group(2)):
+                    method = mm.group('name')
+                    break
+            out.append((m.group('name'), method))
+        return out
+
+    def _inject_instantiate(self, host_code: str, donor_code: str):
+        """Host without a class of its own: instantiate a donor class at
+        the end of the host's code and call one of its methods — the host
+        program now depends on the donor's declaration."""
+        cands = self._instantiable_classes(donor_code)
+        if not cands:
+            return host_code, False
+        name, method = random.choice(cands)
+        stmts = [f"$ffl_obj = new {name}();  {self._tag('declaration')}", "var_dump($ffl_obj);"]
+        if method:
+            stmts.append(f"var_dump($ffl_obj->{method}());")
+        return host_code.rstrip() + "\n" + "\n".join(stmts) + "\n", True
+
+    def _direction_viable(self, host: Seed, donor: Seed) -> bool:
+        d = self._seed_php_code(donor) or ""
+        if not self._PHP_HAS_DECL_RE.search(d):
+            return False
+        h = self._seed_php_code(host) or ""
+        return bool(self._PHP_HAS_DECL_RE.search(h)) or bool(self._instantiable_classes(d))
+
     def is_viable_pair(self, parent_a: Seed, parent_b: Seed) -> bool:
-        return bool(self._PHP_HAS_DECL_RE.search(self._seed_php_code(parent_a) or "")
-                    and self._PHP_HAS_DECL_RE.search(self._seed_php_code(parent_b) or ""))
+        """The donor declares a class/interface/trait; the host either has
+        one to point at the donor's, or the donor has a plain class the
+        host can instantiate. The both-sides gate left 3% of pairs viable
+        (22% of seeds declare a class)."""
+        return self._direction_viable(parent_a, parent_b) or self._direction_viable(parent_b, parent_a)
 
     def _inject_extends(self, code: str, donor_name: str):
         """`class Host extends DonorClass` on a host class that has no
@@ -2339,6 +2468,9 @@ class PHPDeclarationFusionStrategy(PHPFusionStrategy):
                     break
             else:
                 fused_host = host_code
+        if technique == 'none':
+            fused_host, applied = self._inject_instantiate(host_code, donor_code)
+            technique = 'instantiate' if applied else 'none'
 
         # Donor declarations first: PHP resolves extends/implements/use
         # when the class statement executes, top-to-bottom like any other
@@ -2361,13 +2493,17 @@ class PHPDeclarationFusionStrategy(PHPFusionStrategy):
         })
 
     def fuse(self, parent_a: Seed, parent_b: Seed) -> Seed:
+        if not self._direction_viable(parent_a, parent_b) and self._direction_viable(parent_b, parent_a):
+            return self._build_declaration_fused_test(parent_b, parent_a, "ba")
         return self._build_declaration_fused_test(parent_a, parent_b, "ab")
 
     def fuse_bidirectional(self, parent_a: Seed, parent_b: Seed) -> List[Seed]:
-        return [
-            self._build_declaration_fused_test(parent_a, parent_b, "ab"),
-            self._build_declaration_fused_test(parent_b, parent_a, "ba"),
-        ]
+        out = []
+        if self._direction_viable(parent_a, parent_b):
+            out.append(self._build_declaration_fused_test(parent_a, parent_b, "ab"))
+        if self._direction_viable(parent_b, parent_a):
+            out.append(self._build_declaration_fused_test(parent_b, parent_a, "ba"))
+        return out or [self._build_declaration_fused_test(parent_a, parent_b, "ab")]
 
 
 # ==========================================
@@ -3197,6 +3333,7 @@ except Exception as _e:
         # so this wires them together whenever A's binding is live; when it
         # is not, the child raises NameError, which is still a program the
         # interpreter has to survive.
+        renamed_any = False
         if a_var and b_choice and a_var != b_choice:
             _before = b_text
             b_text, _ = replace_one_b_occurrence(b_text, b_choice, a_var)
@@ -3204,6 +3341,15 @@ except Exception as _e:
             # rename_across (it needs indentation-aware replacement), so it
             # has to tag the changed lines itself.
             b_text = self._tag_renamed_lines(_before, b_text)
+            renamed_any = b_text != _before
+        if not renamed_any:
+            # No assigned top-level name in A or no bare use in B for the
+            # native path (196 of 300 dev pairs): the base rename's second
+            # draw (raw scan, use-site probe, direction rule) still finds
+            # an edge for many of them.
+            _before_a, _before_b = a_text, b_text
+            a_text, b_text = self.rename_across(a_text, b_text)
+            renamed_any = a_text != _before_a or b_text != _before_b
 
         final_body = self._splice_functions_or_classes(a_text, b_text, a_var or "0")
 
@@ -3227,6 +3373,9 @@ except Exception as _e:
             metadata={
                 "parents": [parent_a.id, parent_b.id],
                 "type": "python",
+                # `df_none`: no rename happened (a side had no candidate);
+                # the child is the splice plus instrumentation, no edge.
+                "mode": "df_ab" if renamed_any else "df_none_ab",
                 "description": f"Fused {parent_a.id} + {parent_b.id}"
             }
         )
@@ -3485,6 +3634,48 @@ class SwiftFusionStrategy(FusionStrategy):
         other top-level declaration in the file."""
         return set(self._SWIFT_TOP_VAR_RE.findall(code))
 
+    # Top-level `let name: T = init` / `let name = init`: the kind of a
+    # value, from the annotation or the literal.
+    _SWIFT_VAR_INIT_RE = re.compile(r'^(?:(?:public|private|internal|fileprivate)\s+)?(?:let|var)\s+([A-Za-z_]\w*)'
+                                    r'\s*(?::\s*([^=\n]+?))?\s*=\s*([^\n]+?)\s*$', re.M)
+    _TYPED_RENAME_SHARE = 0.9
+
+    @classmethod
+    def _swift_value_kinds(cls, code: str) -> dict:
+        kinds = {}
+        for m in cls._SWIFT_VAR_INIT_RE.finditer(code):
+            name, ann, init = m.group(1), m.group(2), m.group(3)
+            if ann:
+                kinds[name] = re.sub(r'\s+', '', ann)
+            elif re.match(r'^-?\d+$', init):
+                kinds[name] = 'Int'
+            elif re.match(r'^-?\d+\.\d+$', init):
+                kinds[name] = 'Double'
+            elif init.startswith('"'):
+                kinds[name] = 'String'
+            elif init in ('true', 'false'):
+                kinds[name] = 'Bool'
+            elif re.match(r'^[A-Z]\w*\(', init):
+                kinds[name] = init.split('(', 1)[0]
+        return kinds
+
+    def rename_across(self, code_a: str, code_b: str, names_a=None, names_b=None):
+        """Prefer a rename between values of the same kind (annotation or
+        literal): a renamed use keeps its members and operators ("value of
+        type X has no member Y", a quarter of the gated dataflow failures).
+        10% of the draws keep the untyped choice."""
+        names_a = names_a or self._dataflow_names(code_a)
+        names_b = names_b or self._dataflow_names(code_b)
+        ka, kb = self._swift_value_kinds(code_a), self._swift_value_kinds(code_b)
+        pairs = [(a, b) for a in names_a for b in names_b
+                 if a != b and a in ka and b in kb and ka[a] == kb[b]]
+        if pairs and random.random() < self._TYPED_RENAME_SHARE:
+            var_a, var_b = random.choice(pairs)
+            renamed = self._dataflow_replace(code_b, var_b, var_a)
+            if renamed != code_b:
+                return code_a, self._tag_renamed_lines(code_b, renamed)
+        return super().rename_across(code_a, code_b, names_a, names_b)
+
     # Only the dataflow strategy is gated; state/declaration subclasses
     # set this to False.
     _GATE_ON_VISIBLE = True
@@ -3501,12 +3692,23 @@ class SwiftFusionStrategy(FusionStrategy):
             return True
         return random.random() < self._UNGATED_SHARE
 
+    def _dataflow_names(self, code: str):
+        """Bare identifiers of the code without its comments: the seeds'
+        `// RUN:` / doc-comment lines put `the`, `test`, `not` into the
+        pool (21 of 52 viable pairs then found no use site)."""
+        return FusionStrategy._dataflow_names(self, self._strip_comments(code))
+
     def _filter_dataflow_names(self, code: str, names):
         """Drop names that only occur as members (`p.x`), argument labels
         (`f(x: 1)`) or after `@`/`#`: renaming those is "value of type has
         no member" (23% of swift's dataflow failures)."""
         out = []
         for n in names:
+            # Swift types and protocols are UpperCamelCase: a rename of
+            # `init(x: T)` / `struct S: P` is "cannot find type in scope"
+            # (13 of 45 renames drawn from the bare scan of B).
+            if n[:1].isupper():
+                continue
             occ = list(re.finditer(r'(?<![\w])' + re.escape(n) + r'(?![\w])', code))
             if not occ:
                 continue
@@ -3534,6 +3736,8 @@ class SwiftFusionStrategy(FusionStrategy):
                 return False
             if self._SWIFT_DECL_KW_RE.search(before):
                 return False
+            if re.match(r'\s*\(', code[m.end():m.end() + 3]):
+                return False              # callee position ("cannot call value of non-function type")
             return True
         uses = [m for m in re.finditer(r'(?<![\w])' + re.escape(old) + r'(?![\w])', code) if _is_use(m)]
         if not uses:
@@ -3562,7 +3766,12 @@ class SwiftFusionStrategy(FusionStrategy):
         """
         # Matches: var x = 10, let y: Int = 20, var s = "string"
         # Group 2 is name, Group 3 is optional type hint, Group 4 is value
-        regex = r'^\s*(var|let)\s+([a-zA-Z0-9_]+)(\s*:\s*[a-zA-Z0-9_]+)?\s*=\s*(.+)'
+        # Column 0 only (an indented `let` is a function's local: "cannot
+        # find in scope" when donated), modifiers allowed (`public let`),
+        # any type up to the `=` (`[Int]`, `Foo<T>`): with the old pattern
+        # 37 of 95 viable pairs found no donor and made no rename.
+        regex = (r'^(?:(?:public|private|internal|fileprivate|open|static|final|lazy|weak|unowned|nonisolated)\s+)*'
+                 r'(var|let)\s+([a-zA-Z0-9_]+)(\s*:\s*[^=\n]+?)?\s*=\s*(.+)')
         vars_found = []
         for line in code.splitlines():
             match = re.match(regex, line)
@@ -3917,6 +4126,12 @@ do {{
 
         # 2. Analyze Variables in A
         a_vars = self._extract_vars(a_body)
+        if not a_vars:
+            # `let x =` with the initializer on the next line, a tuple
+            # pattern, a computed property: the viability gate saw a
+            # top-level binding that the extractor cannot type. Donate it
+            # untyped rather than making no rename at all.
+            a_vars = [(n, "Any") for n in sorted(self._visible_dataflow_names(a_body))]
 
         # 3. Create Bridge
         # Pick a variable from A to inject into B
@@ -3927,10 +4142,24 @@ do {{
         donor_var = None
         donor_type = "Any"
         final_b_body = b_body
+        renamed_any = False
+        b_first = False
         if a_vars:
             donor_var, donor_type = random.choice(a_vars)
-            _, final_b_body = self.rename_across(a_body, b_body,
-                                                 names_a=[donor_var])
+            new_a, final_b_body = self.rename_across(a_body, b_body,
+                                                     names_a=[donor_var])
+            renamed_any = final_b_body != b_body or new_a != a_body
+        else:
+            # A has no top-level binding (the ungated 10%): the base rule
+            # donates from B into A when B has one -- an edge in the
+            # other direction rather than none.
+            new_a, final_b_body = self.rename_across(a_body, b_body)
+            renamed_any = final_b_body != b_body or new_a != a_body
+            if new_a != a_body:
+                # The base rename donated from B into A: keep the renamed
+                # A (it was discarded before) and emit B first -- a
+                # top-level `let` must precede its use in main.swift.
+                a_body, b_first = new_a, True
         # After the rename, as in Go: the rename may put a colliding
         # name back, and Swift rejects the redeclaration outright.
         final_b_body, _ = self._dedupe_toplevel(
@@ -3948,8 +4177,12 @@ do {{
         # 6. Assemble: Imports -> A -> B -> Primitive
         # A's variables are visible to B because they are top-level.
         final_content = "\n".join(all_imports) + "\n\n"
-        final_content += f"// --- Seed A ---\n{a_body}\n"
-        final_content += f"// --- Seed B ---\n{final_b_body}\n"
+        if b_first:
+            final_content += f"// --- Seed B ---\n{final_b_body}\n"
+            final_content += f"// --- Seed A ---\n{a_body}\n"
+        else:
+            final_content += f"// --- Seed A ---\n{a_body}\n"
+            final_content += f"// --- Seed B ---\n{final_b_body}\n"
         final_content += f"{sentinel_decl}"
         final_content += f"// --- Bug Primitive ---\n{chosen_prim}\n"
 
@@ -3958,6 +4191,9 @@ do {{
             metadata={
                 "parents": [parent_a.id, parent_b.id],
                 "type": "swift",
+                # `df_none`: no rename applied (no use site for any
+                # candidate) -- the plain combination, reported as such.
+                "mode": "df_ab" if renamed_any else "df_none_ab",
                 "description": f"Fused {parent_a.id} + {parent_b.id}"
             }
         )
@@ -4026,24 +4262,129 @@ class SwiftDeclarationFusionStrategy(SwiftFusionStrategy):
             generic = m.group(0).split(m.group('name'), 1)[1].lstrip().startswith('<')
             if generic:
                 continue
-            if m.group('kind') == 'protocol' or (m.group('kind') == 'class' and host_has_class):
+            if m.group('kind') == 'protocol':
+                # Only protocols whose every requirement can be stubbed
+                # (no associatedtype/subscript/where, no inherited
+                # protocols): "does not conform" was 16 of 103 conformance
+                # children, all of these shapes.
+                if self._protocol_stubs(code, m.group('name'), 'struct') is None:
+                    continue
+                out.append((m.group('kind'), m.group('name'), False))
+            elif m.group('kind') == 'class' and host_has_class:
+                line_start = code.rfind('\n', 0, m.start()) + 1
+                if re.search(r'\bfinal\b', code[line_start:m.start()]):
+                    continue              # "inheritance from a final class"
                 out.append((m.group('kind'), m.group('name'), False))
         return out
 
-    def is_viable_pair(self, parent_a: Seed, parent_b: Seed) -> bool:
-        """Both sides must declare a type, and at least one direction must
-        offer a legal slot (a protocol, or a class into a class host):
-        a pair whose donors are only structs/enums/generics could only
-        produce "inheritance from non-protocol type" — 32 of 89 failures
-        on the dev sample, every one from that no-slot fallback."""
-        a, b = parent_a.content or "", parent_b.content or ""
-        if not (self._SWIFT_TYPE_HEADER_RE.search(a) and self._SWIFT_TYPE_HEADER_RE.search(b)):
-            return False
-        has_class = {c: any(m.group('kind') == 'class' for m in self._SWIFT_TYPE_HEADER_RE.finditer(c))
-                     for c in (a, b)}
-        return bool(self._usable_donor_decls(b, has_class[a]) or self._usable_donor_decls(a, has_class[b]))
+    _SWIFT_STORED_RE = re.compile(r'(?m)^[ \t]*(?:(?:public|private|internal|fileprivate|final|static|lazy|weak|unowned)\s+)*(?:var|let)\s+[A-Za-z_]\w*\s*:\s*[^=\n{]+$')
+    _SWIFT_INIT_PARAM_RE = re.compile(r'\binit\s*[?!]?\s*\(\s*[^)\s]')   # `init?(coder:)` too
+    _SWIFT_CASE_RE = re.compile(r'(?m)^[ \t]*case\s+([A-Za-z_]\w*)\s*(?:,|$|//)')
 
-    def _inject_conformance(self, code: str, donor_name: str):
+    def _instance_donor_decls(self, code: str):
+        """(kind, name, expression) for donor types a host can hold a value
+        of without knowing more: a non-generic struct/class whose stored
+        properties all have defaults and that declares no parameterised
+        `init`, or an enum with a payload-free case."""
+        out = []
+        for m in self._SWIFT_TYPE_HEADER_RE.finditer(code):
+            kind, name = m.group('kind'), m.group('name')
+            if kind == 'protocol' or m.group(0).split(name, 1)[1].lstrip().startswith('<'):
+                continue
+            # Top-level only: a type nested in another type or extension
+            # is not in scope at the top level ("cannot find X in scope").
+            line_start = code.rfind('\n', 0, m.start()) + 1
+            if code[line_start:m.start()].strip() not in ('', 'public', 'private', 'internal', 'fileprivate', 'final', 'public final', 'open', 'indirect'):
+                continue
+            if code[line_start:m.start()] and code[line_start] in ' \t':
+                continue
+            body_start = m.end()
+            depth, i = 1, body_start
+            while i < len(code) and depth:
+                depth += (code[i] == '{') - (code[i] == '}')
+                i += 1
+            body = code[body_start:i - 1]
+            if kind == 'enum':
+                cm = self._SWIFT_CASE_RE.search(body)
+                if cm:
+                    out.append((kind, name, f"{name}.{cm.group(1)}"))
+                continue
+            if self._SWIFT_STORED_RE.search(body) or self._SWIFT_INIT_PARAM_RE.search(body):
+                continue
+            if re.search(r'(?m)^[ \t]*(?:required\s+)?init\s*\(\s*\)', body) or True:
+                out.append((kind, name, f"{name}()"))
+        return out
+
+    def _inject_instance(self, code: str, donor_expr: str):
+        """Host without a type to hang a conformance on: a top-level value
+        of the donor's type, used once (single-file compilation treats the
+        file as main.swift, so top-level statements are legal)."""
+        stmt = f"let fflObj = {donor_expr}  {self._tag('declaration')}\n_ = fflObj\n"
+        return code.rstrip("\n") + "\n\n" + stmt, True
+
+    def _direction_viable(self, host: Seed, donor: Seed) -> bool:
+        h, d = host.content or "", donor.content or ""
+        if not self._SWIFT_TYPE_HEADER_RE.search(d):
+            return False
+        has_class = any(m.group('kind') == 'class' for m in self._SWIFT_TYPE_HEADER_RE.finditer(h))
+        if self._SWIFT_TYPE_HEADER_RE.search(h) and self._usable_donor_decls(d, has_class):
+            return True
+        return bool(self._instance_donor_decls(d))
+
+    def is_viable_pair(self, parent_a: Seed, parent_b: Seed) -> bool:
+        """The donor declares a type; the host either has a type with a
+        legal slot for it (protocol conformance, class inheritance) or
+        can hold a value of a donor type (struct/class with defaulted
+        stored properties, enum with a payload-free case). The slot-only
+        gate left 70 of 300 pairs viable."""
+        return self._direction_viable(parent_a, parent_b) or self._direction_viable(parent_b, parent_a)
+
+    _SWIFT_REQ_FUNC_RE = re.compile(r'^[ \t]*((?:(?:static|mutating|class)\s+)*func\s+[A-Za-z_]\w*\s*(?:<[^>\n]*>)?\s*\([^)\n]*\)(?:\s*(?:async|throws|rethrows))*(?:\s*->\s*[^{\n]+?)?)\s*$', re.M)
+    _SWIFT_REQ_VAR_RE = re.compile(r'^[ \t]*((?:static\s+)?var\s+[A-Za-z_]\w*\s*:\s*[^{\n]+?)\s*\{\s*get(\s+set)?\s*\}\s*$', re.M)
+    _SWIFT_REQ_INIT_RE = re.compile(r'^[ \t]*(init\s*\([^)\n]*\))\s*$', re.M)
+
+    def _protocol_stubs(self, donor_body: str, proto_name: str, host_kind: str):
+        """Member stubs satisfying every requirement of `protocol
+        proto_name` in `donor_body`, or None when a requirement is of a
+        kind not stubbed here (associatedtype, subscript, a where clause).
+        A conformance without them was "type X does not conform to
+        protocol Y", 16 of 168 chained declaration failures."""
+        pm = re.search(r'(?m)^[ \t]*(?:public\s+)?protocol\s+' + re.escape(proto_name) + r'\b([^{\n]*)\{', donor_body)
+        if not pm or 'where' in pm.group(1):
+            return None
+        # Inherited protocols bring requirements this scan cannot see
+        # (`protocol Composed: A, B`); layout constraints are fine.
+        parents = [x.strip() for x in pm.group(1).lstrip(': ').split(',') if x.strip()]
+        if any(x not in ('AnyObject', 'Sendable', 'class') for x in parents):
+            return None
+        depth, i = 1, pm.end()
+        while i < len(donor_body) and depth:
+            depth += (donor_body[i] == '{') - (donor_body[i] == '}')
+            i += 1
+        body = donor_body[pm.end():i - 1]
+        stubs = []
+        for line in body.splitlines():
+            st = line.strip()
+            if not st or st.startswith('//'):
+                continue
+            fm = self._SWIFT_REQ_FUNC_RE.match(line)
+            vm = self._SWIFT_REQ_VAR_RE.match(line)
+            im = self._SWIFT_REQ_INIT_RE.match(line)
+            if fm:
+                stubs.append(f"    {fm.group(1)} {{ fatalError() }}")
+            elif vm:
+                if vm.group(2):
+                    stubs.append(f"    {vm.group(1)} {{ get {{ fatalError() }} set {{}} }}")
+                else:
+                    stubs.append(f"    {vm.group(1)} {{ fatalError() }}")
+            elif im:
+                kw = "required " if host_kind == 'class' else ""
+                stubs.append(f"    {kw}{im.group(1)} {{ fatalError() }}")
+            else:
+                return None
+        return stubs
+
+    def _inject_conformance(self, code: str, donor_name: str, donor_body: str = ""):
         matches = list(self._SWIFT_TYPE_HEADER_RE.finditer(code))
         if not matches:
             return code, False
@@ -4053,13 +4394,38 @@ class SwiftDeclarationFusionStrategy(SwiftFusionStrategy):
             new_code = code[:brace_pos].rstrip() + f", {donor_name} " + code[brace_pos:]
         else:
             new_code = code[:brace_pos].rstrip() + f": {donor_name} " + code[brace_pos:]
+        stubs = self._protocol_stubs(donor_body, donor_name, m.group('kind')) if donor_body else None
+        if stubs:
+            # Only members the host does not already declare.
+            hb = new_code.find('{', m.start())
+            depth, j = 1, hb + 1
+            while j < len(new_code) and depth:
+                depth += (new_code[j] == '{') - (new_code[j] == '}')
+                j += 1
+            host_members = set(re.findall(r'\b(?:func|var|let)\s+([A-Za-z_]\w*)', new_code[hb:j]))
+            keep = [st for st in stubs
+                    if not (re.search(r'\b(?:func|var)\s+([A-Za-z_]\w*)', st) and
+                            re.search(r'\b(?:func|var)\s+([A-Za-z_]\w*)', st).group(1) in host_members)]
+            if keep:
+                new_code = new_code[:j - 1] + "\n" + "\n".join(keep) + "\n" + new_code[j - 1:]
         new_code = self._tag_after(new_code, m.start(), 'declaration')
         return new_code, True
 
-    def _inject_superclass(self, code: str, donor_name: str):
+    def _inject_superclass(self, code: str, donor_name: str, donor_body: str = ""):
         """`class Host: DonorClass` — the superclass must come first in
-        the inheritance clause, on a class that has none yet."""
-        matches = [m for m in self._SWIFT_TYPE_HEADER_RE.finditer(code) if m.group('kind') == 'class']
+        the inheritance clause, on a class that has none yet. A host
+        method that shares its name with a donor method gets `override`
+        ("overriding declaration requires an 'override' keyword", 8 of
+        87 chained declaration failures)."""
+        # A host class whose clause already starts with a class (one
+        # declared in either seed, or NSObject) has its superclass slot
+        # taken: "multiple inheritance from classes".
+        known_classes = {mm.group('name') for mm in self._SWIFT_TYPE_HEADER_RE.finditer(code + "\n" + (donor_body or ""))
+                         if mm.group('kind') == 'class'} | {'NSObject'}
+        matches = [m for m in self._SWIFT_TYPE_HEADER_RE.finditer(code)
+                   if m.group('kind') == 'class'
+                   and not (m.group('conforms')
+                            and re.sub(r'^[:\s]+', '', m.group('conforms')).split(',')[0].strip() in known_classes)]
         if not matches:
             return code, False
         m = random.choice(matches)
@@ -4069,6 +4435,38 @@ class SwiftDeclarationFusionStrategy(SwiftFusionStrategy):
         else:
             brace_pos = m.end() - 1
             new_code = code[:brace_pos].rstrip() + f": {donor_name} " + code[brace_pos:]
+        donor_funcs = set()
+        dm = re.search(r'(?m)^[ \t]*(?:(?:final|public|open|internal)\s+)*class\s+' + re.escape(donor_name) + r'\b[^{]*\{', donor_body or "")
+        if dm:
+            depth, i = 1, dm.end()
+            while i < len(donor_body) and depth:
+                depth += (donor_body[i] == '{') - (donor_body[i] == '}')
+                i += 1
+            donor_funcs = set(re.findall(r'\bfunc\s+([A-Za-z_]\w*)\s*\(', donor_body[dm.end():i]))
+            donor_has_init0 = bool(re.search(r'(?m)^[ \t]*(?:(?:public|required|convenience|internal)\s+)*init\s*\(\s*\)', donor_body[dm.end():i]))
+        else:
+            donor_has_init0 = False
+        if donor_has_init0:
+            # A host `init()` now overrides the inherited one.
+            hb = new_code.find('{', m.start())
+            depth, j = 1, hb + 1
+            while j < len(new_code) and depth:
+                depth += (new_code[j] == '{') - (new_code[j] == '}')
+                j += 1
+            body = re.sub(r'(?m)^([ \t]*(?:(?:public|private|internal|fileprivate|required)\s+)*)(?!override\b)((?:convenience\s+)?init\s*\(\s*\))',
+                          r'\1override \2', new_code[hb:j])
+            new_code = new_code[:hb] + body + new_code[j:]
+        if donor_funcs:
+            # only inside the host class's own body
+            hb = new_code.find('{', m.start())
+            depth, j = 1, hb + 1
+            while j < len(new_code) and depth:
+                depth += (new_code[j] == '{') - (new_code[j] == '}')
+                j += 1
+            body = new_code[hb:j]
+            body = re.sub(r'(?m)^([ \t]*(?:(?:public|private|internal|fileprivate|final)\s+)*)(?!override\b)((?:static\s+|class\s+)?func\s+(' + '|'.join(map(re.escape, donor_funcs)) + r')\s*\()',
+                          r'\1override \2', body)
+            new_code = new_code[:hb] + body + new_code[j:]
         return self._tag_after(new_code, m.start(), 'declaration'), True
 
     def _build_declaration_fused_test(self, host: Seed, donor: Seed, direction: str) -> Seed:
@@ -4091,35 +4489,65 @@ class SwiftDeclarationFusionStrategy(SwiftFusionStrategy):
         fused_host, applied = host_body, False
         if donor_decls:
             donor_kind, donor_name, _generic = random.choice(donor_decls)
-            if random.random() < 0.8:
+            # 10% (was 20%) of draws keep a kind-mismatched donor: in chained
+            # mode the draw happens per step, and "inheritance from
+            # non-protocol type" was 49 of 168 chained declaration failures.
+            strict = random.random() < 0.9
+            if strict:
                 # A protocol fits any host; a class only a class host
                 # without a superclass; a generic donor needs arguments
                 # the host does not have ("requires arguments in <...>").
                 usable = self._usable_donor_decls(donor_body, host_has_class)
                 if usable:
                     donor_kind, donor_name, _generic = random.choice(usable)
-            if donor_kind == 'class':
-                fused_host, applied = self._inject_superclass(host_body, donor_name)
-            if not applied:
-                fused_host, applied = self._inject_conformance(host_body, donor_name)
+                else:
+                    # No protocol and no class for a class host: a
+                    # struct/enum in a conformance list is "inheritance
+                    # from non-protocol type" by construction (20 of 103
+                    # conformance children); the instance mode below has
+                    # a slot for it.
+                    donor_kind = None
+            if donor_kind == 'class' and host_has_class:
+                fused_host, applied = self._inject_superclass(host_body, donor_name, donor_body)
+                if not applied and strict:
+                    # Every host class already has a superclass: a class
+                    # in a struct's conformance list fails the same way.
+                    protos = [d for d in self._usable_donor_decls(donor_body, False)]
+                    if protos:
+                        donor_kind, donor_name, _generic = random.choice(protos)
+                    else:
+                        donor_kind = None
+            if donor_kind and not applied and self._SWIFT_TYPE_HEADER_RE.search(host_body):
+                fused_host, applied = self._inject_conformance(host_body, donor_name, donor_body)
+        mode_name = 'conformance'
+        if not applied:
+            inst = self._instance_donor_decls(donor_body)
+            if inst:
+                _k, _n, expr = random.choice(inst)
+                fused_host, applied = self._inject_instance(host_body, expr)
+                mode_name = 'instance'
 
         final_content = "\n".join(all_imports) + "\n\n" + donor_body + "\n" + fused_host
 
         return Seed(content=final_content, metadata={
             "parents": [host.id, donor.id],
             "type": "swift",
-            "mode": f"decl_{'conformance' if applied else 'none'}_{direction}",
+            "mode": f"decl_{mode_name if applied else 'none'}_{direction}",
             "description": f"Declaration-fused {host.id} <- {donor.id} ({direction})",
         })
 
     def fuse(self, parent_a: Seed, parent_b: Seed) -> Seed:
+        if not self._direction_viable(parent_a, parent_b) and self._direction_viable(parent_b, parent_a):
+            return self._build_declaration_fused_test(parent_b, parent_a, "ba")
         return self._build_declaration_fused_test(parent_a, parent_b, "ab")
 
     def fuse_bidirectional(self, parent_a: Seed, parent_b: Seed) -> List[Seed]:
-        return [
-            self._build_declaration_fused_test(parent_a, parent_b, "ab"),
-            self._build_declaration_fused_test(parent_b, parent_a, "ba"),
-        ]
+        out = []
+        if self._direction_viable(parent_a, parent_b):
+            out.append(self._build_declaration_fused_test(parent_a, parent_b, "ab"))
+        if self._direction_viable(parent_b, parent_a):
+            out.append(self._build_declaration_fused_test(parent_b, parent_a, "ba"))
+        return out or [self._build_declaration_fused_test(parent_a, parent_b, "ab")]
 
 
 # ==========================================
@@ -4133,6 +4561,86 @@ class MLIRFusionStrategy(FusionStrategy):
 
     _MLIR_SYMBOL_RE = re.compile(r'@[\w$.-]+')
     _MLIR_SSA_RE = re.compile(r'%[\w$.#-]+')
+
+    # `func.func @f(%a: T, %b: U)` / `call @g(%x, %y)`: the arity of a
+    # symbol as defined and as called.
+    # The dialect of the defining/calling op (`llvm.` / `func.` / bare)
+    # is captured too: an `llvm.call` redirected to a `func.func` is
+    # "does not reference a valid LLVM function".
+    _MLIR_FUNC_SIG_RE = re.compile(r'(?:^|\s)((?:[\w]+\.)?)func(?:\s+\w+)*\s+(@[\w$.-]+)\s*\(([^)]*)\)')
+    _MLIR_CALL_RE = re.compile(r'(?:^|\s)((?:[\w]+\.)?)call(?:\s+\w+)*\s+(@[\w$.-]+)\s*\(([^)]*)\)')
+    _TYPED_RENAME_SHARE = 0.9
+
+    def rename_across(self, code_a: str, code_b: str, names_a=None, names_b=None):
+        """Prefer redirecting one of B's calls to a symbol of A that takes
+        the same number of operands ("incorrect number of operands for
+        callee" was half of the dataflow failures once the rename always
+        fired). The types may still disagree -- that is the edge the
+        verifier then checks. 10% of the draws keep the untyped choice."""
+        if random.random() < self._TYPED_RENAME_SHARE:
+            # Count `%name:` parameters and `%name` operands: a comma
+            # split miscounted `tensor<?x?xf32, #alias>` types (a 3-ary
+            # callee counted as 5).
+            arity_a = {}
+            for m in self._MLIR_FUNC_SIG_RE.finditer(code_a):
+                # `llvm.func @f(!llvm.ptr, i64)` lists types only; count
+                # top-level commas then. `func.func @f(%a: T, %b: U)` lists
+                # `%name:` parameters.
+                params = m.group(3)
+                n = len(re.findall(r'%[\w$.]+\s*:', params))
+                if not n and params.strip():
+                    n = len(re.sub(r'<[^<>]*>', '', re.sub(r'<[^<>]*>', '', params)).split(','))
+                arity_a.setdefault(m.group(2), ((m.group(1) or 'func.'), n))
+            calls_b = {}
+            for m in self._MLIR_CALL_RE.finditer(code_b):
+                calls_b.setdefault(m.group(2), ((m.group(1) or 'func.'), len(re.findall(r'%[\w$.]+', m.group(3)))))
+            pairs = [(a, b) for b, (db, nb) in calls_b.items() for a, (da, na) in arity_a.items()
+                     if a != b and na == nb and da == db]
+            random.shuffle(pairs)
+            for a, b in pairs[:6]:
+                renamed = self._dataflow_replace(code_b, b, a)
+                if renamed != code_b:
+                    return code_a, self._tag_renamed_lines(code_b, renamed)
+        return super().rename_across(code_a, code_b, names_a, names_b)
+
+    # Off (measured r08f/r08g): both gate versions dropped valid symbol
+    # renames (25 -> 6 -> 19 of ~60 on s1, 18 -> 9 on s2); the no-edge
+    # children cost a parse each but the gate costs edges.
+    _GATE_ON_VISIBLE = False
+    _UNGATED_SHARE = 0.1
+
+    def is_viable_pair(self, parent_a: Seed, parent_b: Seed) -> bool:
+        """A symbol rename needs a call site on one side and a function
+        definition on the other (238 of 300 dev pairs had no accepted
+        use and made no edge); 10% ungated."""
+        if not self._GATE_ON_VISIBLE:
+            return super().is_viable_pair(parent_a, parent_b)
+        a, b = parent_a.content or "", parent_b.content or ""
+        # Any symbol definition on one side (func, global, module) and
+        # any symbol *reference* outside a definition line on the other
+        # (`call @f`, `llvm.mlir.addressof @g`, `func.constant @f`): the
+        # first version required a call and a func and dropped 19 of 25
+        # valid renames (r08f).
+        if ((self._mlir_symbol_uses(b) and self._mlir_symbol_defs(a))
+                or (self._mlir_symbol_uses(a) and self._mlir_symbol_defs(b))):
+            return True
+        return random.random() < self._UNGATED_SHARE
+
+    def _mlir_symbol_defs(self, code: str) -> bool:
+        for line in code.split('\n'):
+            m = self._MLIR_SYMBOL_RE.search(line)
+            if m and self._MLIR_SYMBOL_DEF_PREFIX_RE.search(line[:m.start()]):
+                return True
+        return False
+
+    def _mlir_symbol_uses(self, code: str) -> bool:
+        for line in code.split('\n'):
+            if line.lstrip().startswith('//'):
+                continue
+            for m in self._MLIR_SYMBOL_RE.finditer(line):
+                if not self._MLIR_SYMBOL_DEF_PREFIX_RE.search(line[:m.start()]):
+                    return True
+        return False
 
     def _dataflow_names(self, code: str):
         """Symbols first, SSA values only as a fallback.
@@ -4153,9 +4661,13 @@ class MLIRFusionStrategy(FusionStrategy):
     # every time (65% of dataflow failures measured on mlir/test), and a
     # definition is not a use, which is what the technique wires. Uses
     # (`call @f`, `symbol_ref`) are still renamed.
+    # Any word tokens may sit between the op and the symbol: visibility,
+    # linkage, a calling convention (`llvm.func spir_funccc @k(...)` --
+    # renaming that bodiless declaration was "redefinition of symbol", 7
+    # of 40 real-rename failures).
     _MLIR_SYMBOL_DEF_PREFIX_RE = re.compile(
         r'(?:^|\s)(?:[\w.]*func|[\w.]*global|[\w.]*module|ml_program\.[\w.]+)\s+'
-        r'(?:(?:private|public|nested|internal|external|dso_local|constant|mutable)\s+)*$')
+        r'(?:\w+\s+)*$')
 
     def _dataflow_replace(self, code: str, old: str, new: str) -> str:
         # `%` and `@` are unambiguous prefixes, so no word-boundary guard
@@ -4561,8 +5073,12 @@ class MLIRFusionStrategy(FusionStrategy):
         # have them, with `%` values as the fallback; the fallback is
         # expected to be rejected, which is the point of leaving validity
         # to chance.
+        before_b = b_body
         _, b_body = self.rename_across(a_body, b_body)
-        bridge_kind = "rename"
+        # No symbol of B had a use the rename accepts: the child is the
+        # plain combination, reported as such (`dataflow_none`) so the
+        # measurement does not count it as a fused program.
+        bridge_kind = "rename" if b_body != before_b else "none"
 
         # 5) Bug primitives
         bug_prims = self._bug_primitives()
@@ -4653,6 +5169,8 @@ class MLIRStateFusionStrategy(MLIRFusionStrategy):
     the closest analogue to the paper's runtime-state grafting available
     without an execution model.
     """
+    _GATE_ON_VISIBLE = False
+
 
     # MLIR blocks require exactly one terminator op, and it must be the
     # last op in the block — unlike brace balance, this isn't something
@@ -4703,7 +5221,11 @@ class MLIRStateFusionStrategy(MLIRFusionStrategy):
         while start < len(donor_lines) and re.match(
                 r'\s*(?::|->|\)|\]|\}|to\b|into\b|iter_args\b|outs\b|ins\b|blocks\b|threads\b'
                 r'|dynamic_shared_memory_size\b|attributes\b|[A-Za-z_]\w*\s*=\s*[\[#"{@%]'
-                r'|"[^"]*"\s*[,\]])', donor_lines[start]):
+                r'|"[^"]*"\s*[,\]]'
+                # an operand list on its own line (`%a, %b, %c` under a
+                # `vector.contract`): an SSA value that starts a line
+                # without `=` is never a statement
+                r'|%[A-Za-z0-9_$.]+\s*(?:,|$|:\s*[^\s=]))', donor_lines[start]):
             start += 1
         if start >= len(donor_lines):
             return None
@@ -4821,13 +5343,23 @@ class MLIRStateFusionStrategy(MLIRFusionStrategy):
         line."""
         from .state_analysis import StatePoint
 
+        from .state_analysis import _MLIR_CONTINUATION_RE
+
         idx = min(host_point.line_idx, len(host_lines) - 1)
         while idx >= 0:
             stripped = host_lines[idx].strip()
+            # A line whose successor continues the same op (`: types`, an
+            # operand list, `ins(`/`outs(`, `{`) is the middle of an op:
+            # grafting after it split `vector.contract`/`linalg.generic`
+            # ("expected integer number of results", "expected '{' to
+            # begin a region": 12 of 126 mlir state failures).
+            mid_op = idx + 1 < len(host_lines) and _MLIR_CONTINUATION_RE.match(host_lines[idx + 1])
             if (stripped and not stripped.startswith('//')
                     and not self._MLIR_TERMINATOR_RE.match(host_lines[idx])
                     and not stripped.startswith('}')
-                    and not stripped.startswith(')')):
+                    and not stripped.startswith(')')
+                    and not mid_op
+                    and not _MLIR_CONTINUATION_RE.match(host_lines[idx])):
                 return StatePoint(idx, host_point.category, host_point.matched_text,
                                   self._leading_indent(host_lines[idx]))
             idx -= 1
@@ -5031,6 +5563,14 @@ class MLIRStateFusionStrategy(MLIRFusionStrategy):
                     m = self._MLIR_SSA_DEF_RE.match(code)
                     if m:
                         defined.update(self._MLIR_SSA_RE.findall(code[:code.index('=')]))
+                    # Mid-line bindings of a pulled op (`scf.for %i = ...`,
+                    # `iter_args(%acc = ...)`, `^bb0(%a: T)`) are the
+                    # donor's too: left out of `defined`, they kept their
+                    # bare name and collided with the host's ("region
+                    # entry argument '%c1s' is already in use", 8 of 126).
+                    defined.update(re.findall(r'(%[A-Za-z0-9_$.]+)\s*=(?!=)', code))
+                    if code.lstrip().startswith('^'):
+                        defined.update(re.findall(r'(%[A-Za-z0-9_$.]+)\s*:', code))
             # Still free and unmatched — a donor block argument, or a value
             # from a region the pull does not cross. When its type is known
             # (the donor signature, or the use itself), materialise it as
@@ -5086,8 +5626,13 @@ class MLIRStateFusionStrategy(MLIRFusionStrategy):
         for line in continuation:
             code, sep, comment = line.partition('//')
             wants = mlir_operand_types(code) if by_type else {}
-            rewired.append(self._MLIR_SSA_RE.sub(lambda m: _sub(m, wants.get(m.group(0))), code)
-                           + sep + comment)
+            code = self._MLIR_SSA_RE.sub(lambda m: _sub(m, wants.get(m.group(0))), code)
+            # A bare `call @f` resolves only where the enclosing op's
+            # default dialect is `func`; grafted under another region it
+            # is "Dialect `' not found for custom op 'call'". The
+            # qualified spelling is valid everywhere.
+            code = re.sub(r'^(\s*(?:%[\w$.]+(?:\s*,\s*%[\w$.]+)*\s*=\s*)?)call\s+@', r'\1func.call @', code)
+            rewired.append(code + sep + comment)
         return rewired
 
     def _build_state_fused(self, host: Seed, donor: Seed, direction: str) -> Seed:
@@ -5237,6 +5782,8 @@ class MLIRDeclarationFusionStrategy(MLIRFusionStrategy):
     class docstring on MLIRStateFusionStrategy for the state-fusion
     counterpart, which grafts ops instead of swapping a type).
     """
+    _GATE_ON_VISIBLE = False
+
 
     _MLIR_TYPE_TOKEN_RE = re.compile(
         r'\bi\d+\b|\bf(?:16|32|64|80|128)\b|\bindex\b'
@@ -5270,16 +5817,84 @@ class MLIRDeclarationFusionStrategy(MLIRFusionStrategy):
         new_body = self._tag_after(new_body, seg_start, 'declaration')
         return new_body, True
 
+    _MLIR_SCALAR_TYPE_RE = re.compile(r'^(?:i\d+|si\d+|ui\d+|f16|bf16|f32|f64|index)$')
+
+    def _callable_donor_funcs(self, body: str):
+        """(name, [arg types], [result types]) for donor functions a host
+        can call with constants: every argument an integer/float/index."""
+        out = []
+        for m in self._MLIR_FUNC_SIG_RE.finditer(body):
+            ret = (m.group('ret') or '').strip()
+            if 'attributes' in ret or '{' in ret:
+                continue
+            args = []
+            for a in mlir_split_top_level(m.group('args') or ''):
+                a = a.strip()
+                if not a:
+                    continue
+                if ':' not in a:
+                    args = None
+                    break
+                ty = a.split(':', 1)[1].strip()
+                ty = re.sub(r'\s*\{.*\}$', '', ty)          # arg attributes
+                if not self._MLIR_SCALAR_TYPE_RE.match(ty):
+                    args = None
+                    break
+                args.append(ty)
+            if args is None:
+                continue
+            if ret.startswith('(') and ret.endswith(')'):
+                rets = [r.strip() for r in mlir_split_top_level(ret[1:-1]) if r.strip()]
+            else:
+                rets = [ret] if ret else []
+            if any('(' in r or '{' in r for r in rets):
+                continue
+            out.append((m.group('name'), args, rets))
+        return out
+
+    def _inject_call(self, host_body: str, fn):
+        """Constants for each argument and a `func.call` of the donor
+        function at the top of a host function's entry block: a real
+        cross-seed call, and the donor's body now runs in the host's
+        module. The type swap it complements is 7% valid."""
+        name, args, rets = fn
+        hosts = [m for m in self._MLIR_FUNC_SIG_RE.finditer(host_body)
+                 if 'attributes' not in (m.group('ret') or '')]
+        if not hosts:
+            return host_body, False
+        m = random.choice(hosts)
+        tag = random.randrange(1_000_000)
+        lines, names = [], []
+        for i, ty in enumerate(args):
+            v = f"%ffl{tag}_a{i}"
+            names.append(v)
+            if ty == 'index' or ty[0] in 'isu':
+                lines.append(f"    {v} = arith.constant 0 : {ty}")
+            else:
+                lines.append(f"    {v} = arith.constant 0.0 : {ty}")
+        sig = f"({', '.join(args)}) -> ({', '.join(rets)})" if rets else f"({', '.join(args)}) -> ()"
+        lhs = ""
+        if rets:
+            lhs = ", ".join(f"%ffl{tag}_r{i}" for i in range(len(rets))) + " = "
+        lines.append(f"    {lhs}func.call @{name}({', '.join(names)}) : {sig}")
+        at = m.end()                         # just after the `{`
+        block = "\n" + "\n".join(lines)
+        block = self._tag_after(block, 1, 'declaration')
+        return host_body[:at] + block + host_body[at:], True
+
+    def _direction_viable(self, host: Seed, donor: Seed) -> bool:
+        def prep(seed):
+            return _MLIR_BARE_FUNC_RE.sub('func.func @', mlir_strip_directives(seed.content or ""))
+        h, d = prep(host), prep(donor)
+        if self._donor_type_tokens(h) and self._donor_type_tokens(d):
+            return True
+        return bool(self._callable_donor_funcs(d)) and bool(self._MLIR_FUNC_SIG_RE.search(h))
+
     def is_viable_pair(self, parent_a: Seed, parent_b: Seed) -> bool:
-        """Both seeds must have a `func.func` signature carrying a type
-        token: one donates the type, the other's signature receives it.
-        Otherwise the child is `decl_none` — the two seeds concatenated —
-        and an execution is spent on no declaration fusion at all (the
-        same gate PHP/CPython/Swift/Haskell/Fortran now have)."""
-        def ok(seed):
-            src = _MLIR_BARE_FUNC_RE.sub('func.func @', mlir_strip_directives(seed.content or ""))
-            return bool(self._donor_type_tokens(src))
-        return ok(parent_a) and ok(parent_b)
+        """Type swap needs a typed signature on both sides; a call needs a
+        donor function with scalar arguments and any host function. The
+        swap-only gate left 32 of 300 pairs viable."""
+        return self._direction_viable(parent_a, parent_b) or self._direction_viable(parent_b, parent_a)
 
     def _build_declaration_fused_test(self, host: Seed, donor: Seed, direction: str) -> Seed:
         host_src = mlir_isolate_sections(mlir_strip_directives(host.content))
@@ -5314,10 +5929,18 @@ class MLIRDeclarationFusionStrategy(MLIRFusionStrategy):
             })
 
         donor_types = self._donor_type_tokens(donor_body)
-        fused_host, applied = host_body, False
-        if donor_types:
+        fused_host, applied, technique = host_body, False, 'swap'
+        callable_fns = self._callable_donor_funcs(donor_body)
+        if callable_fns and (not donor_types or random.random() < 0.5):
+            fused_host, applied = self._inject_call(host_body, random.choice(callable_fns))
+            technique = 'call'
+        if not applied and donor_types:
             donor_type = random.choice(donor_types)
             fused_host, applied = self._inject_type_swap(host_body, donor_type)
+            technique = 'swap'
+        if not applied and callable_fns:
+            fused_host, applied = self._inject_call(host_body, random.choice(callable_fns))
+            technique = 'call'
 
         # Donor kept in the same module (not grafted into host — the
         # swap above is the whole point) so it's still a self-consistent
@@ -5327,18 +5950,22 @@ class MLIRDeclarationFusionStrategy(MLIRFusionStrategy):
         return Seed(content=final_code, metadata={
             "parents": [host.id, donor.id],
             "type": "mlir",
-            "mode": f"decl_{'type_swap' if applied else 'none'}_{direction}",
+            "mode": f"decl_{technique if applied else 'none'}_{direction}",
             "description": f"Declaration-fused {host.id} <- {donor.id} ({direction})",
         })
 
     def fuse(self, parent_a: Seed, parent_b: Seed) -> Seed:
+        if not self._direction_viable(parent_a, parent_b) and self._direction_viable(parent_b, parent_a):
+            return self._build_declaration_fused_test(parent_b, parent_a, "ba")
         return self._build_declaration_fused_test(parent_a, parent_b, "ab")
 
     def fuse_bidirectional(self, parent_a: Seed, parent_b: Seed) -> List[Seed]:
-        return [
-            self._build_declaration_fused_test(parent_a, parent_b, "ab"),
-            self._build_declaration_fused_test(parent_b, parent_a, "ba"),
-        ]
+        out = []
+        if self._direction_viable(parent_a, parent_b):
+            out.append(self._build_declaration_fused_test(parent_a, parent_b, "ab"))
+        if self._direction_viable(parent_b, parent_a):
+            out.append(self._build_declaration_fused_test(parent_b, parent_a, "ba"))
+        return out or [self._build_declaration_fused_test(parent_a, parent_b, "ab")]
 
 
 class RustLexMixin:
@@ -5536,6 +6163,10 @@ class RustFusionStrategy(RustLexMixin, FusionStrategy):
                 crate_attrs.append(line)
             elif stripped.startswith("use ") or stripped.startswith("extern crate "):
                 use_lines.append(line)
+            elif use_lines and ";" not in use_lines[-1] and "{" in use_lines[-1]:
+                # `use a::{\n  b, c\n};` — the statement continues until
+                # its `;`; splitting it left `b, c\n};` in the body.
+                use_lines[-1] += "\n" + line
             else:
                 body_lines.append(line)
 
@@ -6128,27 +6759,40 @@ class RustStructFusionStrategy(RustLexMixin, FusionStrategy):
                     depth = max(0, depth - 1)
 
         raw_starts = sorted(
-            (m.start(), m.group(1)) for m in self._ITEM_KW_RE.finditer(body)
+            (m.start(), m.start(1), m.group(1)) for m in self._ITEM_KW_RE.finditer(body)
             if is_real[m.start()] and depth_before[m.start()] == 0
         )
 
         items = []
         cursor = 0
-        for start, kind in raw_starts:
+        for start, kw_start, kind in raw_starts:
             if start < cursor:
                 continue
             ext_start = self._extend_for_attrs(body, start)
-            name_m = re.match(re.escape(kind) + r'\s*!?\s+([A-Za-z_][A-Za-z0-9_]*)', body[start:start + 200])
+            # The name follows the *keyword*, not the match start: with
+            # `pub trait T` the match starts at `pub`, and anchoring the
+            # name regex there left every `pub` item nameless — none of
+            # them was ever collision-renamed (the E0428 remainder).
+            name_m = re.match(re.escape(kind) + r'\s*!?\s+([A-Za-z_][A-Za-z0-9_]*)', body[kw_start:kw_start + 200])
             name = name_m.group(1) if name_m else None
 
             j = start
             found_brace = found_semi = None
+            # `impl<T, const N: usize> Tr for [T; N] where ... {`: the `;`
+            # inside `[T; N]` is not the item's end. Track ()/[] depth
+            # (not <>, which is also a comparison) while scanning.
+            bdepth = 0
             while j < n:
                 if is_real[j]:
-                    if body[j] == '{':
+                    c = body[j]
+                    if c in '([':
+                        bdepth += 1
+                    elif c in ')]':
+                        bdepth = max(0, bdepth - 1)
+                    elif c == '{' and bdepth == 0:
                         found_brace = j
                         break
-                    if body[j] == ';':
+                    elif c == ';' and bdepth == 0:
                         found_semi = j
                         break
                 j += 1
@@ -6188,9 +6832,16 @@ class RustStructFusionStrategy(RustLexMixin, FusionStrategy):
         # A header whose last line carries a `//` comment (`where F: Fn<..>,
         # //~ ERROR E0658`) would swallow the `{` into the comment:
         # "unexpected closing delimiter" (12 of 273 rust combined failures).
-        sep = "\n" if "//" in item['header'].rsplit("\n", 1)[-1] else " "
+        sep = self._brace_sep(item['header'])
         item['text'] = f"{item['header']}{sep}{{\n{new_inner}\n}}"
         return item
+
+    @staticmethod
+    def _brace_sep(header: str) -> str:
+        """`{` goes on a new line when the header's last line carries a
+        `//` comment (`where F: Fn<..>, //~ ERROR E0658`), or it would be
+        swallowed by the comment ("unexpected closing delimiter")."""
+        return "\n" if "//" in header.rsplit("\n", 1)[-1] else " "
 
     # ------------------------------------------------------------------
     # Cross-seed name collision handling
@@ -6244,14 +6895,33 @@ class RustStructFusionStrategy(RustLexMixin, FusionStrategy):
         pools = [('a', items_a), ('b', items_b)]
         containers = [(tag, idx, it) for tag, lst in pools for idx, it in enumerate(lst)
                       if it['kind'] in ('fn', 'mod') and it['inner'] is not None]
+        # `fn main` stays at crate level: nested inside another item it is
+        # no entry point, and the "add a main" fallback still sees it
+        # ("`main` function not found in crate", 17 of the declaration
+        # strategy's failures on the dev sample).
         movable = [(tag, idx, it) for tag, lst in pools for idx, it in enumerate(lst)
-                   if it['kind'] in ('fn', 'struct', 'enum', 'trait', 'impl', 'mod', 'union')]
+                   if it['kind'] in ('fn', 'struct', 'enum', 'trait', 'impl', 'mod', 'union')
+                   and not (it['kind'] == 'fn' and it.get('name') == 'main')]
         if not containers or len(movable) < 2:
             return items_a, items_b
         c_tag, c_idx, container = random.choice(containers)
         candidates = [m for m in movable if not (m[0] == c_tag and m[1] == c_idx)]
         if not candidates:
             return items_a, items_b
+        # An item whose name other items refer to cannot be nested without
+        # stranding them ("cannot find trait/type in this scope", the two
+        # largest declaration classes). Prefer items nothing else names;
+        # one draw in ten keeps the unconstrained choice.
+        all_items = items_a + items_b
+        def referenced_elsewhere(m):
+            name = m[2].get('name')
+            if not name:
+                return False
+            rx = re.compile(r'(?<![\w])' + re.escape(name) + r'(?![\w])')
+            return any(rx.search(it['text']) for it in all_items if it is not m[2])
+        free = [m for m in candidates if not referenced_elsewhere(m)]
+        if free and random.random() < 0.9:
+            candidates = free
         chosen = random.sample(candidates, min(random.randint(1, 2), len(candidates)))
 
         # Remove chosen units from their origin lists (mark for deletion by identity).
@@ -6295,7 +6965,7 @@ class RustStructFusionStrategy(RustLexMixin, FusionStrategy):
             sep = ' + ' if has_bound else ': '
             new_header = f"{header}{sep}{super_name}"
         new_target = dict(target, header=new_header,
-                          text=f"{new_header} {{  {self._tag('declaration')}\n{target['inner']}\n}}")
+                          text=f"{new_header}{self._brace_sep(new_header)}{{  {self._tag('declaration')}\n{target['inner']}\n}}")
         new_lst = [new_target if it is target else it for it in lst]
         return (new_lst, items_b) if tag == 'a' else (items_a, new_lst)
 
@@ -6382,7 +7052,7 @@ class RustStructFusionStrategy(RustLexMixin, FusionStrategy):
             new_header = target['header'][:m.end(1)] + f": {trait_name}" + target['header'][m.end(1):]
         new_target = dict(target, header=new_header)
         if target['inner'] is not None:
-            new_target['text'] = f"{new_header} {{  {self._tag('declaration')}\n{target['inner']}\n}}"
+            new_target['text'] = f"{new_header}{self._brace_sep(new_header)}{{  {self._tag('declaration')}\n{target['inner']}\n}}"
         else:
             # semicolon item — reconstruct from the original text's tail
             tail = target['text'][len(target['header']):]
@@ -6416,6 +7086,8 @@ class RustStructFusionStrategy(RustLexMixin, FusionStrategy):
                     crate_attrs.append(line)
                 elif stripped.startswith("use ") or stripped.startswith("extern crate "):
                     use_lines.append(line)
+                elif use_lines and ";" not in use_lines[-1] and "{" in use_lines[-1]:
+                    use_lines[-1] += "\n" + line     # multi-line `use a::{ ... };`
                 else:
                     body_lines.append(line)
         all_attrs = _rust_merge_attrs(crate_attrs_a, crate_attrs_b)
@@ -6453,8 +7125,10 @@ class RustStructFusionStrategy(RustLexMixin, FusionStrategy):
 
         body = "\n".join(it['text'] for it in items_a) + "\n" + "\n".join(it['text'] for it in items_b)
 
-        if not re.search(r'\bfn\s+main\s*\(', body):
-            body += "\nfn main() {}\n"
+        if not re.search(r'^\s*(?:pub\s+)?(?:async\s+)?fn\s+main\s*\(', body, re.M) \
+                or not any(it['kind'] == 'fn' and it.get('name') == 'main' for it in items_a + items_b):
+            if not re.search(r'^(?:pub\s+)?fn\s+main\s*\(', body, re.M):
+                body += "\nfn main() {}\n"
 
         parts = []
         if all_attrs:
@@ -6638,7 +7312,11 @@ class HaskellFusionStrategy(FusionStrategy):
         """Top-level bindings (column 0, `name args = ...` / `name ::`):
         what another top-level definition can refer to; a `where`/`let`
         local is not ("Variable not in scope")."""
-        return set(self._HS_TOP_DEF_RE.findall(code))
+        # The entry action (`main`, renamed `fflMain_<uid>` by
+        # _process_seed) is IO () and never a dataflow target; counting
+        # it made a main-only seed look like it had a donor name.
+        return {n for n in self._HS_TOP_DEF_RE.findall(code)
+                if n not in self._HS_KEYWORDS and not n.startswith("fflMain_")}
 
     # Top-level type signatures: `name :: Type` at column 0.
     _HS_SIG_RE = re.compile(r"^([a-z_][\w']*)\s*::\s*(.+?)\s*$", re.M)
@@ -6651,22 +7329,59 @@ class HaskellFusionStrategy(FusionStrategy):
         fit an expression slot."""
         return [n for n in names if n and n[0].islower() and not n.startswith("fflMain_")]
 
-    def _dataflow_replace(self, code: str, old: str, new: str) -> str:
+    def _dataflow_replace(self, code: str, old: str, new: str, allow_head: bool = False) -> str:
         """Rename *uses* of `old`, never its definition or signature line
         (both start at column 0 in Haskell): renaming the binding without
         its signature is "type signature lacks an accompanying binding" by
         construction, the largest dataflow failure class. A name with no
-        use sites is left untouched."""
+        use sites is left untouched. `allow_head`: the typed branches pass
+        it when both names are functions of the same arity -- redirecting
+        `old x y` to `new x y` is then a real call edge."""
         def _is_use(mm):
             ls = code.rfind('\n', 0, mm.start()) + 1
             before = code[ls:mm.start()]
             after = code[mm.end():code.find('\n', mm.end()) if code.find('\n', mm.end()) != -1 else len(code)]
-            if '--' in before:
-                return False                                   # comment
+            if '--' in before or '{-#' in before:
+                return False                # comment / pragma (`{-# NOINLINE x #-}`)
+            if before.endswith('`') and code[mm.end():mm.end() + 1] == '`':
+                return False                # infix application head (x `seq` y)
             if re.match(r'\s*(?:[\w\'\s(),_\[\]]*?)::', after):
                 return False                                   # signature
-            if not before.strip() and re.match(r'(?:\s+[\w\'()\[\],_]+)*\s*(?:=(?!=)|\|)', after):
-                return False                                   # equation / guard head
+            # Type-level positions: a `type`/`data`/`class`/`instance`
+            # line, an annotation after `::`/`forall`, or the continuation
+            # of a multi-line signature (previous line ends in `->`, `=>`
+            # or `::`) -- a value name there is "Not in scope: type
+            # variable" (4% of the dataflow failures).
+            if re.match(r'(?:type|data|newtype|class|instance|deriving|pattern)\b', before.lstrip()):
+                return False
+            if '::' in before or re.search(r'\bforall\b', before):
+                return False
+            if not before.strip():
+                prev = code[:ls].rstrip()
+                prev_line = prev[prev.rfind('\n') + 1:].strip()
+                if prev_line.endswith(('->', '=>', '::')):
+                    return False
+                if prev_line.endswith('.') and re.search(r'\bforall\b', code[max(0, ls - 400):ls]):
+                    return False                               # `forall a b.` continuation
+            head = before.strip()
+            # Equation head at any depth (`f a b =`, `let loop a b =`,
+            # `where go x =`), a bind (`x <- act`) or a guard head: the
+            # occurrence is the function or one of its argument patterns.
+            if (re.match(r"^(?:(?:let|where)\s+)?[\w'()\[\],_@:\s]*$", head)
+                    and re.match(r'(?:\s+[\w\'()\[\],_@:]+)*\s*(?:=(?!=)|\||<-)', after)):
+                return False
+            # Case-alternative or lambda pattern (`Left e ->`, `\e ->`):
+            # renaming the binder leaves its body's uses unbound
+            # ("Variable not in scope: e :: SomeException").
+            if (re.match(r'(?:\s+[\w\'()\[\],_@]+)*\s*->', after)
+                    and re.match(r'^[\\\w\'()\[\],_@:\s]*$', head)):
+                return False
+            # Applied to an argument (`old x`, `old (y)`): the head of an
+            # application is a function use; a value put there is
+            # "Couldn't match expected type" (29% of the dataflow failures).
+            if (not allow_head and re.match(r'[ \t]+(?:[a-z_(\[\d"\'][\w\'"]*|\(|\[)', after)
+                    and not re.match(r'[ \t]+(?:`|[-+*/<>=!&|.$]|::|then|else|of|in|where|do\b)', after)):
+                return False
             return True
 
         uses = [mm for mm in re.finditer(rf'(?<![\w\'])' + re.escape(old) + r'(?![\w\'])', code)
@@ -6676,9 +7391,28 @@ class HaskellFusionStrategy(FusionStrategy):
             # duplicate of A's binding, never an edge. Leave B alone.
             return code
         k = min(pick_occurrence_count(), len(uses))
+        original = code
         for mm in sorted(random.sample(uses, k), key=lambda x: x.start(), reverse=True):
             code = code[:mm.start()] + new + code[mm.end():]
-        return code
+        return self._realign_layout(original, code)
+
+    # Only the dataflow strategy is gated; the state/declaration
+    # subclasses set this to False (same pattern as Swift/WGSL).
+    _GATE_ON_VISIBLE = True
+    _UNGATED_SHARE = 0.1
+
+    def is_viable_pair(self, parent_a: Seed, parent_b: Seed) -> bool:
+        """A dataflow rename needs a top-level binding to donate on at
+        least one side; two main-only seeds (the LLM-translated corpus)
+        have none, and every draw was "Variable not in scope". Such pairs
+        go to state/declaration fusion, with a 10% allowance kept for the
+        error paths."""
+        if not self._GATE_ON_VISIBLE:
+            return super().is_viable_pair(parent_a, parent_b)
+        if (self._visible_dataflow_names(parent_a.content or "")
+                or self._visible_dataflow_names(parent_b.content or "")):
+            return True
+        return random.random() < self._UNGATED_SHARE
 
     def rename_across(self, code_a: str, code_b: str, names_a=None, names_b=None):
         """Dataflow rename with the type signatures in view: when A and B
@@ -6689,20 +7423,153 @@ class HaskellFusionStrategy(FusionStrategy):
         dataflow failures). 10% of the draws keep the untyped choice."""
         names_a = self._filter_dataflow_names(code_a, names_a or self._dataflow_names(code_a))
         names_b = self._filter_dataflow_names(code_b, names_b or self._dataflow_names(code_b))
+        # The co-occurrence group of A is every token on a line, imported
+        # library functions included (`readIORef`, `hSetBuffering`, `try`:
+        # "applied to too few arguments" / "Couldn't match expected type",
+        # 15% of the dataflow failures). When the group holds none of A's
+        # own top-level bindings, draw from those bindings instead -- the
+        # base class's visible-name preference has nothing to prefer
+        # otherwise. 5% of the draws keep the raw group (error paths).
+        visible = self._visible_dataflow_names(code_a)
+        if not visible:
+            # A has no top-level binding of its own (the LLM-translated
+            # seeds keep everything inside `main`): any name it donates
+            # is a `let`/`where` local, out of scope beside B ("Variable
+            # not in scope", 39% of the dataflow failures). Donate in the
+            # other direction when B has one -- the edge then runs from
+            # B's binding into A's use, which is just as much a fusion.
+            # 10% of such draws keep the raw pool for the error paths.
+            if self._visible_dataflow_names(code_b):
+                if random.random() < self._VISIBLE_RENAME_SHARE:
+                    new_b, new_a = self.rename_across(code_b, code_a, names_b, names_a)
+                    return new_a, new_b
+            elif random.random() < self._VISIBLE_RENAME_SHARE:
+                return code_a, code_b     # neither side has a legal donor: no edge to make
+        elif not any(n in visible for n in names_a) and random.random() < self._VISIBLE_RENAME_SHARE:
+            names_a = self._filter_dataflow_names(code_a, sorted(visible)) or names_a
         # B candidates must be *used* somewhere (a bare definition gives
         # nothing to rewire).
         used_b = [n for n in names_b if self._dataflow_replace(code_b, n, n + "_probe") != code_b]
         names_b = used_b or names_b
         sig_a = {k: re.sub(r'\s+', ' ', v) for k, v in self._HS_SIG_RE.findall(code_a)}
         sig_b = {k: re.sub(r'\s+', ' ', v) for k, v in self._HS_SIG_RE.findall(code_b)}
-        pairs = [(a, b) for a in names_a for b in names_b
+        # Signed top-level names on both sides (not only the group's
+        # names, which are mostly locals without a signature: the
+        # identical-signature path fired for 0 of 167 renames).
+        signed_b = [n for n in sig_b if n in set(names_b) or self._dataflow_replace(code_b, n, n + "_probe", allow_head=True) != code_b]
+        signed_a = sorted(set(names_a) | (set(sig_a) & set(visible or [])))
+        pairs = [(a, b) for a in signed_a for b in signed_b
                  if a != b and a in sig_a and b in sig_b and sig_a[a] == sig_b[b]]
         if pairs and random.random() < self._TYPED_RENAME_SHARE:
-            var_a, var_b = random.choice(pairs)
-            renamed = self._dataflow_replace(code_b, var_b, var_a)
-            return code_a, self._tag_renamed_lines(code_b, renamed)
+            random.shuffle(pairs)
+            for var_a, var_b in pairs[:6]:
+                renamed = self._dataflow_replace(code_b, var_b, var_a, allow_head=True)
+                if renamed != code_b:
+                    return code_a, self._tag_renamed_lines(code_b, renamed)
+        # No identical signatures: at least keep the *kind* -- a function
+        # (`->` in its signature) for a function, a value for a value. A
+        # function dropped into `print x` / `show x` is "No instance for
+        # Show (a -> b)" (12% of the dataflow failures); the untyped draw
+        # stays for names without a signature.
+        def _is_fn(name, sig, code):
+            if sig is not None:
+                return bool(re.search(r'->', re.sub(r'\([^()]*\)|\[[^\[\]]*\]', '', sig)))
+            # No signature: a definition head with argument patterns
+            # (`name x y = ...`) is a function, `name = ...` a value; an
+            # imported name (no definition at all) stays unknown.
+            m = re.search(r'^' + re.escape(name) + r'([^\n=]*?)=(?!=)\s*([^\n]*)', code, re.M)
+            if not m:
+                return None
+            if m.group(1).strip():
+                return True
+            # A value: its literal kind when it has one (`x = 3`, `s = "a"`,
+            # `xs = [..]`), so 3 pairs with 3 and "a" with "b".
+            init = m.group(2).strip()
+            if re.match(r'^-?\d+$', init):
+                return 'num'
+            if re.match(r'^-?\d+\.\d+', init):
+                return 'frac'
+            if init.startswith('"'):
+                return 'str'
+            if init.startswith('['):
+                return 'list'
+            if init in ('True', 'False'):
+                return 'bool'
+            return False
+        # Pools for the kinded stage: the group names (measured: widening
+        # them to every top-level binding of A and every used name of B
+        # took dataflow 21.6/18.9 -> 15.6/15.8 (r08m/r08n) -- the extra
+        # pairs were mostly locals of B whose kind the head heuristic
+        # misreads).
+        # Plus B's signed top-level names: their kind comes from the
+        # signature, which is reliable (the reverted widening added
+        # locals whose kind the head heuristic misreads).
+        pool_a = list(dict.fromkeys(list(names_a) + [n for n in signed_a if n in sig_a]))
+        pool_b = list(dict.fromkeys(list(names_b) + signed_b))
+        kind_a = {a: _is_fn(a, sig_a.get(a), code_a) for a in pool_a}
+        kind_b = {b: _is_fn(b, sig_b.get(b), code_b) for b in pool_b}
+        kinded = [(a, b) for a in pool_a for b in pool_b
+                  if a != b and kind_a[a] is not None and kind_a[a] == kind_b[b]]
+        def _arity(sig):
+            return len(re.findall(r'->', re.sub(r'\([^()]*\)|\[[^\[\]]*\]', '', sig or '')))
+        if kinded and random.random() < self._TYPED_RENAME_SHARE:
+            random.shuffle(kinded)
+            for var_a, var_b in kinded[:6]:
+                # Two functions of the same arity: the call itself may be
+                # redirected (`f x y` -> `g x y`).
+                both_fn = (kind_a[var_a] is True and var_a in sig_a and var_b in sig_b
+                           and _arity(sig_a[var_a]) == _arity(sig_b[var_b]))
+                renamed = self._dataflow_replace(code_b, var_b, var_a, allow_head=both_fn)
+                if renamed != code_b:
+                    return code_a, self._tag_renamed_lines(code_b, renamed)
         return super().rename_across(code_a, code_b, names_a, names_b)
 
+
+    # A layout keyword with the block's first item on the same line: the
+    # block's indentation is the column of that item, so any rename that
+    # changes the length of the text before it (`main = do print foo` ->
+    # `fflMain_<uid> = do print foo`) moves the column while the block's
+    # remaining lines stay put -- "Unexpected do block in function
+    # application" / parse errors on every one-line-`do` main (3% of the
+    # dataflow failures, the seeds' commonest `main` shape after `main = do`).
+    _HS_LAYOUT_OPEN_RE = re.compile(r'(?<![\w\'])(?:do|mdo|where|let|of)[ \t]+(?=\S)|\\case[ \t]+(?=\S)')
+
+    @classmethod
+    def _realign_layout(cls, before: str, after: str) -> str:
+        """`after` is `before` with some same-line-count substitutions;
+        shift the continuation lines of every layout block opened on a
+        changed line by the amount its first item moved."""
+        old_lines = before.split('\n')
+        new_lines = after.split('\n')
+        if len(old_lines) != len(new_lines):
+            return after
+        i = 0
+        while i < len(new_lines):
+            old, new = old_lines[i], new_lines[i]
+            if old != new:
+                mo = cls._HS_LAYOUT_OPEN_RE.search(old)
+                mn = cls._HS_LAYOUT_OPEN_RE.search(new)
+                delta = (mn.end() - mo.end()) if (mo and mn) else 0
+                head = len(new) - len(new.lstrip())
+                if delta:
+                    j = i + 1
+                    while j < len(new_lines):
+                        ln = new_lines[j]
+                        if not ln.strip():
+                            j += 1
+                            continue
+                        ind = len(ln) - len(ln.lstrip())
+                        if ind <= head:
+                            break
+                        if delta > 0:
+                            new_lines[j] = ' ' * delta + ln
+                        else:
+                            new_lines[j] = ln[min(-delta, ind - head - 1):]
+                        j += 1
+                    i = j
+                    continue
+            i += 1
+        return '\n'.join(new_lines)
 
     def _process_seed(self, code: str, uid: str) -> dict:
         pragmas = [p.strip() for p in self._PRAGMA_RE.findall(code)]
@@ -6714,7 +7581,7 @@ class HaskellFusionStrategy(FusionStrategy):
 
         had_main = bool(self._MAIN_DEF_RE.search(code))
         main_name = f"fflMain_{uid}"
-        code = re.sub(r'\bmain\b', main_name, code)
+        code = self._realign_layout(code, re.sub(r'\bmain\b', main_name, code))
 
         toplevel = set()
         for m in self._TOPLEVEL_RE.finditer(code):
@@ -6816,6 +7683,40 @@ class HaskellFusionStrategy(FusionStrategy):
                 new = f"{name}_b{uid_safe}{k}"
                 k += 1
             body_b = re.sub(r'\b' + re.escape(name) + r'\b', new, body_b)
+        return self._rename_operator_collisions(host_body, body_b)
+
+    # Top-level operator definitions: `(.~) :: ...`, `(.~) a b = ...` and
+    # the infix form `a .~ b = ...`. Identifier-based collision renaming
+    # cannot see them ("Multiple declarations of `.~`", 3 of 36 in the
+    # combined-mode sample).
+    _HS_OP_CHARS = r"!#$%&*+./<=>?@\\^|\-~:"
+    _HS_OP_DEF_RE = re.compile(r"^(?:\(([" + _HS_OP_CHARS + r"]+)\)\s*(?:::|[\w'\s]*=(?!=))"
+                               r"|[a-z_][\w']*\s+([" + _HS_OP_CHARS + r"]+)\s+[a-z_][\w']*\s*=(?!=))", re.M)
+    _HS_RESERVED_OPS = {"=", "|", "->", "<-", "::", "=>", "..", "@", "~", "\\", "-", "!"}
+
+    @classmethod
+    def _hs_top_operators(cls, body: str) -> set:
+        ops = set()
+        for m in cls._HS_OP_DEF_RE.finditer(body):
+            op = m.group(1) or m.group(2)
+            if op and op not in cls._HS_RESERVED_OPS and not op.startswith("--"):
+                ops.add(op)
+        return ops
+
+    @classmethod
+    def _rename_operator_collisions(cls, host_body: str, body_b: str) -> str:
+        if not host_body:
+            return body_b
+        shared = cls._hs_top_operators(host_body) & cls._hs_top_operators(body_b)
+        for op in sorted(shared, key=len, reverse=True):
+            bound = r"(?<![" + cls._HS_OP_CHARS + r"])" + re.escape(op) + r"(?![" + cls._HS_OP_CHARS + r"])"
+            k = 1
+            while True:
+                new = op + ("~" if op[-1] != "~" else "+") * k
+                if new not in host_body and new not in body_b:
+                    break
+                k += 1
+            body_b = re.sub(bound, new, body_b)
         return body_b
 
     def _uniquify_main(self, host_body: str, proc: dict) -> None:
@@ -6827,7 +7728,8 @@ class HaskellFusionStrategy(FusionStrategy):
         k = 2
         while re.search(r'\b' + re.escape(f"{name}_{k}") + r'\b', host_body):
             k += 1
-        proc['body'] = re.sub(r'\b' + re.escape(name) + r'\b', f"{name}_{k}", proc['body'])
+        proc['body'] = self._realign_layout(
+            proc['body'], re.sub(r'\b' + re.escape(name) + r'\b', f"{name}_{k}", proc['body']))
         proc['main_name'] = f"{name}_{k}"
 
     def _build_entry_action(self, name: str, had_main: bool, nullary_bindings: list) -> str:
@@ -6890,6 +7792,8 @@ class HaskellFusionStrategy(FusionStrategy):
 
         body_a = proc_a['body']
         self._uniquify_main(body_a, proc_b)
+        self._uniquify_main(proc_b['body'], proc_a)
+        body_a = proc_a['body']
         body_b = self._rename_collisions(proc_a['toplevel_names'], proc_b['body'], proc_b['toplevel_names'], uid_b,
                                          host_body=body_a)
 
@@ -6964,7 +7868,13 @@ class HaskellFusionStrategy(FusionStrategy):
             # also had; all of them are gone (see
             # FusionStrategy.rename_across).
             shared_decl = ""
+            before = (src_body, dst_body)
             src_body, dst_body = self.rename_across(src_body, dst_body)
+            if (src_body, dst_body) == before:
+                # No legal donor on either side (main-only seeds): the
+                # child is the plain combination, reported as such so the
+                # measurement does not count it as a fused program.
+                mode = mode.replace('df_', 'df_none_', 1) if mode.startswith('df_') else f"{mode}_none"
             if src_first:
                 body_a, body_b = src_body, dst_body
             else:
@@ -7063,6 +7973,8 @@ class HaskellStateFusionStrategy(HaskellFusionStrategy):
     compile-only (`ghc -fno-code`), so even a successful run here only
     exercises the type-checker, not actual execution.
     """
+    _GATE_ON_VISIBLE = False
+
 
     #: Haskell's layout-based scoping doesn't fit the live-variable model,
     #: so its splice point is a uniformly random line regardless of
@@ -7082,6 +7994,11 @@ class HaskellStateFusionStrategy(HaskellFusionStrategy):
 
         body_host = proc_host['body']
         self._uniquify_main(body_host, proc_donor)
+        # A main-less seed's synthesized `fflMain_<uid>` entry lives in
+        # the child; when that seed comes back as the *host* of a later
+        # step its entry is synthesized again under the same name.
+        self._uniquify_main(proc_donor['body'], proc_host)
+        body_host = proc_host['body']
         body_donor = self._rename_collisions(proc_host['toplevel_names'], proc_donor['body'],
                                              proc_donor['toplevel_names'], uid_donor,
                                              host_body=body_host)
@@ -7136,6 +8053,8 @@ class HaskellDeclarationFusionStrategy(HaskellFusionStrategy):
     or self-referential superclass context fails to even be accepted,
     independent of whether anything ever uses it.
     """
+    _GATE_ON_VISIBLE = False
+
 
     _HS_CLASS_HEADER_RE = re.compile(
         r'^(?P<indent>[ \t]*)class\s+'
@@ -7190,10 +8109,32 @@ class HaskellDeclarationFusionStrategy(HaskellFusionStrategy):
         Without a gate 65% of default-run iterations produced a
         `decl_none` child (the two seeds merely concatenated); with the
         class-only gate one pair in 300 was viable."""
-        a, b = parent_a.content or "", parent_b.content or ""
+        return self._direction_viable(parent_a, parent_b) or self._direction_viable(parent_b, parent_a)
+
+    # `data T = C | D ...` with no type parameter and a nullary first
+    # constructor: a value of it can be written without knowing anything
+    # else about the type.
+    _HS_NULLARY_DATA_RE = re.compile(r"^data\s+([A-Z][\w']*)\s*=\s*([A-Z][\w']*)\s*(?=\||$|deriving\b|--)", re.M)
+
+    def _value_donor_types(self, body: str):
+        return [(m.group(1), m.group(2)) for m in self._HS_NULLARY_DATA_RE.finditer(body)]
+
+    def _inject_value(self, body_host: str, type_name: str, con: str, uid: str):
+        """Third slot, for a host with neither a class nor a data type: a
+        top-level value of the donor's type, forced with `seq` so the
+        host's module type-checks against the donor's declaration. The
+        class-only gate left 3% of pairs viable (6% of seeds declare a
+        class); 11% declare a nullary-constructor data type."""
+        v = f"fflVal_{uid}"
+        lines = (f"{v} :: {type_name}  {self._tag('declaration')}\n{v} = {con}\n"
+                 f"fflUse_{uid} :: ()\nfflUse_{uid} = {v} `seq` ()\n")
+        return body_host.rstrip("\n") + "\n\n" + lines, True
+
+    def _direction_viable(self, host: Seed, donor: Seed) -> bool:
+        h, d = host.content or "", donor.content or ""
         has_class = lambda t: bool(self._HS_CLASS_HEADER_RE.search(t))
         has_slot = lambda t: has_class(t) or bool(self._HS_DATA_RE.search(t))
-        return (has_class(a) and has_slot(b)) or (has_class(b) and has_slot(a))
+        return (has_class(d) and has_slot(h)) or bool(self._value_donor_types(d))
 
     def _build_declaration_fused_test(self, host: Seed, donor: Seed, direction: str) -> Seed:
         host_code, donor_code = host.content, donor.content
@@ -7207,9 +8148,18 @@ class HaskellDeclarationFusionStrategy(HaskellFusionStrategy):
         proc_host = self._process_seed(host_code, uid_host)
         proc_donor = self._process_seed(donor_code, uid_donor)
 
-        body_donor = self._rename_collisions(proc_host['toplevel_names'], proc_donor['body'],
-                                              proc_donor['toplevel_names'], uid_donor)
         body_host = proc_host['body']
+        # The other two paths pass the host body; without it there is no
+        # verbatim-block drop and no constructor/field renaming, so a
+        # chained donor's `data Color = Red | Blue` came in a second time
+        # with only the type suffixed ("Multiple declarations of `Red`",
+        # the largest combined-mode class at 20%).
+        self._uniquify_main(body_host, proc_donor)
+        self._uniquify_main(proc_donor['body'], proc_host)
+        body_host = proc_host['body']
+        body_donor = self._rename_collisions(proc_host['toplevel_names'], proc_donor['body'],
+                                              proc_donor['toplevel_names'], uid_donor,
+                                              host_body=body_host)
 
         donor_class_names = [m.group('name') for m in self._HS_CLASS_HEADER_RE.finditer(body_donor)]
         fused_host, applied, how = body_host, False, 'none'
@@ -7224,6 +8174,12 @@ class HaskellDeclarationFusionStrategy(HaskellFusionStrategy):
             if not applied:
                 fused_host, applied = self._inject_superclass(body_host, donor_name)
                 how = 'superclass' if applied else 'none'
+        if not applied:
+            value_types = self._value_donor_types(body_donor)
+            if value_types:
+                t, con = random.choice(value_types)
+                fused_host, applied = self._inject_value(body_host, t, con, uid_donor[:8])
+                how = 'value' if applied else 'none'
 
         entry_host = self._build_entry_action(proc_host['main_name'], proc_host['had_main'],
                                                host.metadata.get('nullary_bindings', []))
@@ -7266,13 +8222,17 @@ class HaskellDeclarationFusionStrategy(HaskellFusionStrategy):
         })
 
     def fuse(self, parent_a: Seed, parent_b: Seed) -> Seed:
+        if not self._direction_viable(parent_a, parent_b) and self._direction_viable(parent_b, parent_a):
+            return self._build_declaration_fused_test(parent_b, parent_a, "ba")
         return self._build_declaration_fused_test(parent_a, parent_b, "ab")
 
     def fuse_bidirectional(self, parent_a: Seed, parent_b: Seed) -> List[Seed]:
-        return [
-            self._build_declaration_fused_test(parent_a, parent_b, "ab"),
-            self._build_declaration_fused_test(parent_b, parent_a, "ba"),
-        ]
+        out = []
+        if self._direction_viable(parent_a, parent_b):
+            out.append(self._build_declaration_fused_test(parent_a, parent_b, "ab"))
+        if self._direction_viable(parent_b, parent_a):
+            out.append(self._build_declaration_fused_test(parent_b, parent_a, "ba"))
+        return out or [self._build_declaration_fused_test(parent_a, parent_b, "ab")]
 
 
 # ==========================================
@@ -7299,6 +8259,8 @@ class ClangFusionStrategy(GenericDataflowStrategy):
       function/type def-use), with optional injection of a top-level unit
       into a compound block body.
     """
+    _BARE_IDENT_FALLBACK = True
+
 
     # Best-effort C/C++ variable-declaration type extractor — a heuristic,
     # preference. Matches `<base-type> [*...] name (=|;|,|\))`.
@@ -7339,6 +8301,20 @@ class ClangFusionStrategy(GenericDataflowStrategy):
     _CXX_ONLY_EXTS = ('.cpp', '.cc', '.cxx')
     _OBJC_ONLY_EXTS = ('.m',)
 
+    _C_ONLY_SPELLINGS = ((re.compile(r'\b_Bool\b'), 'bool'), (re.compile(r'\brestrict\b'), '__restrict'))
+
+    def _cxx_compat(self, code: str, meta_a, meta_b, seed_type: str) -> str:
+        """A C parent fused into a C++ child: the C-only spellings that
+        never compile as C++ (`_Bool`, `restrict`) are rewritten to their
+        C++ equivalents. 3% of clang's failures were these."""
+        if seed_type not in ('cpp', 'objcpp'):
+            return code
+        if not any((m or {}).get('type') in ('c', 'objc') for m in (meta_a, meta_b)):
+            return code
+        for rx, rep in self._C_ONLY_SPELLINGS:
+            code = rx.sub(rep, code)
+        return code
+
     def _result_lang(self, meta_a, meta_b, cxx_required: bool = False):
         ext_a = (meta_a.get('extension') or '').lower()
         ext_b = (meta_b.get('extension') or '').lower()
@@ -7373,7 +8349,11 @@ class ClangFusionStrategy(GenericDataflowStrategy):
     # only have removed half of the dataflow children. On for WGSL (Naga
     # sets it), where the gate turned 82% of dataflow failures into
     # state/declaration fusions.
-    _GATE_ON_VISIBLE = False
+    # On for C since 2026-09-09 17:15: with the direction rule a pair is
+    # viable when *either* side has a file-scope value; the 164 of 300
+    # pairs with none on both sides were no-edge children (`df_none`)
+    # that cost the fuzzer a compile each.
+    _GATE_ON_VISIBLE = True
     _UNGATED_SHARE = 0.1
 
     def is_viable_pair(self, parent_a: Seed, parent_b: Seed) -> bool:
@@ -7384,7 +8364,8 @@ class ClangFusionStrategy(GenericDataflowStrategy):
         except a 10% allowance for the resolver's error path."""
         if not self._GATE_ON_VISIBLE:
             return super().is_viable_pair(parent_a, parent_b)
-        if self._visible_dataflow_names(parent_a.content or ""):
+        if (self._visible_dataflow_names(parent_a.content or "")
+                or self._visible_dataflow_names(parent_b.content or "")):
             return True
         return random.random() < self._UNGATED_SHARE
 
@@ -7399,11 +8380,55 @@ class ClangFusionStrategy(GenericDataflowStrategy):
             head = line.split('//')[0]
             if '(' in head.split('=')[0]:
                 continue                      # prototype / definition
+            # `typedef long ssize_t;` names a type, `struct S { int a, b; };`
+            # on one line names members: neither is a value ("'ssize_t'
+            # undeclared", "'a' undeclared" after the rename).
+            if re.match(r'\s*(?:typedef|template|using|friend)\b', head) or '{' in head or '}' in head:
+                continue                      # `template <typename R>`: R is not a value
+            if re.match(r'\s*(?:struct|union|class|enum)\s+[A-Za-z_]\w*\s*;', head) or head.lstrip().startswith('@'):
+                continue                      # forward declaration / `@class Foo;`: a tag, not a value
             for m in self._C_LOCAL_DECL_RE.finditer(head):
                 out.add(m.group(1))
             for m in self._C_VAR_DECL_RE.finditer(head):
                 out.add(m.group(m.lastindex))
+        # File-scope enumerators are values too (`enum { A, B = 2 };`),
+        # and the C++ tests that declare no variable often declare an
+        # enum: 147 of 300 dev pairs had no donor on either side.
+        for em in self._C_FILE_ENUM_RE.finditer(code):
+            for item in (em.group(1) or em.group(2) or '').split(','):
+                name = item.split('=')[0].strip()
+                if re.fullmatch(r'[A-Za-z_]\w*', name):
+                    out.add(name)
+        # A macro that the seed `#undef`s is gone by the time B runs.
+        out -= set(re.findall(r'(?m)^\s*#\s*undef\s+([A-Za-z_]\w*)', code))
         return out - self._C_KEYWORDS
+
+    # Unscoped only: `enum class K { P }` needs `K::P`.
+    _C_FILE_ENUM_RE = re.compile(r'(?m)^(?:typedef\s+)?enum\s+(?!class\b|struct\b)(?:[A-Za-z_]\w*\s*)?(?::\s*[\w:]+\s*)?\{([^{}]*)\}()')
+
+    _TYPED_RENAME_SHARE = 0.9
+
+    def rename_across(self, code_a: str, code_b: str, names_a=None, names_b=None):
+        """Prefer a rename between two names declared with the same type
+        (`int x` for `int y`, `char *p` for `char *q`): with the rename now
+        always making a real edge, type mismatches ("invalid conversion",
+        "could not convert", "subscripted value is neither array nor
+        pointer") are the largest remaining C dataflow class. The pair is
+        drawn from A's file-scope names and B's names with a use site;
+        10% of the draws keep the untyped choice."""
+        visible = self._visible_dataflow_names(code_a)
+        if visible and random.random() < self._TYPED_RENAME_SHARE:
+            ta = self._infer_c_var_types(code_a)
+            tb = self._infer_c_var_types(code_b)
+            cand_b = [n for n in self._filter_dataflow_names(code_b, list(tb)) if n not in self._C_KEYWORDS]
+            pairs = [(a, b) for a in sorted(visible) if a in ta
+                     for b in cand_b if b != a and tb[b] == ta[a]]
+            random.shuffle(pairs)
+            for a, b in pairs[:6]:
+                renamed = self._dataflow_replace(code_b, b, a)
+                if renamed != code_b:
+                    return code_a, self._tag_renamed_lines(code_b, renamed)
+        return super().rename_across(code_a, code_b, names_a, names_b)
 
     def _filter_dataflow_names(self, code: str, names):
         """Keep only names that can be values. --pre-analysis's groups hold
@@ -7452,6 +8477,8 @@ class ClangFusionStrategy(GenericDataflowStrategy):
                 return False
             if re.match(r'\s*:\s*\d', code[m.end():m.end() + 4]):
                 return False                                  # bit-field
+            if re.match(r'\s*\(', code[m.end():m.end() + 3]):
+                return False                                  # callee position: a value cannot replace it ("implicit declaration of function", "called object is not a function")
             # `int old`, `char *old`, `struct S old`: a declaration, whose
             # rename strands every other use ("use of undeclared
             # identifier", 11% of C dataflow failures).
@@ -7935,6 +8962,7 @@ class ClangFusionStrategy(GenericDataflowStrategy):
         funcs |= set(self._C_PROTO_RE.findall(stripped)) - kw
         return types, funcs
 
+
     def _top_level_chunks(self, code: str):
         """(start, end) spans of top-level items: runs of lines that end
         at brace depth 0 with `;` or `}` (a `template<...>` line stays
@@ -8179,19 +9207,28 @@ class ClangFusionStrategy(GenericDataflowStrategy):
             fused = self._statement_fuse(code2, code1, variable2, variable1)
         elif mode == 'df_ab':
             new_code1, new_code2 = self.interleave_code_blocks(code1, code2, dataflow1, dataflow2)
-            fused = f"{new_code1}\n{new_code2}"
+            # The name source goes first (C declares before use). When the
+            # rename swapped direction (B donated into A, A changed) B is
+            # the source: emitting A first made 21 of 45 residual
+            # "was not declared in this scope" failures.
+            fused = f"{new_code2}\n{new_code1}" if new_code1 != code1 else f"{new_code1}\n{new_code2}"
+            if (new_code1, new_code2) == (code1, code2):
+                mode = 'df_none_ab'      # no edge made: the plain combination
         elif mode == 'df_ba':
             new_code2, new_code1 = self.interleave_code_blocks(code2, code1, dataflow2, dataflow1)
+            if (new_code1, new_code2) == (code1, code2):
+                mode = 'df_none_ba'
             # The renamed side (A here) now refers to B's names: in C a
             # file-scope name must be declared before use, so the name
             # source goes first — the mirror of df_ab's order.
-            fused = f"{new_code2}\n{new_code1}"
+            fused = f"{new_code2}\n{new_code1}" if new_code2 == code2 else f"{new_code1}\n{new_code2}"
         else:
             raise ValueError(f"Unknown mode: {mode}")
 
         # Prefer C++/Obj-C metadata from either parent so the driver picks
         # clang++ (and the right dialect) when either side actually needs it.
         ext, seed_type = self._result_lang(meta1, meta2)
+        fused = self._cxx_compat(fused, meta1, meta2, seed_type)
 
         return Seed(content=fused, metadata={
             "parents": [parent_a.id, parent_b.id],
@@ -8276,10 +9313,18 @@ class ClangDeclarationFusionStrategy(ClangFusionStrategy):
             if name in cls._C_KEYWORDS or name in cls._C_CONTROL_KW:
                 continue
             names[name] = names.get(name, False) or bool(m.group('template'))
+        # `template <class T, class S>` declares parameters, not types:
+        # a default template argument of `= S` or a base class `S` from
+        # there is "unknown type name 'S'".
+        tparams = set()
+        for tm in re.finditer(r'template\s*<([^>]*)>', code):
+            tparams.update(re.findall(r'\b(?:class|typename)\s+([A-Za-z_]\w*)', tm.group(1)))
         for name in cls._C_TYPE_DEF_RE.findall(code):
-            if name in cls._C_KEYWORDS or name in cls._C_CONTROL_KW:
+            if name in cls._C_KEYWORDS or name in cls._C_CONTROL_KW or name in tparams:
                 continue
             names.setdefault(name, False)
+        for tp in tparams:
+            names.pop(tp, None)
         return names
 
     @staticmethod
@@ -8320,15 +9365,52 @@ class ClangDeclarationFusionStrategy(ClangFusionStrategy):
         looks for."""
         return bool(cls._extract_type_names(code)) or bool(cls._donor_type_items(code))
 
+    _C_VAR_DONOR_RE = re.compile(r'^\s*(struct|union)\s+([A-Za-z_]\w*)\s*(?::[^{]*)?\{', re.S)
+    _C_SCALAR_MEMBER_RE = re.compile(
+        r'^[ \t]*(?:const\s+)?(?:unsigned\s+|signed\s+)?(?:int|long|short|char|float|double|bool|_Bool|size_t)'
+        r'[ \t]+([A-Za-z_]\w*)[ \t]*;', re.M)
+    _C_FUNC_BODY_STMT_RE = re.compile(r'[A-Za-z_]\w*\s*\([^;{}]*\)\s*(?:const\s*)?(?:noexcept\s*)?\{')
+
+    def _inject_variable(self, host_stmts: List[str], donor_item: str):
+        """Host without a declaration of its own: a file-scope variable of
+        the donor's struct/union and one member store in the host's first
+        function — the host now depends on the donor's type layout. The
+        donor's code is emitted first, so the type is complete there."""
+        m = self._C_VAR_DONOR_RE.match(donor_item.lstrip())
+        if not m or donor_item.lstrip().startswith('template'):
+            return host_stmts, False
+        key, name = m.group(1), m.group(2)
+        var = f"ffl_{name[:16]}"
+        mem = self._C_SCALAR_MEMBER_RE.search(donor_item)
+        use = f"{var}.{mem.group(1)} = 1;" if mem else f"(void){var};"
+        decl = f"static {key} {name} {var};  {self._tag('declaration')}"
+        result = list(host_stmts)
+        for idx, st in enumerate(result):
+            fm = self._C_FUNC_BODY_STMT_RE.search(st)
+            if not fm:
+                continue
+            head = st[:fm.start()]
+            head = head[max(head.rfind(';'), head.rfind('}')) + 1:]
+            if '=' in head or re.match(r'\s*(?:if|for|while|switch|do|else|catch)\b', head):
+                continue
+            at = fm.end()
+            result[idx] = st[:at] + f"\n    {use}" + st[at:]
+            result.insert(idx, decl)
+            return result, True
+        # No function body to use it in: the declaration alone.
+        return [decl] + result, True
+
+    def _direction_viable(self, host: Seed, donor: Seed) -> bool:
+        """The donor must offer a declaration; the host either has one
+        (base class / template argument / nesting slots) or any code at
+        all (a variable of the donor's type). The both-sides gate left
+        16–24% of pairs viable."""
+        if not self._cached_has_declaration(donor):
+            return False
+        return self._cached_has_declaration(host) or bool((host.content or "").strip())
+
     def is_viable_pair(self, parent_a: Seed, parent_b: Seed) -> bool:
-        """Declaration fusion only does something on a pair when BOTH seeds
-        can donate a declaration — fuse_bidirectional tries each seed as
-        donor in turn (ab and ba), so a seed with none is dead weight in
-        either role. Without --pre-analysis's has_declaration metadata
-        (get_strategies already disables this strategy entirely in that
-        case, so this branch shouldn't normally run), falls back to
-        scanning both seeds on the spot rather than assuming viability."""
-        return self._cached_has_declaration(parent_a) and self._cached_has_declaration(parent_b)
+        return self._direction_viable(parent_a, parent_b) or self._direction_viable(parent_b, parent_a)
 
     def _cached_has_declaration(self, seed: Seed) -> bool:
         """has_injectable_declaration(seed), memoized on the seed itself.
@@ -8435,12 +9517,24 @@ class ClangDeclarationFusionStrategy(ClangFusionStrategy):
                     applied = True
                     break
 
-        if not applied:
+        host_has_decl = self.has_injectable_declaration(host_code)
+        if not applied and host_has_decl:
             donor_items = self._donor_type_items(donor_code)
             if donor_items:
                 donor_item = random.choice(donor_items)
                 host_stmts, applied = self._nest_declaration(host_stmts, donor_item)
                 technique = 'item_nest'
+        if not applied:
+            donor_items = [it for it in self._donor_type_items(donor_code)
+                           if self._C_VAR_DONOR_RE.match(it.lstrip())]
+            if donor_items:
+                host_stmts, applied = self._inject_variable(host_stmts, random.choice(donor_items))
+                technique = 'variable' if applied else technique
+            if not applied and host_has_decl:
+                all_items = self._donor_type_items(donor_code)
+                if all_items:
+                    host_stmts, applied = self._nest_declaration(host_stmts, random.choice(all_items))
+                    technique = 'item_nest'
 
         fused_host = '\n'.join(host_stmts)
         # Donor code goes FIRST: a base-class or default-template-argument
@@ -8458,6 +9552,7 @@ class ClangDeclarationFusionStrategy(ClangFusionStrategy):
             host.metadata, donor.metadata,
             cxx_required=(technique in ('base_class', 'template_param')),
         )
+        fused = self._cxx_compat(fused, host.metadata, donor.metadata, seed_type)
 
         return Seed(content=fused, metadata={
             "parents": [host.id, donor.id],
@@ -8468,14 +9563,19 @@ class ClangDeclarationFusionStrategy(ClangFusionStrategy):
         })
 
     def fuse(self, parent_a: Seed, parent_b: Seed) -> Seed:
+        if not self._direction_viable(parent_a, parent_b) and self._direction_viable(parent_b, parent_a):
+            return self._build_declaration_fused_test(parent_b, parent_a, 'ba')
         return self._build_declaration_fused_test(parent_a, parent_b, 'ab')
 
     def fuse_bidirectional(self, parent_a: Seed, parent_b: Seed) -> List[Seed]:
-        """A hosts a declaration referring into B, and vice versa."""
-        return [
-            self._build_declaration_fused_test(parent_a, parent_b, 'ab'),
-            self._build_declaration_fused_test(parent_b, parent_a, 'ba'),
-        ]
+        """A hosts a declaration referring into B, and vice versa — for the
+        directions that have a slot."""
+        out = []
+        if self._direction_viable(parent_a, parent_b):
+            out.append(self._build_declaration_fused_test(parent_a, parent_b, 'ab'))
+        if self._direction_viable(parent_b, parent_a):
+            out.append(self._build_declaration_fused_test(parent_b, parent_a, 'ba'))
+        return out or [self._build_declaration_fused_test(parent_a, parent_b, 'ab')]
 
 
 class ClangStateFusionStrategy(ClangFusionStrategy):
@@ -8508,6 +9608,9 @@ class ClangStateFusionStrategy(ClangFusionStrategy):
         host_body, host_includes = self._extract_includes_and_body(host_code)
         donor_body, donor_includes = self._extract_includes_and_body(donor_code)
         includes = sorted({i.strip() for i in host_includes} | {i.strip() for i in donor_includes})
+        _ext, seed_type = self._result_lang(host.metadata, donor.metadata)
+        host_body = self._cxx_compat(host_body, host.metadata, donor.metadata, seed_type)
+        donor_body = self._cxx_compat(donor_body, host.metadata, donor.metadata, seed_type)
         return host_body, donor_body, includes
 
     def _state_graft_donor(self, donor_body: str, donor_point) -> str:
@@ -8540,6 +9643,24 @@ class NagaFusionStrategy(ClangFusionStrategy):
     statement splitter and dependency interleaver, but swaps in WGSL syntax
     for identifiers, declarations, bridge variables, and top-level symbols.
     """
+    def is_viable_pair(self, parent_a: Seed, parent_b: Seed) -> bool:
+        """WGSL keeps the one-sided gate: the either-side version (r08c)
+        added valid dataflow children (tint 27 -> 43, naga 27/29 -> 40/45)
+        but the swapped step inside chains cost combined -8 to -9
+        (naga 82.7/83.0 -> 74.0/74.7, tint 68.0 -> 60.0)."""
+        if not self._GATE_ON_VISIBLE:
+            return FusionStrategy.is_viable_pair(self, parent_a, parent_b)
+        if self._visible_dataflow_names(parent_a.content or ""):
+            return True
+        return random.random() < self._UNGATED_SHARE
+
+    # _FIRST_DRAW_VISIBLE_FALLBACK: measured both ways on WGSL (r08a/r08b):
+    # naga 40/49 vs 42/49, tint 21/27 vs 22/23 -- no difference, base default kept.
+    # Typed pairing (ClangFusionStrategy.rename_across) is off for WGSL:
+    # three typed-pairing variants were measured and reverted here
+    # (report 07: tint 43 -> 22, "cannot assign" doubled).
+    _TYPED_RENAME_SHARE = 0.0
+
 
     LANGUAGE = "naga"
 
@@ -8743,11 +9864,25 @@ class NagaDeclarationFusionStrategy(NagaFusionStrategy):
     def has_injectable_declaration(cls, code: str) -> bool:
         return bool(cls._extract_type_names(code) or cls._donor_type_items(code))
 
+    _WGSL_FN_RE = re.compile(r'(?m)^\s*(?:@[^\n]*\s+)*fn\s+[A-Za-z_]\w*\s*\(')
+
+    def _has_decl(self, seed: Seed) -> bool:
+        meta = seed.metadata or {}
+        if "has_declaration" in meta:
+            return bool(meta["has_declaration"])
+        return self.has_injectable_declaration(seed.content)
+
+    def _direction_viable(self, host: Seed, donor: Seed) -> bool:
+        """The donor must declare a struct/alias; the host either has one
+        (struct member slot) or any function (`fn_param`/`item_nest`
+        slots). The both-sides gate left 10–16% of pairs viable although
+        99% of seeds declare a function."""
+        if not self._has_decl(donor):
+            return False
+        return self._has_decl(host) or bool(self._WGSL_FN_RE.search(host.content or ""))
+
     def is_viable_pair(self, parent_a: Seed, parent_b: Seed) -> bool:
-        meta_a, meta_b = parent_a.metadata or {}, parent_b.metadata or {}
-        if "has_declaration" in meta_a and "has_declaration" in meta_b:
-            return bool(meta_a["has_declaration"]) and bool(meta_b["has_declaration"])
-        return self.has_injectable_declaration(parent_a.content) and self.has_injectable_declaration(parent_b.content)
+        return self._direction_viable(parent_a, parent_b) or self._direction_viable(parent_b, parent_a)
 
     @classmethod
     def _donor_type_items(cls, code: str):
@@ -8770,7 +9905,37 @@ class NagaDeclarationFusionStrategy(NagaFusionStrategy):
         _, body_end = span
         member = f"\n  ffl_decl_{random.randrange(1_000_000)} : {donor_type},"
         new_stmt = stmt[:body_end] + member + "\n" + stmt[body_end:]
+        # Remembered so the host's constructor calls of this struct can get
+        # a value for the new member ("Composing expects 3 components but
+        # 2 were given", 13 of 19 naga declaration failures).
+        self._last_member_host = (m.group('name') if 'name' in m.groupdict() else
+                                  re.search(r'struct\s+([A-Za-z_]\w*)', stmt).group(1))
         return self._tag_after(new_stmt, m.start(), "declaration"), True
+
+    @staticmethod
+    def _append_ctor_arg(text: str, struct_name: str, donor_type: str) -> str:
+        """`S(a, b)` -> `S(a, b, Donor())` for every constructor call of
+        the host struct outside its own declaration."""
+        out, i = [], 0
+        rx = re.compile(r'(?<![\w.])' + re.escape(struct_name) + r'\s*\(')
+        for m in rx.finditer(text):
+            if m.start() < i:
+                continue
+            before = text[max(0, m.start() - 8):m.start()]
+            if re.search(r'(?:struct|fn)\s*$', before):
+                continue
+            depth, j = 1, m.end()
+            while j < len(text) and depth:
+                depth += (text[j] == '(') - (text[j] == ')')
+                j += 1
+            if depth:
+                break
+            close = j - 1
+            args = text[m.end():close].strip()
+            extra = f"{donor_type}()" if not args else f", {donor_type}()"
+            out.append(text[i:close]); out.append(extra); i = close
+        out.append(text[i:])
+        return "".join(out)
 
     _WGSL_ENTRY_ATTR_RE = re.compile(r'@(?:vertex|fragment|compute)\b')
 
@@ -8789,6 +9954,10 @@ class NagaDeclarationFusionStrategy(NagaFusionStrategy):
         insert_at = m.end(2)
         prefix = ", " if params else ""
         new_stmt = stmt[:insert_at] + f"{prefix}ffl_decl_{random.randrange(1_000_000)} : {donor_type}" + stmt[insert_at:]
+        # Remembered so the host's calls of this function get an argument
+        # for the new parameter ("too few arguments in call", 5 of 10 tint
+        # declaration failures).
+        self._last_param_host = m.group(1)
         return self._tag_after(new_stmt, m.start(), "declaration"), True
 
     def _nest_declaration(self, host_stmts: List[str], donor_item: str):
@@ -8828,6 +9997,11 @@ class NagaDeclarationFusionStrategy(NagaFusionStrategy):
                 if ok:
                     host_stmts[idx] = new_stmt
                     applied = True
+                    hn = (self._last_member_host if technique == "struct_member"
+                          else getattr(self, "_last_param_host", None))
+                    if hn:
+                        host_stmts = [st if k == idx else self._append_ctor_arg(st, hn, donor_type)
+                                      for k, st in enumerate(host_stmts)]
                     break
 
         if not applied:
@@ -8846,13 +10020,17 @@ class NagaDeclarationFusionStrategy(NagaFusionStrategy):
         })
 
     def fuse(self, parent_a: Seed, parent_b: Seed) -> Seed:
+        if not self._direction_viable(parent_a, parent_b) and self._direction_viable(parent_b, parent_a):
+            return self._build_declaration_fused_test(parent_b, parent_a, "ba")
         return self._build_declaration_fused_test(parent_a, parent_b, "ab")
 
     def fuse_bidirectional(self, parent_a: Seed, parent_b: Seed) -> List[Seed]:
-        return [
-            self._build_declaration_fused_test(parent_a, parent_b, "ab"),
-            self._build_declaration_fused_test(parent_b, parent_a, "ba"),
-        ]
+        out = []
+        if self._direction_viable(parent_a, parent_b):
+            out.append(self._build_declaration_fused_test(parent_a, parent_b, "ab"))
+        if self._direction_viable(parent_b, parent_a):
+            out.append(self._build_declaration_fused_test(parent_b, parent_a, "ba"))
+        return out or [self._build_declaration_fused_test(parent_a, parent_b, "ab")]
 
 
 # ==========================================
@@ -9452,8 +10630,28 @@ class FlangFusionStrategy(GenericDataflowStrategy):
         Fortran folds case, so a name declared `Count` is the same entity
         as `COUNT` two lines down, and a case-sensitive scan would miss
         most of its uses."""
+        def _is_use(m):
+            ls = code.rfind('\n', 0, m.start()) + 1
+            line = code[ls:code.find('\n', m.start()) if code.find('\n', m.start()) != -1 else len(code)]
+            st = line.strip()
+            if not st or st.startswith('!') or st.startswith('#'):
+                return False              # comment, directive, preprocessor
+            if '!' in code[ls:m.start()]:
+                return False              # inside a trailing comment
+            first = re.split(r'[^A-Za-z]', st, 1)[0].lower()
+            # A declaration (`integer i, j, k`, `real(real64) :: x`) is
+            # not a use: renaming it leaves every use undeclared
+            # ("Variable 'k' is not declared"). Nor is a unit header:
+            # `subroutine X1(n)` renamed its dummy argument and left the
+            # body's declaration behind ("No explicit type declared for
+            # 'n'", 8% of flang's real-edge dataflow failures).
+            if re.match(r'(?:(?:pure|elemental|recursive|impure|module)\s+)*(?:subroutine|function|program|entry|end)\b', st, re.I):
+                return False
+            if re.match(r'(?:integer|real|logical|character|complex|type\s*\(|class\s*\(|double)[^\n]*\bfunction\b', st, re.I):
+                return False                  # typed function header
+            return first not in self._DECL_FIRST
         matches = [m for m in re.finditer(
-            rf'(?<!\w){re.escape(old)}(?!\w)', code, re.IGNORECASE)]
+            rf'(?<!\w){re.escape(old)}(?!\w)', code, re.IGNORECASE) if _is_use(m)]
         if not matches:
             return code
         m = random.choice(matches)
@@ -9508,6 +10706,18 @@ class FlangFusionStrategy(GenericDataflowStrategy):
 
         var_a = random.choice(sorted(decls_a))
         var_b = random.choice(declared_b)
+        # Same declared type when one exists (`integer :: n` for
+        # `integer :: k`): "No intrinsic or user-defined ASSIGNMENT(=)
+        # matches operand types" and "Actual argument has bad type" were
+        # 19 of 146 real-edge flang dataflow failures. 10% untyped.
+        decls_b = self._intrinsic_decls('\n'.join(unit["decls"]))
+        def _ty(d):
+            return re.sub(r'\s+', '', d.split('::')[0].strip().lower())
+        if random.random() < 0.9:
+            pairs = [(a, b) for a in sorted(decls_a) for b in declared_b
+                     if a.upper() != b.upper() and b in decls_b and _ty(decls_a[a]) == _ty(decls_b[b])]
+            if pairs:
+                var_a, var_b = random.choice(pairs)
         if var_a.upper() == var_b.upper():
             return code_a, code_b
 
@@ -9520,6 +10730,14 @@ class FlangFusionStrategy(GenericDataflowStrategy):
         new_decls = list(unit["decls"])
         if var_a.upper() not in {n.upper() for n in declared_b}:
             new_decls.append(decls_a[var_a])
+            # A's declaration may name a kind from an intrinsic module
+            # (`real(real64)`, `integer(c_int)`): the copy needs that
+            # module too ("Variable 'real64' is not declared", 15% of
+            # lfortran's dataflow failures). `use` precedes `implicit`.
+            for kind in re.findall(r'\(\s*(?:kind\s*=\s*)?([A-Za-z_]\w*)\s*\)', decls_a[var_a]):
+                mod = self._KIND_MODULES.get(kind.lower())
+                if mod and not re.search(r'(?im)^\s*use\b.*\b' + re.escape(mod) + r'\b', '\n'.join(new_decls)):
+                    new_decls.insert(0, f"  use, intrinsic :: {mod}, only: {kind}")
 
         parts = ([unit["header"]] + new_decls + renamed.split('\n')
                  + unit["tail"] + [unit["footer"]])
@@ -9543,6 +10761,11 @@ class FlangFusionStrategy(GenericDataflowStrategy):
     # Splitting both sides into units lets the donor's main program be
     # demoted to an ordinary SUBROUTINE and every module be hoisted, which
     # is what makes a fused Fortran file compile at all.
+
+    _KIND_MODULES = {k: 'iso_fortran_env' for k in ('int8', 'int16', 'int32', 'int64', 'real32', 'real64', 'real128')}
+    _KIND_MODULES.update({k: 'iso_c_binding' for k in (
+        'c_int', 'c_short', 'c_long', 'c_long_long', 'c_size_t', 'c_int8_t', 'c_int16_t', 'c_int32_t', 'c_int64_t',
+        'c_float', 'c_double', 'c_long_double', 'c_bool', 'c_char', 'c_ptr', 'c_funptr')})
 
     _MODULE_HEAD_RE = re.compile(r'^(module|submodule)\b', re.IGNORECASE)
     _PROGRAM_HEAD_RE = re.compile(r'^program\b', re.IGNORECASE)
@@ -9919,15 +11142,40 @@ class FlangFusionStrategy(GenericDataflowStrategy):
                 names.add(m.group(1).upper())
         return names
 
+    _FORTRAN_TAG_RE = re.compile(r'[ \t]*!\s*\w+ fusion[ \t]*$', re.M)
+
+    def _drop_verbatim_units(self, code_a: str, code_b: str) -> str:
+        """Chained fusion: a donor program unit the host already holds
+        verbatim (tags stripped, case and blank lines ignored) is dropped
+        — "Module X appears multiple times in a compilation unit", "X is
+        already declared in this scoping unit"."""
+        units, ok = self._split_top_level(code_b)
+        if not ok or len(units) < 1:
+            return code_b
+        norm = lambda t: re.sub(r'\s+', ' ', self._FORTRAN_TAG_RE.sub('', t)).strip().lower()
+        host = norm(code_a)
+        kept = [t for k, t in units if not (len(t) >= 40 and norm(t) in host)]
+        if len(kept) == len(units):
+            return code_b
+        return '\n'.join(kept)
+
     def _resolve_name_conflicts(self, code_a: str, code_b: str) -> str:
+        code_b = self._drop_verbatim_units(code_a, code_b)
         conflicts = self._extract_top_level_names(code_a) & self._extract_top_level_names(code_b)
         if not conflicts:
             return code_b
         result = code_b
+        low = code_a.lower()
         for name in sorted(conflicts, key=len, reverse=True):
+            # The suffix must be new in the host: a chained fusion has the
+            # first round's `name_ffl` there already.
+            new_name, k = name + '_ffl', 2
+            while re.search(r'(?<!\w)' + re.escape(new_name.lower()) + r'(?!\w)', low):
+                new_name = f"{name}_ffl{k}"
+                k += 1
             result = re.sub(
                 rf'(?<!\w)\b{re.escape(name)}\b(?!\w)',
-                name + '_ffl',
+                new_name,
                 result,
                 flags=re.IGNORECASE,
             )
@@ -10202,6 +11450,15 @@ class FlangDeclarationFusionStrategy(FlangFusionStrategy):
                    and not re.search(r'(?i)extends\s*\(', m.group('attrs') or "")]
         if not matches:
             return code, False
+        # A component name shared with the donor's type is "Component X is
+        # already declared in a parent of this derived type" (10 of 60
+        # chained declaration failures on flang): prefer hosts without one.
+        donor_comps = {c.lower() for c in re.findall(r'(?im)::\s*([A-Za-z_]\w*)', donor_block or "")}
+        if donor_comps:
+            clean = [m for m in matches
+                     if not (donor_comps & {c.lower() for c in re.findall(r'(?im)::\s*([A-Za-z_]\w*)', self._type_block(code, m))})]
+            if clean:
+                matches = clean
         m = random.choice(matches)
         if m.group('attrs'):
             new_code = code[:m.end('attrs')] + f", extends({donor_name})" + code[m.end('attrs'):]
@@ -10243,13 +11500,108 @@ class FlangDeclarationFusionStrategy(FlangFusionStrategy):
         return [(m, self._type_block(code, m)) for m in self._FORTRAN_TYPE_HEADER_RE.finditer(code)
                 if self._extensible(m.group('attrs'), self._type_block(code, m))]
 
+    _FORTRAN_UNIT_HEADER_RE = re.compile(
+        r'(?im)^[ \t]*(?:(?:recursive|pure|elemental|impure|module)\s+)*'
+        r'(?:program|subroutine|module(?!\s+procedure)|(?:[\w()=,* ]+\s+)?function)\s+[A-Za-z_]\w*[^\n]*$')
+    _FORTRAN_IMPLICIT_NONE_RE = re.compile(r'(?im)^[ \t]*implicit\s+none\b[^\n]*$')
+    _FORTRAN_UNIT_END_RE = re.compile(r'(?im)^[ \t]*(?:contains\b|end\s*(?:program|subroutine|function|module)\b)[^\n]*$')
+    _FORTRAN_COMPONENT_RE = re.compile(
+        r'(?im)^[ \t]*(integer|real|double\s+precision|logical|character)\b'
+        r'(?P<spec>[^:!\n]*)::[ \t]*(?P<name>[A-Za-z_]\w*)[ \t]*(?:[!\n]|$)')
+    _FIXED_FORM_EXTS = ('.f', '.for', '.ftn', '.fpp')
+
+    @staticmethod
+    def _free_form(seed: Seed) -> bool:
+        ext = str((seed.metadata or {}).get('extension', '.f90')).lower()
+        return ext not in FlangDeclarationFusionStrategy._FIXED_FORM_EXTS
+
     def is_viable_pair(self, parent_a: Seed, parent_b: Seed) -> bool:
-        """Both seeds must declare an extensible derived type: one to
-        extend from, one to receive `extends(...)`. Without this gate 48%
-        of LFortran's default-run iterations were `decl_none`
-        concatenations."""
-        return bool(self._extensible_types(parent_a.content or "")
-                    and self._extensible_types(parent_b.content or ""))
+        """One side must declare an extensible derived type (the donor);
+        the other either has one too (it receives `extends(...)`) or is a
+        free-form unit that can take the donor's type as a new component
+        declaration. The extends-only gate left 2–5% of pairs viable
+        (27% of seeds declare a type, so both-sides is 7%); without any
+        gate 48% of LFortran's iterations were `decl_none` concatenations."""
+        a, b = parent_a.content or "", parent_b.content or ""
+        ta, tb = bool(self._extensible_types(a)), bool(self._extensible_types(b))
+        if ta and tb:
+            return True
+        return ((tb and self._free_form(parent_a) and bool(self._FORTRAN_UNIT_HEADER_RE.search(a)))
+                or (ta and self._free_form(parent_b) and bool(self._FORTRAN_UNIT_HEADER_RE.search(b))))
+
+    _FORTRAN_TYPE_CONTAINS_RE = re.compile(r'(?is)^[ \t]*contains\b.*?(?=^[ \t]*end\s*type\b)', re.M)
+
+    def _component_candidate(self, block: str):
+        """The donor type as it can stand alone in the host: no `extends`,
+        `abstract` or type parameters in the header, no component of
+        another derived type or of a named kind, no bindings (`contains`
+        part dropped: the procedures are not copied). None when the type
+        cannot be made self-contained — the largest component-mode
+        failure classes were exactly these ("Derived type not found",
+        "binding must be an accessible module procedure", "ABSTRACT
+        derived type may not be used here", "No explicit type declared")."""
+        head, _, rest = block.partition('\n')
+        if re.search(r'(?i)\b(?:abstract|extends\s*\(|bind\s*\()', head) or re.search(r'::\s*\w+\s*\(', head):
+            return None
+        body = self._FORTRAN_TYPE_CONTAINS_RE.sub('', rest)
+        lines = [ln for ln in body.splitlines()
+                 if not re.match(r'(?i)^[ \t]*(?:private|public|sequence)\s*(?:!.*)?$', ln)]
+        comps = [ln for ln in lines if not re.match(r'(?i)^[ \t]*end\s*type\b', ln) and ln.strip() and not ln.strip().startswith('!')]
+        if not comps:
+            return None
+        for ln in comps:
+            if re.search(r'(?i)\b(?:type|class|procedure)\s*\(', ln):
+                return None
+            spec = ln.split('::')[0] if '::' in ln else ln
+            # `integer(kind=k)`, `real(dp)`: a named kind lives elsewhere
+            for km in re.finditer(r'\(([^()]*)\)', spec):
+                inner = km.group(1)
+                if re.search(r'(?i)(?:kind|len)\s*=\s*[A-Za-z_]', inner) or re.fullmatch(r'\s*[A-Za-z_]\w*\s*', inner):
+                    return None
+        return head + '\n' + '\n'.join(lines)
+
+    def _inject_component(self, code: str, uname: str, dblock: str):
+        """Host without a derived type: copy the donor's type into the
+        host's first unit's specification part, declare a variable of it,
+        and assign one scalar intrinsic component before the unit ends."""
+        h = self._FORTRAN_UNIT_HEADER_RE.search(code)
+        if not h:
+            return code, False
+        # Insertion point: after `implicit none` of that unit when present,
+        # else right after the unit header (and its `use` lines).
+        unit_end = self._FORTRAN_UNIT_END_RE.search(code, h.end())
+        end_pos = unit_end.start() if unit_end else len(code)
+        imp = self._FORTRAN_IMPLICIT_NONE_RE.search(code, h.end(), end_pos)
+        if imp:
+            at = imp.end()
+        else:
+            at = h.end()
+            for um in re.finditer(r'(?im)^[ \t]*use\b[^\n]*$', code[at:end_pos]):
+                at = at + um.end()
+        line_start = code.rfind('\n', 0, h.start()) + 1
+        indent = re.match(r'[ \t]*', code[line_start:h.end()]).group(0) + "  "
+        var = f"ffl_{uname[:12]}"
+        block = "\n".join(indent + ln.strip() for ln in dblock.strip().splitlines())
+        decl = f"\n{block}\n{indent}type({uname}) :: {var}"
+        # One executable use, before `contains`/`end <unit>`.
+        use_stmt = ""
+        cm = next((m for m in self._FORTRAN_COMPONENT_RE.finditer(dblock)
+                   if not re.search(r'(?i)allocatable|pointer|dimension|\(', m.group('spec'))), None)
+        if cm:
+            kind = cm.group(1).lower()
+            lit = {"integer": "1", "logical": ".true.", "character": "'x'"}.get(kind, "1.0")
+            use_stmt = f"{indent}{var}%{cm.group('name')} = {lit}\n"
+        new_code = code[:at] + decl + code[at:]
+        # A module's specification part cannot hold an executable
+        # statement ("expected declaration construct"): declaration only.
+        if use_stmt and re.match(r'(?i)\s*module\b', code[line_start:h.end()]):
+            use_stmt = ""
+        if use_stmt:
+            ue = self._FORTRAN_UNIT_END_RE.search(new_code, h.end())
+            if ue:
+                ls = new_code.rfind('\n', 0, ue.start()) + 1
+                new_code = new_code[:ls] + use_stmt + new_code[ls:]
+        return self._tag_after(new_code, at + 1, 'declaration'), True
 
     def _build_declaration_fused_test(self, host: Seed, donor: Seed, direction: str) -> Seed:
         host_code, donor_code = host.content, donor.content
@@ -10259,14 +11611,30 @@ class FlangDeclarationFusionStrategy(FlangFusionStrategy):
         donor_code = self._resolve_name_conflicts(host_code, donor_code)
 
         donor_types = self._extensible_types(donor_code)
-        fused_host, applied = host_code, False
+        fused_host, applied, mode = host_code, False, 'none'
         if donor_types:
             dm, dblock = random.choice(donor_types)
             dname = dm.group('name')
             uname = self._unique_type_name(host_code, dname)
             if uname != dname:
                 dblock = re.sub(r'(?i)(?<![\w%])' + re.escape(dname) + r'\b', uname, dblock)
-            fused_host, applied = self._inject_extends(host_code, uname, dblock)
+            if self._extensible_types(host_code) and random.random() < 0.8:
+                fused_host, applied = self._inject_extends(host_code, uname, dblock)
+                mode = 'extends'
+            if not applied and self._free_form(host):
+                # Prefer a donor type that can stand alone in the host.
+                cands = []
+                for cm_, cb in donor_types:
+                    cn = cm_.group('name'); cu = self._unique_type_name(host_code, cn)
+                    if cu != cn:
+                        cb = re.sub(r'(?i)(?<![\w%])' + re.escape(cn) + r'\b', cu, cb)
+                    cleaned = self._component_candidate(cb)
+                    if cleaned:
+                        cands.append((cu, cleaned))
+                if cands:
+                    uname, dblock = random.choice(cands)
+                fused_host, applied = self._inject_component(host_code, uname, dblock)
+                mode = 'component' if applied else 'none'
 
         fused = self._concat_units(donor_code, fused_host)
 
@@ -10277,18 +11645,33 @@ class FlangDeclarationFusionStrategy(FlangFusionStrategy):
             "parents": [host.id, donor.id],
             "type": seed_type,
             "extension": ext,
-            "mode": f"decl_{'extends' if applied else 'none'}_{direction}",
+            "mode": f"decl_{mode}_{direction}",
             "description": f"Declaration-fused {host.id} <- {donor.id} ({direction})",
         })
 
+    def _direction_viable(self, host: Seed, donor: Seed) -> bool:
+        """The donor must offer an extensible type; the host either has
+        one (extends) or is a free-form unit (component injection)."""
+        h, d = host.content or "", donor.content or ""
+        if not self._extensible_types(d):
+            return False
+        return bool(self._extensible_types(h)) or (
+            self._free_form(host) and bool(self._FORTRAN_UNIT_HEADER_RE.search(h)))
+
     def fuse(self, parent_a: Seed, parent_b: Seed) -> Seed:
+        if not self._direction_viable(parent_a, parent_b) and self._direction_viable(parent_b, parent_a):
+            return self._build_declaration_fused_test(parent_b, parent_a, "ba")
         return self._build_declaration_fused_test(parent_a, parent_b, "ab")
 
     def fuse_bidirectional(self, parent_a: Seed, parent_b: Seed) -> List[Seed]:
-        return [
-            self._build_declaration_fused_test(parent_a, parent_b, "ab"),
-            self._build_declaration_fused_test(parent_b, parent_a, "ba"),
-        ]
+        # Only the directions that can inject: the other one produced a
+        # `decl_none` concatenation (41–48 of 300 pairs on the dev sample).
+        out = []
+        if self._direction_viable(parent_a, parent_b):
+            out.append(self._build_declaration_fused_test(parent_a, parent_b, "ab"))
+        if self._direction_viable(parent_b, parent_a):
+            out.append(self._build_declaration_fused_test(parent_b, parent_a, "ba"))
+        return out or [self._build_declaration_fused_test(parent_a, parent_b, "ab")]
 
 
 class LFortranFusionStrategy(FlangFusionStrategy):
@@ -10541,6 +11924,8 @@ class GoFusionStrategy(GenericDataflowStrategy):
     blocks, which fails in the parser before any of the compiler this
     fuzzer is aiming at ever runs.
     """
+    _BARE_IDENT_FALLBACK = True
+
 
     LANGUAGE = "go"
 
@@ -10592,6 +11977,8 @@ class GoFusionStrategy(GenericDataflowStrategy):
                 return False
             if re.match(r'\s*\(', after) and re.search(r'\bfunc\s*$', before):
                 return False
+            if re.match(r'\s*\(', after):
+                return False              # callee position: a value cannot replace it ("cannot call non-function")
             return True
         uses = [mm for mm in re.finditer(r'(?<![\w])' + re.escape(old) + r'(?![\w])', code) if _is_use(mm)]
         if not uses:
@@ -10635,11 +12022,102 @@ class GoFusionStrategy(GenericDataflowStrategy):
 
     # `var` only: a renamed use may sit on the left of `=`, and assigning
     # to a package `const` is an error every time.
-    _GO_PKG_VAR_RE = re.compile(r'^var\s+([A-Za-z_]\w*)', re.M)
-    _GO_PKG_GROUP_RE = re.compile(r'^var\s*\((.*?)^\)', re.M | re.S)
+    # Package-level `var` and `const`: both are values another function
+    # can refer to (the test corpus declares far more consts than vars;
+    # with vars alone 226 of 300 dev pairs had no donor).
+    _GO_PKG_VAR_RE = re.compile(r'^(?:var|const)\s+([A-Za-z_]\w*)', re.M)
+    _GO_PKG_GROUP_RE = re.compile(r'^(?:var|const)\s*\((.*?)^\)', re.M | re.S)
+
+    _GO_TYPE_PARAM_RE = re.compile(r'(?:type|func)\s+\w+\s*\[([^\]\n]*)\]')
+
+    def _filter_dataflow_names(self, code: str, names):
+        """Drop names that are not values in scope anywhere: a name only
+        ever seen as a selector member (`fmt.Println`, `x.doSomething`),
+        a generic type parameter (`type Bar[A1, A2 any]`), and Go's
+        predeclared identifiers. "undefined: X" was 57 of 151 dataflow
+        failures on the dev sample; 17 of those were these."""
+        tparams = set()
+        for m in self._GO_TYPE_PARAM_RE.finditer(code):
+            for part in m.group(1).split(','):
+                tok = part.strip().split()
+                if tok:
+                    tparams.add(tok[0])
+        out = []
+        for n in names:
+            if n in tparams or n in self._GO_PREDECLARED:
+                continue
+            bare = re.search(r'(?<![\w.])' + re.escape(n) + r'(?![\w])', code)
+            if not bare:
+                continue        # selector member only
+            out.append(n)
+        return out
+
+    _GO_PREDECLARED = frozenset({
+        "append", "cap", "close", "complex", "copy", "delete", "imag", "len", "make",
+        "new", "panic", "print", "println", "real", "recover", "clear", "min", "max",
+        "true", "false", "nil", "iota", "error", "any", "comparable",
+    })
+
+    # Kind of a package-level value: its explicit type (`var x int`,
+    # `const c uint8 = 1`) or the literal kind of its initializer.
+    _GO_VALUE_RE = re.compile(r'(?m)^(?:var|const)\s+([A-Za-z_]\w*)(?:\s+([A-Za-z_][\w.\[\]*]*))?\s*(?:=\s*([^\n]+?))?\s*$')
+    _TYPED_RENAME_SHARE = 0.9
+
+    @classmethod
+    def _go_value_kinds(cls, code: str) -> dict:
+        kinds = {}
+        specs = [(m.group(1), m.group(2), (m.group(3) or '').strip()) for m in cls._GO_VALUE_RE.finditer(code)]
+        # Grouped blocks: each `name [type] [= init]` line inside `var (` / `const (`.
+        for grp in cls._GO_PKG_GROUP_RE.findall(code):
+            for line in grp.splitlines():
+                mm = re.match(r'\s*([A-Za-z_]\w*)(?:\s+([A-Za-z_][\w.\[\]*]*))?\s*(?:=\s*([^\n]+?))?\s*(?://.*)?$', line)
+                if mm and mm.group(1) and not line.strip().startswith('//') and (mm.group(2) or mm.group(3)):
+                    specs.append((mm.group(1), mm.group(2), (mm.group(3) or '').strip()))
+        for name, typ, init in specs:
+            if typ:
+                kinds[name] = typ
+            elif re.match(r'^-?\d+$', init):
+                kinds[name] = 'int'
+            elif re.match(r'^-?\d+\.\d+', init):
+                kinds[name] = 'float64'
+            elif init.startswith('"') or init.startswith('`'):
+                kinds[name] = 'string'
+            elif init in ('true', 'false'):
+                kinds[name] = 'bool'
+            elif re.match(r'^\[\]?\w+\{', init):
+                kinds[name] = init.split('{', 1)[0]
+        return kinds
+
+    def rename_across(self, code_a: str, code_b: str, names_a=None, names_b=None):
+        """Prefer a rename between package-level values of the same kind
+        (explicit type or literal): after the direction rule, Go's real
+        edges fail mostly on one-off type mismatches (`cannot use Cf2
+        (untyped float constant) as string value`). 10% untyped."""
+        ka, kb = self._go_value_kinds(code_a), self._go_value_kinds(code_b)
+        if ka and kb and random.random() < self._TYPED_RENAME_SHARE:
+            pairs = [(a, b) for a in ka for b in kb if a != b and ka[a] == kb[b]]
+            random.shuffle(pairs)
+            for a, b in pairs[:6]:
+                renamed = self._dataflow_replace(code_b, b, a)
+                if renamed != code_b:
+                    return code_a, self._tag_renamed_lines(code_b, renamed)
+        return super().rename_across(code_a, code_b, names_a, names_b)
+
+    _GATE_ON_VISIBLE = True
+    _UNGATED_SHARE = 0.1
+
+    def is_viable_pair(self, parent_a: Seed, parent_b: Seed) -> bool:
+        """A rename needs a package-level value on one side (199 of 300
+        dev pairs had none and produced no edge); 10% ungated."""
+        if not self._GATE_ON_VISIBLE:
+            return super().is_viable_pair(parent_a, parent_b)
+        if (self._visible_dataflow_names(parent_a.content or "")
+                or self._visible_dataflow_names(parent_b.content or "")):
+            return True
+        return random.random() < self._UNGATED_SHARE
 
     def _visible_dataflow_names(self, code: str):
-        """Package-level `var` names, grouped blocks included."""
+        """Package-level `var`/`const` names, grouped blocks included."""
         out = set(self._GO_PKG_VAR_RE.findall(code))
         for grp in self._GO_PKG_GROUP_RE.findall(code):
             for line in grp.splitlines():
@@ -10698,10 +12176,12 @@ class GoFusionStrategy(GenericDataflowStrategy):
         pkg_a, imports_a, body_a = split_go_file(code_a)
         pkg_b, imports_b, body_b = split_go_file(code_b)
 
+        before = (body_a, body_b)
         body_a, body_b = self.interleave_code_blocks(
             body_a, body_b,
             (parent_a.metadata or {}).get("dataflows"),
             (parent_b.metadata or {}).get("dataflows"))
+        df_mode = 'df_none_ab' if (body_a, body_b) == before else 'df_ab'
 
         # After the dataflow rename, never before. A package-scope `var` is
         # in both sets — the names this dedupes and the names the rename
@@ -10724,6 +12204,7 @@ class GoFusionStrategy(GenericDataflowStrategy):
             "extension": ".go",
             "is_main": package == "main",
             "renamed": sorted(collisions),
+            "mode": df_mode,
             "description": f"Fused {parent_a.id} + {parent_b.id}",
         })
 
@@ -10739,6 +12220,8 @@ class GoStateFusionStrategy(GoFusionStrategy):
     or the interleave drops an `import` block into the middle of a
     function body.
     """
+    _GATE_ON_VISIBLE = False
+
 
     def _state_prepare(self, host: Seed, donor: Seed):
         pkg_h, imports_h, body_h = split_go_file(host.content)
@@ -10779,6 +12262,8 @@ class GoDeclarationFusionStrategy(GoFusionStrategy):
     an unrelated function's signature is a cheap way into paths that a
     single seed rarely reaches.
     """
+    _GATE_ON_VISIBLE = False
+
 
     # `type X struct {...}` / `type X interface {...}` / `type X = Y`,
     # captured whole so the injection carries the body with it.
@@ -11266,6 +12751,2187 @@ class V8DeclarationFusionStrategy(V8FusionStrategy):
         return Seed(content=content, metadata=meta)
 
 
+# ==========================================
+# Ruby Specific Fusion Strategy
+# ==========================================
+
+class RubyFusionStrategy(FusionStrategy):
+    """Ruby (projects/ruby). Seeds are *executed*, so "valid" means the
+    fused script ran to completion (projects/ruby/config.yaml).
+
+    Scoping decides what a rename can reach. A top-level local is visible
+    to the top-level code and blocks that follow it, but not inside a
+    `def`; constants, classes, top-level `def`s and `$globals` are visible
+    everywhere. So A donates its column-0 assignments, constants,
+    classes/modules, `def`s and globals; B's targets are the locals it
+    assigns and the bare names it reads. A B use inside a `def` renamed to
+    one of A's locals becomes a method call there — NameError, one of the
+    error paths kept on purpose.
+
+    Kinded draw (85%): a name B *calls* is replaced by one of A's `def`s,
+    a constant by one of A's constants/classes, a value by one of A's
+    top-level locals or globals. Ruby's own rule makes the value case the
+    real edge: a bare name that was assigned earlier in the same scope is
+    a local, so B's reads of A's top-level local read A's value.
+    """
+
+    LANGUAGE = "ruby"
+
+    _DATAFLOW_KEYWORDS = frozenset({
+        "BEGIN", "END", "alias", "and", "begin", "break", "case", "class",
+        "def", "defined?", "do", "else", "elsif", "end", "ensure", "false",
+        "for", "if", "in", "module", "next", "nil", "not", "or", "redo",
+        "rescue", "retry", "return", "self", "super", "then", "true",
+        "undef", "unless", "until", "when", "while", "yield", "__method__",
+        "__FILE__", "__LINE__", "__dir__", "lambda", "proc", "loop", "puts",
+        "print", "p", "pp", "require", "require_relative", "raise", "new",
+        "attr_accessor", "attr_reader", "attr_writer", "include", "extend",
+        "prepend", "private", "public", "protected", "module_function",
+        "each", "map", "call", "to_s", "to_a", "to_i", "inspect", "size",
+        "length", "freeze", "dup", "clone", "class", "send", "block_given?",
+        "catch", "throw", "format", "sprintf", "Integer", "Float", "String",
+        "Array", "Hash", "Object", "Kernel", "Comparable", "Enumerable",
+        "Struct", "Proc", "Symbol", "Range", "Regexp", "Exception",
+        "StandardError", "RuntimeError", "ArgumentError", "TypeError",
+        "NameError", "NoMethodError", "GC", "ObjectSpace", "Marshal",
+        "RubyVM", "Module", "Class", "BasicObject", "Method", "Encoding",
+        "Time", "Math", "Rational", "Complex", "IO", "File", "Data",
+    })
+
+    _RB_ASSIGN_OP = r'\s*(?:\|\||&&|\*\*|<<|>>|[-+*/%|&^])?=(?![=~>])'
+    _RB_TOP_LOCAL_RE = re.compile(r'^([a-z_]\w*)' + _RB_ASSIGN_OP, re.M)
+    _RB_ANY_LOCAL_RE = re.compile(r'^\s*([a-z_]\w*)' + _RB_ASSIGN_OP, re.M)
+    _RB_MULTI_ASSIGN_RE = re.compile(r'^\s*([a-z_]\w*(?:\s*,\s*\*?[a-z_]\w*)+)\s*=(?![=~>])', re.M)
+    _RB_BLOCK_PARAM_RE = re.compile(r'(?:\bdo|\{)\s*\|([^|\n]*)\|')
+    _RB_CONST_RE = re.compile(r'^([A-Z]\w*)\s*=(?![=~>])', re.M)
+    # A method name may start with an uppercase letter — unusual, but
+    # this corpus leans on it (`def S(*args)` as a constructor helper is
+    # in every String test). Requiring lowercase left A with no callable
+    # pool at all for those seeds, which was the largest single cause of
+    # a pair getting no dataflow edge.
+    _RB_DEF_RE = re.compile(r'^def\s+(?:self\.)?([A-Za-z_]\w*[?!]?)', re.M)
+    _RB_CLASS_RE = re.compile(r'^(?:class|module)\s+([A-Z]\w*)', re.M)
+    _RB_GVAR_RE = re.compile(r'(\$[a-z_]\w*)\s*=(?![=~>])')
+    _RB_IVAR_ASSIGN_RE = re.compile(r'^\s*(@[a-z_]\w*)' + _RB_ASSIGN_OP, re.M)
+    _RB_TOP_IVAR_RE = re.compile(r'^(@[a-z_]\w*)' + _RB_ASSIGN_OP, re.M)
+    _RB_CALL_RE = re.compile(r'(?<![\w.:@$])([A-Za-z_]\w*[?!]?)\s*\(([^()\n]*)\)')
+    # A command call: `assert_equal 3, 15 / 5`, `p x` -- a bare name at
+    # statement start followed by an argument (not an operator, block
+    # or assignment).
+    _RB_CMD_CALL_RE = re.compile(r'^\s*([a-z_]\w*[?!]?)[ \t]+(?![-+*/%|&<>!?:.=]|do\b|\{|if\b|unless\b|while\b|until\b|rescue\b|and\b|or\b)([^\n]*\S)', re.M)
+    _RB_DEF_SIG_RE = re.compile(r'^def\s+(?:self\.)?([A-Za-z_]\w*[?!]?)\s*(?:\(([^)]*)\))?', re.M)
+    _RB_PREAMBLE_RE = re.compile(
+        r'^(?:require(?:_relative)?\s+[\'"][^\'"\n]+[\'"]\s*'
+        r'|#\s*(?:frozen_string_literal|coding|encoding|-\*-)[^\n]*)$')
+    _RB_MAGIC_RE = re.compile(r'^#\s*(?:frozen_string_literal|coding|encoding|-\*-)')
+    _KIND_AWARE_SHARE = 0.85
+    _UNGATED_SHARE = 0.1
+
+    def __init__(self, project_root="projects/ruby", lightweight: bool = False):
+        self.project_root = project_root
+        self.mutation = True
+        self.mut = BaseMutator()
+        self.lightweight = lightweight
+
+    # ── preamble ─────────────────────────────────────────────────────
+
+    def _split_preamble(self, code):
+        """(body, preamble_lines): `require`s and magic comments go to the
+        top of the fused file; a magic comment only works on line 1."""
+        pre, body = [], []
+        # The byte-order mark is legal only at the very start of a file;
+        # concatenating two seeds that carry one puts it mid-file, where
+        # Ruby reports it as an unexpected character.
+        for line in code.replace("\ufeff", "").splitlines():
+            if self._RB_PREAMBLE_RE.match(line.strip()) and line.strip():
+                pre.append(line.strip())
+            else:
+                body.append(line)
+        return "\n".join(body), pre
+
+    def _merge_preambles(self, *pres):
+        magic, reqs = [], []
+        for pre in pres:
+            for line in pre:
+                if self._RB_MAGIC_RE.match(line):
+                    # One frozen_string_literal directive; the first wins.
+                    key = line.split(":")[0]
+                    if not any(m.split(":")[0] == key for m in magic):
+                        magic.append(line)
+                elif line not in reqs:
+                    reqs.append(line)
+        return magic + reqs
+
+    # ── dataflow hooks ───────────────────────────────────────────────
+
+    def _dataflow_names(self, code: str) -> List[str]:
+        code = self._strip_comments(code)
+        names = []
+        names += self._RB_ANY_LOCAL_RE.findall(code)
+        for grp in self._RB_MULTI_ASSIGN_RE.findall(code):
+            names += re.findall(r'[a-z_]\w*', grp)
+        for grp in self._RB_BLOCK_PARAM_RE.findall(code):
+            names += re.findall(r'(?<![\w=])[a-z_]\w*(?!\s*[=:])', grp)
+        names += self._RB_IVAR_ASSIGN_RE.findall(code)
+        names += self._RB_CONST_RE.findall(code)
+        # Names B calls: `assert_equal(a, b)` renamed to one of A's `def`s
+        # calls A's method with B's arguments (a real edge; arity-matched
+        # in rename_across where A has a def of that arity).
+        names += [n for n, _ in self._RB_CALL_RE.findall(code)]
+        names += [n for n, _ in self._RB_CMD_CALL_RE.findall(code)]
+        return [n for n in dict.fromkeys(names) if n not in self._DATAFLOW_KEYWORDS]
+
+    def _toplevel_locals(self, code: str):
+        """Local (and instance) variables assigned in top-level code.
+
+        Not just column zero. Ruby scopes a local to its method or to the
+        top level, *not* to the `if`/`while`/`begin` block it was
+        assigned in, so `if c\n  x = 1\nend` leaves `x` visible to
+        everything after it — including a second program concatenated
+        below. Only a `def`/`class`/`module` body (a new scope) and a
+        block parameter (local to its block) are excluded. Restricting
+        this to column zero left A with no pool to donate on most of the
+        bootstraptest half of the corpus, where the whole program is one
+        indented block.
+        """
+        clean = self._strip_comments(code)
+        spans = self._def_spans(clean)
+        binders = [m.span() for m in self._RB_BINDER_RE.finditer(clean)]
+        out = set()
+        for rx in (self._RB_ANY_LOCAL_RE, self._RB_IVAR_ASSIGN_RE):
+            for m in rx.finditer(clean):
+                pos = m.start(1)
+                if any(a <= pos < b for a, b in spans) or any(a <= pos < b for a, b in binders):
+                    continue
+                out.add(m.group(1))
+        return out
+
+    def _visible_dataflow_names(self, code: str):
+        clean = self._strip_comments(code)
+        vis = self._toplevel_locals(code)
+        vis |= set(self._RB_CONST_RE.findall(clean))
+        vis |= set(self._RB_CLASS_RE.findall(clean))
+        vis |= set(self._RB_DEF_RE.findall(clean))
+        vis |= set(self._RB_GVAR_RE.findall(clean))
+        return {n for n in vis if n not in self._DATAFLOW_KEYWORDS}
+
+    _RB_BINDER_RE = re.compile(r'(?:\bdo|\{)\s*\|[^|\n]*\||^\s*def\s+[\w.?!]+\s*\([^)\n]*\)', re.M)
+
+    @staticmethod
+    def _def_spans(code):
+        """Character spans of `def ... end` bodies: a top-level local or
+        instance variable of A is not visible inside them."""
+        from .state_analysis import _lexical_mask, _ruby_line_state
+        lines = code.splitlines()
+        if not lines:
+            return []
+        mask = _lexical_mask(code, "ruby")
+        offsets, off = [], 0
+        for ln in lines:
+            offsets.append(off)
+            off += len(ln) + 1
+        depths, _ = _ruby_line_state(lines, mask, offsets)
+        spans, i = [], 0
+        while i < len(lines):
+            if re.match(r'^\s*def\b', lines[i]) and not re.match(r'^\s*def\s+[\w.?!]+(?:\s*\([^)]*\))?\s*=(?!=)', lines[i]):
+                base = depths[i - 1] if i > 0 else 0
+                j = i
+                while j < len(lines) and depths[j] > base:
+                    j += 1
+                spans.append((offsets[i], offsets[j] if j < len(lines) else len(code)))
+                i = j + 1
+            else:
+                i += 1
+        return spans
+
+    def _dataflow_replace(self, code: str, old: str, new: str) -> str:
+        """Rename use sites only: not after `.`/`::` (a method or a scoped
+        constant), not a `:sym`, not a `key:` argument, not the name in a
+        `def`, not a block or method parameter binder, and not on a
+        comment line. A local or instance variable target is not visible
+        inside a `def`, so uses there are taken only when B has no other."""
+        if old[:1] in "$@":
+            pat = re.compile(re.escape(old) + r'(?![\w?!])')
+        else:
+            pat = re.compile(r'(?<![\w.:@$])' + re.escape(old) + r'(?![\w?!])(?!\s*:(?!:))')
+        binders = [m.span() for m in self._RB_BINDER_RE.finditer(code)]
+        scoped = new[:1] == "@" or (new[:1].islower() and not new.endswith(("?", "!"))
+                                    and not re.search(r'^def\s+(?:self\.)?' + re.escape(new) + r'\b', code, re.M))
+        def_spans = self._def_spans(code) if scoped else []
+        matches, lhs, in_def = [], [], []
+        for m in pat.finditer(code):
+            ls = code.rfind("\n", 0, m.start()) + 1
+            line_head = code[ls:m.start()]
+            if line_head.lstrip().startswith("#") or re.search(r'\bdef\s+(?:self\.)?$', line_head):
+                continue
+            if any(a <= m.start() < b for a, b in binders):
+                continue
+            if any(a <= m.start() < b for a, b in def_spans):
+                in_def.append(m)
+                continue
+            # An assignment's left side is a definition, not a use:
+            # renaming it leaves B's later reads dangling ("uninitialized
+            # constant", NameError). Uses first; the LHS only when B
+            # never reads the name.
+            if re.match(r'\s*(?:\|\||&&|\*\*|<<|>>|[-+*/%|&^])?=(?![=~>])', code[m.end():m.end() + 4]):
+                lhs.append(m)
+            else:
+                matches.append(m)
+        matches = matches or lhs or in_def
+        if not matches:
+            return code
+        n = min(pick_occurrence_count(), len(matches))
+        chosen = sorted(random.sample(matches, n), key=lambda m: m.start(), reverse=True)
+        for m in chosen:
+            code = code[:m.start()] + new + code[m.end():]
+        return code
+
+    def _kind(self, name, code):
+        if name[:1] == "@":
+            return "ivar"
+        # An uppercase name followed by `(` is a method call, not a
+        # constant reference: `S('x')` calls `def S`, and pairing it with
+        # one of A's constants would be a "wrong number of arguments" or
+        # a "not a class" error rather than an edge.
+        if re.search(r'(?<![\w.:@$])' + re.escape(name) + r'\s*\(', code):
+            return "callable"
+        if name[:1].isupper():
+            return "const"
+        if re.search(r'^\s*' + re.escape(name) + r'[ \t]+(?![-+*/%|&<>!?:.=]|do\b|\{)\S', code, re.M):
+            return "callable"
+        return "value"
+
+    @staticmethod
+    def _arity(arglist):
+        arglist = arglist.strip()
+        if not arglist:
+            return 0
+        depth, n = 0, 1
+        for ch in arglist:
+            if ch in "([{":
+                depth += 1
+            elif ch in ")]}":
+                depth -= 1
+            elif ch == "," and depth == 0:
+                n += 1
+        return n
+
+    # What a name was assigned, where the right-hand side says so
+    # plainly. Ruby is dynamically typed, so this is the same trick the C
+    # adapter's _infer_c_var_types plays: pair like with like where the
+    # corpus makes the type obvious ("undefined method for an instance of
+    # Array/String/Hash" was the largest group of real-edge failures),
+    # and fall back to any value when it does not.
+    _RB_TYPE_PATTERNS = (
+        ("string", re.compile(r'^\s*(?:["\']|%[qQwWi]?[\[({<]|<<[~-]?["\'A-Z]|'
+                              r'String\.new|\.to_s\b|sprintf\(|format\()')),
+        ("symbol", re.compile(r'^\s*:(?![:=])')),
+        ("array", re.compile(r'^\s*(?:\[|Array\.new|%[wWi][\[({<]|\.to_a\b|'
+                             r'\.map\b|\.select\b|\.sort\b|\.each_slice\b)')),
+        ("hash", re.compile(r'^\s*(?:\{\s*(?:["\':]|\w+:)|Hash\.new|\.to_h\b)')),
+        ("range", re.compile(r'^\s*(?:\(?\s*[\d\'"][^\n]*\.\.\.?|Range\.new)')),
+        ("integer", re.compile(r'^\s*-?\d+(?![.\d])')),
+        ("float", re.compile(r'^\s*-?\d+\.\d')),
+        ("proc", re.compile(r'^\s*(?:->|lambda\b|proc\b|Proc\.new)')),
+        ("class", re.compile(r'^\s*(?:Class\.new|Struct\.new|Data\.define|Module\.new)')),
+    )
+    _TYPED_RENAME_SHARE = 0.9
+
+    def _infer_rb_types(self, code):
+        """{name: type} for names whose assignment gives the type away."""
+        clean = self._strip_comments(code)
+        out = {}
+        for m in self._RB_ANY_LOCAL_RE.finditer(clean):
+            nl = clean.find("\n", m.end())
+            rhs = clean[m.end():nl if nl != -1 else len(clean)]
+            for tname, rx in self._RB_TYPE_PATTERNS:
+                if rx.match(rhs):
+                    out[m.group(1)] = tname
+                    break
+        return out
+
+    def rename_across(self, code_a: str, code_b: str, names_a=None, names_b=None):
+        names_a = names_a or self._dataflow_names(code_a)
+        names_b = names_b or self._dataflow_names(code_b)
+        names_a = [n for n in names_a if n not in self._DATAFLOW_KEYWORDS]
+        names_b = [n for n in names_b if n not in self._DATAFLOW_KEYWORDS]
+        if names_b and random.random() < self._KIND_AWARE_SHARE:
+            clean_a = self._strip_comments(code_a)
+            types_a, types_b = self._infer_rb_types(code_a), self._infer_rb_types(code_b)
+            # Several B names are tried: a callable B name has no partner
+            # in an A without `def`s, and the plain draw would then pair
+            # it with an ivar or a local ("undefined method '@verbose'",
+            # the largest dataflow failure class of the first measurement).
+            for var_b in random.sample(names_b, min(len(names_b), 8)):
+                kind = self._kind(var_b, code_b)
+                if kind == "const":
+                    pool = self._RB_CONST_RE.findall(clean_a) + self._RB_CLASS_RE.findall(clean_a)
+                elif kind == "ivar":
+                    pool = [n for n in self._toplevel_locals(code_a) if n.startswith("@")]
+                elif kind == "callable":
+                    defs = self._RB_DEF_SIG_RE.findall(clean_a)
+                    call = re.search(r'(?<![\w.:@$])' + re.escape(var_b) + r'\s*\(([^()\n]*)\)', code_b) \
+                        or re.search(r'^\s*' + re.escape(var_b) + r'[ \t]+(?![-+*/%|&<>!?:.=]|do\b|\{)([^\n]*\S)', code_b, re.M)
+                    want = self._arity(call.group(1)) if call else None
+                    # Same arity, else a def whose parameter list can
+                    # absorb the call (splat / optional / keyword rest):
+                    # "wrong number of arguments" was 22% of the combined
+                    # failures when any def would do.
+                    pool = [n for n, params in defs if want is None or self._arity(params) == want] \
+                        or [n for n, params in defs if re.search(r'\*|=|\.\.\.', params)]
+                else:
+                    # A value read becomes a call of one of A's argument-
+                    # less methods: B consumes what A's method returns.
+                    pool = (sorted(self._toplevel_locals(code_a))
+                            + self._RB_GVAR_RE.findall(clean_a)
+                            + [n for n, params in self._RB_DEF_SIG_RE.findall(clean_a)
+                               if not params.strip() and not n.endswith(("?", "!"))])
+                pool = [n for n in dict.fromkeys(pool) if n != var_b and n not in self._DATAFLOW_KEYWORDS]
+                if kind in ("value", "ivar"):
+                    want = types_b.get(var_b)
+                    if want and random.random() < self._TYPED_RENAME_SHARE:
+                        pool = [n for n in pool if types_a.get(n) == want] or pool
+                if not pool:
+                    continue
+                var_a = random.choice(pool)
+                renamed = self._dataflow_replace(code_b, var_b, var_a)
+                if renamed != code_b:
+                    return code_a, self._tag_renamed_lines(code_b, renamed)
+            # No kinded partner for any B name: the plain draw below can
+            # only pair a call with a value or a value with a method, so
+            # only the ungated share proceeds.
+            if random.random() >= self._UNGATED_SHARE:
+                return code_a, code_b
+        return super().rename_across(code_a, code_b, names_a, names_b)
+
+    # ── instrumentation ─────────────────────────────────────────────
+
+    def _instrumentation_ruby(self, names):
+        """Phase-directed probes appended after the fused body, each
+        wrapped so it cannot fail the child on its own: object-graph
+        stress (compaction, full GC) over whatever the two programs left
+        behind, and round trips of a fused value through Marshal / dup /
+        freeze — the paths where a VM invariant broken earlier shows."""
+        if not names or random.random() < 0.5:
+            return ""
+        v = random.choice(names)
+        # Aimed at the subsystems that carry Ruby's invariants rather than
+        # at the value itself: the object-shape transitions an instance
+        # variable write drives, the global method cache that a singleton
+        # class or a `define_method` invalidates, compaction moving an
+        # object under a live reference, and the frozen/refinement checks.
+        # The first finding on this target was exactly a method-cache
+        # invariant, reached through `Method#to_s`.
+        primitives = [
+            "GC.start(full_mark: true, immediate_sweep: true)",
+            "GC.compact if GC.respond_to?(:compact)",
+            f"Marshal.load(Marshal.dump({v}))",
+            f"{v}.dup.freeze; {v}.clone(freeze: false)",
+            f"ObjectSpace.each_object({v}.class).first(50).each(&:inspect)",
+            f"{v}.frozen? || {v}.instance_variables.each {{ |iv| {v}.instance_variable_get(iv) }}",
+            f"RubyVM::InstructionSequence.compile({v}.to_s).to_a rescue nil",
+            f"{v}.method(:inspect).owner; {v}.singleton_methods",
+        ]
+        picks = random.sample(primitives, random.randint(1, 3))
+        # One physical line, deliberately. In a strategy chain this block
+        # is appended to the dataflow child and *then* state fusion cuts
+        # that child in two, and a cut inside a multi-line
+        # `begin ... end` would leave half of it on each side of the
+        # other program's text. Worth 0.6 of a point on the combined
+        # column, measured on one sample with the same 300 pairs.
+        body = "; ".join(picks)
+        return f"\nbegin {body}; rescue Exception; end  {self._tag('dataflow')}\n"
+
+    # ── fuse ─────────────────────────────────────────────────────────
+
+    def fuse(self, parent_a: Seed, parent_b: Seed) -> Seed:
+        sa, sb = parent_a.content, parent_b.content
+        if self.mutation:
+            sa, sb = self.mut.mutate(sa), self.mut.mutate(sb)
+        a_body, a_pre = self._split_preamble(sa)
+        b_body, b_pre = self._split_preamble(sb)
+
+        # Ruby runs a file top to bottom, so a name is only defined for
+        # the code below its definition. The side that donates the name
+        # therefore goes first: when A has nothing at file scope and B
+        # has, B donates and B's text leads (the same order rule as the
+        # C adapter after its direction swap).
+        swapped = False
+        if not self._visible_dataflow_names(a_body) and self._visible_dataflow_names(b_body) \
+                and random.random() < self._VISIBLE_RENAME_SHARE:
+            swapped = True
+            a_body, b_body = b_body, a_body
+            a_pre, b_pre = b_pre, a_pre
+        before_a, before_b = a_body, b_body
+        a_body, b_body = self.rename_across(a_body, b_body)
+        renamed_any = a_body != before_a or b_body != before_b
+
+        pre = self._merge_preambles(a_pre, b_pre)
+        content = ("\n".join(pre) + "\n\n" if pre else "") + a_body.rstrip("\n") + "\n\n" + b_body.rstrip("\n") + "\n"
+        content += self._instrumentation_ruby(sorted(self._toplevel_locals(a_body)))
+        return Seed(content=content, metadata={
+            "parents": [parent_a.id, parent_b.id],
+            "type": "ruby",
+            "extension": ".rb",
+            "mode": ("df_ba" if swapped else "df_ab") if renamed_any else "df_none_ab",
+            "description": f"Fused {parent_a.id} + {parent_b.id}",
+        })
+
+
+class RubyStateFusionStrategy(RubyFusionStrategy):
+    """State fusion for Ruby (core/state_analysis.py): the four-segment
+    interleave over `end`-delimited blocks. Segment boundaries are the
+    lines after which every `def`/`class`/`if`/`do`…`end` and every
+    bracket is closed and no heredoc is open (see
+    _compute_segment_boundaries's ruby branch)."""
+
+    def fuse(self, parent_a: Seed, parent_b: Seed) -> Seed:
+        return self._build_state_fused(parent_a, parent_b, "ab")
+
+    def fuse_bidirectional(self, parent_a: Seed, parent_b: Seed) -> List[Seed]:
+        return [self._build_state_fused(parent_a, parent_b, "ab"),
+                self._build_state_fused(parent_b, parent_a, "ba")]
+
+    def _state_prepare(self, host: Seed, donor: Seed):
+        host_src, donor_src = host.content, donor.content
+        if self.mutation:
+            host_src, donor_src = self.mut.mutate(host_src), self.mut.mutate(donor_src)
+        host_body, host_pre = self._split_preamble(host_src)
+        donor_body, donor_pre = self._split_preamble(donor_src)
+        return host_body, donor_body, self._merge_preambles(host_pre, donor_pre)
+
+    def _state_seed_metadata(self, host: Seed, donor: Seed) -> dict:
+        return {"type": "ruby", "extension": ".rb"}
+
+
+class RubyDeclarationFusionStrategy(RubyFusionStrategy):
+    """Declaration fusion for Ruby: a class or module the donor declares
+    is copied to the front of the host and wired into one of the host's
+    class declarations — as its superclass, or through `include` /
+    `prepend` / `extend` for a module. Ruby resolves all of that when the
+    `class` statement (or `Class.new`) runs: ancestor linearisation, the
+    `inherited` / `included` / `prepended` hooks, method-cache
+    invalidation and the "superclass mismatch" check happen before a
+    single method is called — the interpreter-side analogue of a
+    compile-time-only declaration check.
+
+    Donors: `class X` / `module X` at any nesting, and `X = Class.new`,
+    `Module.new`, `Struct.new`, `Data.define` assigned to a constant.
+    Hosts: a `class X` header, a `Class.new` expression, or a block-less
+    `Struct.new(...)`.
+    """
+
+    _RB_DECL_HEAD_RE = re.compile(
+        r'^(\s*)(?:(class|module)\s+([A-Z]\w*(?:::[A-Z]\w*)*)(\s*<\s*[A-Z][\w:.()]*)?'
+        r'|([A-Z]\w*)\s*=\s*(Class|Module|Struct|Data)\.(?:new|define)\b)')
+    _RB_CLASS_NEW_RE = re.compile(r'\bClass\.new\b(\s*\(([^()\n]*)\))?(\s*(\{|do\b[^\n]*))?')
+    _RB_STRUCT_NEW_RE = re.compile(r'\bStruct\.new\s*\([^()\n]*\)(?!\s*(?:\{|do\b))')
+
+    @classmethod
+    def _decl_blocks(cls, code):
+        """[(kind, name, start, end)] — kind is "class" or "module"; the
+        block spans the declaration to the line where its keyword depth
+        and bracket depth return to what they were before it."""
+        from .state_analysis import _lexical_mask, _paren_depth_prefix, _ruby_line_state
+        lines = code.splitlines()
+        if not lines:
+            return []
+        mask = _lexical_mask(code, "ruby")
+        offsets, off = [], 0
+        for ln in lines:
+            offsets.append(off)
+            off += len(ln) + 1
+        depths, unsafe = _ruby_line_state(lines, mask, offsets)
+        paren = _paren_depth_prefix(code, mask)
+        out = []
+        for i, line in enumerate(lines):
+            m = cls._RB_DECL_HEAD_RE.match(line)
+            if not m or line.lstrip().startswith("class <<"):
+                continue
+            if m.group(2):
+                kind, name = m.group(2), m.group(3)
+            else:
+                kind = "module" if m.group(6) == "Module" else "class"
+                name = m.group(5)
+            base_depth = depths[i - 1] if i > 0 else 0
+            base_paren = paren[offsets[i]]
+            for j in range(i, len(lines)):
+                end_off = min(offsets[j] + len(lines[j]), len(paren) - 1)
+                if depths[j] == base_depth and paren[end_off] == base_paren and not unsafe[j]:
+                    out.append((kind, name.split("::")[-1], i, j))
+                    break
+        return out
+
+    # `obj = Foo.new` / `@obj = Foo.new`: the host binds an instance of
+    # some class. Two declaration-time operations attach a donor to it —
+    # `obj.extend(M)` builds a singleton class with M in its ancestry,
+    # and reopening the class it names splices the donor into the real
+    # ancestor chain. Both run their checks (ancestor linearisation,
+    # `extended`/`included` hooks, method-cache invalidation) the moment
+    # the statement is reached, before any method of either program is
+    # called.
+    _RB_OBJ_ASSIGN_RE = re.compile(
+        r'^(\s*)((?:@@|@)?[a-z_]\w*)\s*=\s*([A-Z]\w*(?:::[A-Z]\w*)*)\.new\b')
+    #: How often a donor that *does* declare a class or module donates a
+    #: module built from its methods instead. Both are declarations; the
+    #: built one reaches the six pairs in seven where the donor declares
+    #: nothing at all.
+    _DEFS_MODULE_SHARE = 0.5
+
+    def _host_sites(self, code):
+        sites = []
+        for i, line in enumerate(code.splitlines()):
+            m = self._RB_DECL_HEAD_RE.match(line)
+            if m and m.group(2) == "class" and not line.lstrip().startswith("class <<"):
+                sites.append(("class", i))
+            elif self._RB_CLASS_NEW_RE.search(line):
+                sites.append(("Class.new", i))
+            elif self._RB_STRUCT_NEW_RE.search(line):
+                sites.append(("Struct.new", i))
+            elif self._RB_OBJ_ASSIGN_RE.match(line):
+                sites.append(("obj_assign", i))
+        return sites
+
+    # A top-level `def` at column zero, to its column-zero `end` (or the
+    # end of a one-line `def f; ...; end`).
+    _RB_TOP_DEF_RE = re.compile(r'^def\s+([a-z_]\w*[?!=]?)')
+
+    @classmethod
+    def _defs_module(cls, code, tag):
+        """(module_text, module_name) built from the donor's top-level
+        method definitions, or (None, None).
+
+        Only 13% of this corpus opens a `class` or `module` — it is
+        mostly expression-level test scripts — so a strategy that needs a
+        declared type to donate has nothing to work with for six pairs in
+        seven. A module built from the donor's own methods is still a
+        *declaration*: including it runs ancestor linearisation, the
+        `included` hook and the method-cache invalidation at the moment
+        the `include` statement is reached, before either program's code
+        calls anything. The same widening the Fortran adapter's
+        decl_component and the PHP adapter's decl_instantiate made.
+        """
+        lines = code.splitlines()
+        picked, i = [], 0
+        while i < len(lines):
+            if cls._RB_TOP_DEF_RE.match(lines[i]):
+                one_line = re.match(r'^(def\s.*?\bend)\b', lines[i].rstrip())
+                if one_line:
+                    # `def f; ...; end; f(5)` — the call after the `end`
+                    # is top-level code, and carrying it into the module
+                    # body runs it at module-definition time against an
+                    # instance method that has no receiver there.
+                    picked.append([one_line.group(1)])
+                    i += 1
+                    continue
+                if lines[i].rstrip().endswith("end"):
+                    picked.append(lines[i:i + 1])
+                    i += 1
+                    continue
+                for j in range(i + 1, len(lines)):
+                    if lines[j].rstrip() == "end":
+                        picked.append(lines[i:j + 1])
+                        i = j + 1
+                        break
+                else:
+                    i += 1
+            else:
+                i += 1
+        if not picked:
+            return None, None
+        name = f"FflMod_{tag}"
+        body = []
+        for block in picked[:6]:
+            body += ["  " + l for l in block]
+        return "\n".join([f"module {name}"] + body + ["end"]), name
+
+    def is_viable_pair(self, parent_a: Seed, parent_b: Seed) -> bool:
+        host = self._host_sites(self._split_preamble(parent_a.content)[0])
+        if not host:
+            return False
+        donor = self._split_preamble(parent_b.content)[0]
+        return bool(self._decl_blocks(donor)) or bool(self._defs_module(donor, "x")[0])
+
+    def _wire(self, line, kind_host, donor_kind, donor_name):
+        """The host line with the donor wired into its declaration.
+        Returns (new_lines, applied) or (None, None)."""
+        tag = self._tag("declaration")
+        if kind_host == "class":
+            if donor_kind == "class":
+                m = self._RB_DECL_HEAD_RE.match(line)
+                if m.group(4):
+                    new = self._RB_DECL_HEAD_RE.sub(
+                        lambda mm: f"{mm.group(1)}class {mm.group(3)} < {donor_name}", line, count=1)
+                    return [f"{new}  {tag}"], "superclass_replaced"
+                new = re.sub(r'^(\s*class\s+[A-Z][\w:]*)', rf'\1 < {donor_name}', line, count=1)
+                return [f"{new}  {tag}"], "superclass"
+            # A one-line class (`class Foo; def x; end; end`) closes on
+            # this same line, so a mixin appended below it would land at
+            # top level — where `include` mixes into Object instead, a
+            # different operation from the one this mode reports.
+            if re.search(r'(?<![\w.:@$])end\b', re.sub(r'#[^\n]*', '', line)):
+                return None, None
+            verb = random.choices(["include", "prepend", "extend"], weights=(6, 2, 2))[0]
+            indent = line[:len(line) - len(line.lstrip())]
+            return [line, f"{indent}  {verb} {donor_name}  {tag}"], verb
+        if kind_host == "Class.new":
+            m = self._RB_CLASS_NEW_RE.search(line)
+            if donor_kind == "class":
+                new = line[:m.start()] + f"Class.new({donor_name})" + (m.group(3) or "") + line[m.end():]
+                return [f"{new}  {tag}"], "class_new_superclass"
+            verb = random.choice(["include", "prepend"])
+            if m.group(4) == "{":
+                new = line[:m.end()] + f" {verb} {donor_name};" + line[m.end():]
+                return [f"{new}  {tag}"], f"class_new_{verb}"
+            if m.group(4):                                  # `do ...` block
+                indent = line[:len(line) - len(line.lstrip())]
+                return [line, f"{indent}  {verb} {donor_name}  {tag}"], f"class_new_{verb}"
+            new = line[:m.end()] + f" {{ {verb} {donor_name} }}" + line[m.end():]
+            return [f"{new}  {tag}"], f"class_new_{verb}"
+        if kind_host == "Struct.new" and donor_kind == "module":
+            m = self._RB_STRUCT_NEW_RE.search(line)
+            new = line[:m.end()] + f" {{ include {donor_name} }}" + line[m.end():]
+            return [f"{new}  {tag}"], "struct_include"
+        if kind_host == "obj_assign":
+            m = self._RB_OBJ_ASSIGN_RE.match(line)
+            indent, var, cls = m.group(1), m.group(2), m.group(3)
+            if donor_kind == "module":
+                if random.random() < 0.5:
+                    # Singleton class: the object alone gains the donor.
+                    return [line, f"{indent}{var}.extend({donor_name})  {tag}"], "extend_object"
+                # Reopening the class puts the donor in the ancestry of
+                # every instance, and re-runs the linearisation.
+                return [f"{indent}class {cls}; include {donor_name}; end  {tag}",
+                        line], "reopen_include"
+            # A class donor cannot be mixed in, but a subclass of it
+            # declared here still runs the inheritance checks and the
+            # `inherited` hook, and the host's binding then holds one.
+            return [f"{indent}class FflSub_{donor_name} < {donor_name}; end  {tag}",
+                    line, f"{indent}{var} = FflSub_{donor_name}.allocate  {tag}"], "subclass"
+        return None, None
+
+    def _build_declaration_fused(self, host: Seed, donor: Seed, direction: str) -> Seed:
+        host_src, donor_src = host.content, donor.content
+        if self.mutation:
+            host_src, donor_src = self.mut.mutate(host_src), self.mut.mutate(donor_src)
+        host_body, host_pre = self._split_preamble(host_src)
+        donor_body, donor_pre = self._split_preamble(donor_src)
+        pre = self._merge_preambles(host_pre, donor_pre)
+        applied = None
+        lines = host_body.splitlines()
+        sites = self._host_sites(host_body)
+        blocks = self._decl_blocks(donor_body)
+        mod_text, mod_name = (None, None)
+        if not blocks or random.random() < self._DEFS_MODULE_SHARE:
+            mod_text, mod_name = self._defs_module(donor_body, donor.id[:6])
+        if sites and (blocks or mod_text):
+            if mod_text and (not blocks or random.random() < self._DEFS_MODULE_SHARE):
+                dkind, dname = "module", mod_name
+                donor_lines = mod_text.splitlines()
+            else:
+                dkind, dname, ds, de = random.choice(blocks)
+                donor_lines = donor_body.splitlines()[ds:de + 1]
+                indent = len(donor_lines[0]) - len(donor_lines[0].lstrip())
+                donor_lines = [l[indent:] if l[:indent].strip() == "" else l.lstrip()
+                               for l in donor_lines]
+            hkind, hi = random.choice(sites)
+            new_lines, applied = self._wire(lines[hi], hkind, dkind, dname)
+            if new_lines:
+                if applied and dkind == "module" and mod_text and dname == mod_name:
+                    applied = f"defs_{applied}"
+                lines[hi:hi + 1] = new_lines
+                # The donor's *whole half* goes first, not just the
+                # declaration that was wired in. Copying the block alone
+                # left the child holding 31% of the donor's lines on
+                # average — the lowest retention of any strategy here —
+                # and any name the block referred to from elsewhere in
+                # its own file was gone. The TypeScript adapter made the
+                # same change for the same reason and its declaration
+                # column rose 17 points; V8's has always assembled
+                # donor-then-host. The declaration must still precede
+                # the host's use of it, which this ordering gives.
+                if mod_text and dname == mod_name:
+                    head = donor_body.splitlines() + [""] + list(donor_lines)
+                else:
+                    head = list(donor_body.splitlines())
+                    if 0 <= ds < len(head):
+                        head[ds] = f"{head[ds]}  {self._tag('declaration')}"
+                lines[0:0] = head + [""]
+        fused = "\n".join(lines)
+        content = ("\n".join(pre) + "\n\n" if pre else "") + fused.rstrip("\n") + "\n"
+        return Seed(content=content, metadata={
+            "parents": [host.id, donor.id],
+            "type": "ruby",
+            "extension": ".rb",
+            "mode": f"decl_{applied or 'none'}_{direction}",
+            "description": f"Declaration-fused {host.id} <- {donor.id} ({direction})",
+        })
+
+    def fuse(self, parent_a: Seed, parent_b: Seed) -> Seed:
+        return self._build_declaration_fused(parent_a, parent_b, "ab")
+
+    def fuse_bidirectional(self, parent_a: Seed, parent_b: Seed) -> List[Seed]:
+        return [self._build_declaration_fused(parent_a, parent_b, "ab"),
+                self._build_declaration_fused(parent_b, parent_a, "ba")]
+
+
+# ==========================================
+# TypeScript Specific Fusion Strategy
+# ==========================================
+
+class TypeScriptFusionStrategy(FusionStrategy):
+    """TypeScript (projects/typescript): the Go-native `tsc`, which
+    *checks* rather than executes, so what a fused program exercises is
+    the checker, the transformers and the declaration emitter.
+
+    That changes what a dataflow rename should aim at. TypeScript has two
+    namespaces — values and types — and the same identifier can live in
+    both (a `class` or `enum` declares one of each). A rename that puts a
+    type name where a value is expected is "only refers to a type, but is
+    being used as a value here": a diagnostic produced by the resolver
+    before any type is compared, which is the shallowest failure there is.
+    Pairing by namespace (85% of draws) keeps the child in the checker's
+    interesting paths — assignability, inference, overload resolution —
+    which is where a checker's bugs are.
+    """
+
+    LANGUAGE = "typescript"
+
+    _DATAFLOW_KEYWORDS = frozenset({
+        "let", "const", "var", "function", "class", "interface", "type",
+        "enum", "namespace", "module", "import", "export", "default",
+        "return", "if", "else", "for", "while", "do", "switch", "case",
+        "break", "continue", "new", "this", "super", "typeof", "instanceof",
+        "in", "of", "void", "delete", "throw", "try", "catch", "finally",
+        "yield", "await", "async", "as", "is", "keyof", "readonly", "infer",
+        "declare", "abstract", "implements", "extends", "static", "public",
+        "private", "protected", "get", "set", "constructor", "satisfies",
+        "any", "unknown", "never", "number", "string", "boolean", "symbol",
+        "object", "bigint", "undefined", "null", "true", "false", "asserts",
+        "out", "override", "accessor", "using", "global", "require",
+        "Array", "Promise", "Object", "Function", "String", "Number",
+        "Boolean", "Symbol", "Math", "JSON", "Map", "Set", "WeakMap",
+        "console", "window", "document", "Error", "Date", "RegExp",
+        "Partial", "Readonly", "Record", "Pick", "Omit", "Exclude",
+        "Extract", "Required", "ReturnType", "Parameters", "Awaited",
+    })
+
+    # Value declarations and type declarations. `class` and `enum` appear
+    # in both lists on purpose: each declares a value *and* a type, so a
+    # class name is a legal rename target in either position.
+    _TS_VALUE_DECL_RE = re.compile(
+        r'^[ \t]*(?:export\s+)?(?:declare\s+)?(?:abstract\s+)?'
+        r'(?:let|const|var|function\s*\*?|class|enum)\s+([A-Za-z_$][\w$]*)', re.M)
+    _TS_TYPE_DECL_RE = re.compile(
+        r'^[ \t]*(?:export\s+)?(?:declare\s+)?(?:abstract\s+)?'
+        r'(?:interface|type|class|enum)\s+([A-Za-z_$][\w$]*)', re.M)
+    # File scope: column zero (the corpus indents everything nested).
+    _TS_TOP_VALUE_RE = re.compile(
+        r'^(?:export\s+)?(?:declare\s+)?(?:abstract\s+)?'
+        r'(?:let|const|var|function\s*\*?|class|enum)\s+([A-Za-z_$][\w$]*)', re.M)
+    _TS_TOP_TYPE_RE = re.compile(
+        r'^(?:export\s+)?(?:declare\s+)?(?:abstract\s+)?'
+        r'(?:interface|type|class|enum)\s+([A-Za-z_$][\w$]*)', re.M)
+    _TS_ANY_NAME_RE = re.compile(r'(?<![\w$.])([A-Za-z_$][\w$]*)')
+    # Names of A that can stand on the left of a `(`: a function, a class
+    # (through `new`), an arrow or function expression bound to a name.
+    # A value use that happens to be a *call* needs one of these; pairing
+    # it with an ordinary value is "This expression is not callable",
+    # which was 8% of the real-edge failures.
+    _TS_CALLABLE_DECL_RE = re.compile(
+        r'^[ \t]*(?:export\s+)?(?:declare\s+)?(?:abstract\s+)?'
+        r'(?:function\s*\*?\s+([A-Za-z_$][\w$]*)'
+        r'|class\s+([A-Za-z_$][\w$]*)'
+        r'|(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*(?::[^=\n]+)?=\s*'
+        r'(?:async\s+)?(?:function\b|\([^()]*\)\s*(?::[^=>\n]+)?=>|[A-Za-z_$][\w$]*\s*=>))', re.M)
+    # A directive line the harness reads (`// @target: es2015`) — it is
+    # configuration, not program text, and must stay at the top.
+    _TS_DIRECTIVE_RE = re.compile(r'^\s*//\s*@[A-Za-z]+\s*:[^\n]*$')
+
+    _KIND_AWARE_SHARE = 0.85
+    _UNGATED_SHARE = 0.1
+
+    def __init__(self, project_root="projects/typescript", lightweight: bool = False):
+        self.project_root = project_root
+        self.mutation = True
+        self.mut = BaseMutator()
+        self.lightweight = lightweight
+
+    # ── preamble ─────────────────────────────────────────────────────
+
+    def _split_preamble(self, code):
+        """(body, directive_lines). The `// @option:` lines drive
+        projects/typescript/driver.py's command line; they only mean
+        anything at the top of the file.
+
+        The byte-order mark goes too. It is legal only as the very first
+        character of a file, so concatenating two seeds that both carry
+        one puts an illegal character in the middle of the child
+        ("Invalid character", TS1127) — and it hid the directive line
+        behind it from this scan.
+        """
+        pre, body = [], []
+        for line in code.replace("\ufeff", "").splitlines():
+            (pre if self._TS_DIRECTIVE_RE.match(line) else body).append(line)
+        return "\n".join(body), pre
+
+    @staticmethod
+    def _merge_preambles(pre_a, pre_b):
+        """Both seeds' directives, first spelling of each option winning:
+        a second `// @target:` would silently replace the level the other
+        seed was written for."""
+        out, seen = [], set()
+        for line in list(pre_a) + list(pre_b):
+            key = line.split("@", 1)[1].split(":", 1)[0].strip().lower()
+            if key not in seen:
+                seen.add(key)
+                out.append(line)
+        return out
+
+    # ── dataflow hooks ───────────────────────────────────────────────
+
+    def _dataflow_names(self, code: str) -> List[str]:
+        code = self._strip_comments(code)
+        names = self._TS_VALUE_DECL_RE.findall(code) + self._TS_TYPE_DECL_RE.findall(code)
+        return [n for n in dict.fromkeys(names) if n not in self._DATAFLOW_KEYWORDS]
+
+    def _visible_dataflow_names(self, code: str):
+        code = self._strip_comments(code)
+        vis = set(self._TS_TOP_VALUE_RE.findall(code)) | set(self._TS_TOP_TYPE_RE.findall(code))
+        return {n for n in vis if n not in self._DATAFLOW_KEYWORDS}
+
+    def _callable_names(self, code):
+        return {n for m in self._TS_CALLABLE_DECL_RE.finditer(self._strip_comments(code))
+                for n in m.groups() if n and n not in self._DATAFLOW_KEYWORDS}
+
+    def _type_names(self, code):
+        return {n for n in self._TS_TYPE_DECL_RE.findall(self._strip_comments(code))
+                if n not in self._DATAFLOW_KEYWORDS}
+
+    def _value_names(self, code):
+        return {n for n in self._TS_VALUE_DECL_RE.findall(self._strip_comments(code))
+                if n not in self._DATAFLOW_KEYWORDS}
+
+    # Positions where an identifier denotes a *type*: after `:` (an
+    # annotation), after `extends`/`implements`, inside `<...>` type
+    # arguments, after `as`/`satisfies`, after `keyof`/`typeof`-in-type.
+    _TS_TYPE_POS_RE = re.compile(
+        r'(?::\s*|extends\s+|implements\s+|as\s+|satisfies\s+|keyof\s+|'
+        r'<\s*|,\s*(?=[^()]*>)|\|\s*|&\s*)$')
+
+    def _use_kind(self, name, code):
+        """"type", "value" or "both" for `name` as B uses it."""
+        declared_t = name in self._type_names(code)
+        declared_v = name in self._value_names(code)
+        if declared_t and declared_v:
+            return "both"
+        if declared_t:
+            return "type"
+        if declared_v:
+            return "value"
+        # Not declared here: decide from the first use site.
+        for m in re.finditer(r'(?<![\w$.])' + re.escape(name) + r'(?![\w$])', code):
+            ls = code.rfind("\n", 0, m.start()) + 1
+            if self._TS_TYPE_POS_RE.search(code[ls:m.start()]):
+                return "type"
+        return "value"
+
+    def _dataflow_replace(self, code: str, old: str, new: str) -> str:
+        """Rename use sites: never after `.` (a property), never a string
+        key, never the name in its own declaration, and never inside a
+        `// @option:` directive."""
+        pat = re.compile(r'(?<![\w$.])' + re.escape(old) + r'(?![\w$])')
+        decl = re.compile(
+            r'(?:let|const|var|function\s*\*?|class|interface|type|enum|namespace)\s+$')
+        matches = []
+        for m in pat.finditer(code):
+            ls = code.rfind("\n", 0, m.start()) + 1
+            head = code[ls:m.start()]
+            if head.lstrip().startswith("//") or decl.search(head):
+                continue
+            matches.append(m)
+        if not matches:
+            return code
+        n = min(pick_occurrence_count(), len(matches))
+        for m in sorted(random.sample(matches, n), key=lambda x: x.start(), reverse=True):
+            code = code[:m.start()] + new + code[m.end():]
+        return code
+
+    _TS_TYPE_PARAMS_RE = re.compile(
+        r'^[ \t]*(?:export\s+)?(?:declare\s+)?(?:abstract\s+)?'
+        r'(?:interface|type|class|enum)\s+(?P<name>[A-Za-z_$][\w$]*)\s*'
+        r'<(?P<tp>[^<>]*(?:<[^<>]*>[^<>]*)*)>', re.M)
+
+    @staticmethod
+    def _tp_count(text):
+        depth, n = 0, 1
+        for ch in text:
+            if ch in "([{<":
+                depth += 1
+            elif ch in ")]}>":
+                depth -= 1
+            elif ch == "," and depth == 0:
+                n += 1
+        return n if text.strip() else 0
+
+    def _arity_matched(self, pool, code_a, code_b, var_b):
+        """Names of `pool` whose type-parameter count matches how B uses
+        `var_b`. "Type 'X' is not generic" and "requires N type
+        arguments" are arity complaints — a fact about the substitution
+        rather than about the two programs."""
+        m = re.search(r'(?<![\w$.])' + re.escape(var_b) + r'\s*<([^<>]*(?:<[^<>]*>[^<>]*)*)>', code_b)
+        want = self._tp_count(m.group(1)) if m else 0
+        counts = {mm.group("name"): self._tp_count(mm.group("tp"))
+                  for mm in self._TS_TYPE_PARAMS_RE.finditer(self._strip_comments(code_a))}
+        exact = [n for n in pool if counts.get(n, 0) == want]
+        if exact:
+            return exact
+        # No exact match: at least keep the generic/non-generic split, or
+        # the child fails on "Type 'X' is not generic" — an arity
+        # complaint about the substitution rather than about the two
+        # programs.
+        return [n for n in pool if (counts.get(n, 0) > 0) == (want > 0)]
+
+    def _has_use_site(self, code, name):
+        """True when `name` appears somewhere other than its own
+        declaration. Half of this corpus declares a type or a value only
+        to check the declaration itself, and renaming a name that is
+        never used again is an alpha-rename, not an edge."""
+        return self._dataflow_replace(code, name, name + "_ffl_probe") != code
+
+    def rename_across(self, code_a: str, code_b: str, names_a=None, names_b=None):
+        names_a = [n for n in (names_a or self._dataflow_names(code_a))
+                   if n not in self._DATAFLOW_KEYWORDS]
+        names_b = [n for n in (names_b or self._dataflow_names(code_b))
+                   if n not in self._DATAFLOW_KEYWORDS]
+        if names_b and random.random() < self._KIND_AWARE_SHARE:
+            visible = self._visible_dataflow_names(code_a)
+            types, values = self._type_names(code_a), self._value_names(code_a)
+            callables = self._callable_names(code_a)
+            # File-scope names first: B's half is concatenated after A's,
+            # so only A's file-scope declarations are in scope there. When
+            # A has none (everything is inside a `namespace` or a
+            # function), the rename is out of scope wherever it lands —
+            # kept, because "Cannot find name" is the checker's recovery
+            # path, but only after the in-scope pools are exhausted.
+            a_types = (types & visible) or types
+            a_values = (values & visible) or values
+            # B's pool is wider than A's on purpose. A must really
+            # *declare* what B is renamed to, but B's side only has to be
+            # a use — and a third of this corpus declares nothing my scan
+            # recognises while using plenty (a test case that exercises a
+            # type by annotating an existing binding). Every identifier B
+            # uses that is not a keyword or a global is a rename target,
+            # so B's use of it becomes a use of A's declaration.
+            declared = [n for n in names_b if self._has_use_site(code_b, n)]
+            bare = [n for n in dict.fromkeys(
+                        self._TS_ANY_NAME_RE.findall(self._strip_comments(code_b)))
+                    if n not in self._DATAFLOW_KEYWORDS and n not in set(names_b)
+                    and self._has_use_site(code_b, n)]
+            usable_b = (random.sample(declared, min(len(declared), 5))
+                        + random.sample(bare, min(len(bare), 5))) or names_b
+            for var_b in usable_b[:8]:
+                kind = self._use_kind(var_b, code_b)
+                # A class or enum declares a value *and* a type, so it is
+                # the only substitution for a name used as both. Crossing
+                # the namespaces is never worth it: "only refers to a
+                # type, but is being used as a value here" is raised by
+                # the resolver before a single type is compared, and
+                # letting an empty pool fall through to the other
+                # namespace made it 25% of the real-edge failures. When
+                # this B name has no partner, the next one is tried.
+                pool = (a_types & a_values) if kind == "both" else \
+                       a_types if kind == "type" else a_values
+                pool = [n for n in sorted(pool) if n != var_b]
+                if kind == "value" and re.search(
+                        r'(?<![\w$.])' + re.escape(var_b) + r'\s*[(<]', code_b):
+                    # B calls it (or instantiates it with type arguments),
+                    # so only something of A's that can be called will do.
+                    pool = [n for n in pool if n in callables] or pool
+                if kind != "value":
+                    pool = self._arity_matched(pool, code_a, code_b, var_b) or pool
+                if not pool:
+                    continue
+                renamed = self._dataflow_replace(code_b, var_b, random.choice(pool))
+                if renamed != code_b:
+                    return code_a, self._tag_renamed_lines(code_b, renamed)
+            if random.random() >= self._UNGATED_SHARE:
+                return code_a, code_b
+        return super().rename_across(code_a, code_b, names_a, names_b)
+
+    # ── fuse ─────────────────────────────────────────────────────────
+
+    def _dedupe_toplevel(self, a_body, b_body, tag):
+        """Rename B's file-scope declarations that collide with A's.
+
+        A redeclared `let`/`const`/`class`/`interface`-with-conflicting-
+        members is an error raised while binding, before a single type is
+        checked — and two test cases both declaring `x` or `Foo` is
+        ordinary in this corpus.
+        """
+        collisions = self._visible_dataflow_names(a_body) & self._visible_dataflow_names(b_body)
+        for name in sorted(collisions):
+            b_body = rename_all_word_occurrences(b_body, name, f"{name}_{tag}")
+        return b_body, collisions
+
+    def fuse(self, parent_a: Seed, parent_b: Seed) -> Seed:
+        sa, sb = parent_a.content, parent_b.content
+        a_body, a_pre = self._split_preamble(sa)
+        b_body, b_pre = self._split_preamble(sb)
+        if self.mutation:
+            a_body, b_body = self.mut.mutate(a_body), self.mut.mutate(b_body)
+
+        # Dedupe first, rename second: the rename's whole job is to make a
+        # name of A appear in B, so deduping afterwards would undo it.
+        b_body, collisions = self._dedupe_toplevel(a_body, b_body, f"b{parent_b.id[:6]}")
+        # A donates names, so A's half goes first. When A declares nothing
+        # at file scope and B does, the two swap: the donor's declarations
+        # have to precede the uses that were renamed to them.
+        swapped = False
+        if not self._visible_dataflow_names(a_body) and self._visible_dataflow_names(b_body) \
+                and random.random() < self._VISIBLE_RENAME_SHARE:
+            swapped = True
+            a_body, b_body = b_body, a_body
+            a_pre, b_pre = b_pre, a_pre
+        before_b = b_body
+        a_body, b_body = self.rename_across(a_body, b_body)
+        renamed_any = b_body != before_b
+
+        pre = self._merge_preambles(a_pre, b_pre)
+        content = ("\n".join(pre) + "\n" if pre else "") + \
+                  a_body.rstrip("\n") + "\n\n" + b_body.rstrip("\n") + "\n"
+        return Seed(content=content, metadata={
+            "parents": [parent_a.id, parent_b.id],
+            "type": "typescript",
+            "extension": ".ts",
+            "renamed": sorted(collisions),
+            "mode": ("df_ba" if swapped else "df_ab") if renamed_any else "df_none_ab",
+            "description": f"Fused {parent_a.id} + {parent_b.id}",
+        })
+
+
+class TypeScriptStateFusionStrategy(TypeScriptFusionStrategy):
+    """State fusion for TypeScript (core/state_analysis.py): the
+    four-segment interleave. For a checker "state" is the set of bindings
+    and their inferred types at a point, so a segment of B placed inside
+    A's declarations is checked against types its author never wrote it
+    for — control-flow narrowing, inference from a differently-typed
+    initialiser, overload resolution against another signature set."""
+
+    def _state_prepare(self, host: Seed, donor: Seed):
+        host_body, host_pre = self._split_preamble(host.content)
+        donor_body, donor_pre = self._split_preamble(donor.content)
+        if self.mutation:
+            host_body, donor_body = self.mut.mutate(host_body), self.mut.mutate(donor_body)
+        donor_body, _ = self._dedupe_toplevel(host_body, donor_body, f"d{donor.id[:6]}")
+        return host_body, donor_body, self._merge_preambles(host_pre, donor_pre)
+
+    def _state_seed_metadata(self, host: Seed, donor: Seed) -> dict:
+        return {"type": "typescript", "extension": ".ts"}
+
+    def fuse(self, parent_a: Seed, parent_b: Seed) -> Seed:
+        return self._build_state_fused(parent_a, parent_b, "ab")
+
+    def fuse_bidirectional(self, parent_a: Seed, parent_b: Seed) -> List[Seed]:
+        return [self._build_state_fused(parent_a, parent_b, "ab"),
+                self._build_state_fused(parent_b, parent_a, "ba")]
+
+
+class TypeScriptDeclarationFusionStrategy(TypeScriptFusionStrategy):
+    """Declaration fusion for TypeScript: a type the donor declares is
+    wired into one of the host's declarations — a base class, an
+    implemented interface, an extended interface, an intersection member
+    of a type alias, or the annotation of a variable.
+
+    This is the technique's best fit in the whole campaign. Everything it
+    injects is resolved at *check* time and nothing else: TypeScript
+    erases types, so a declaration-fused child emits the same JavaScript
+    the host would have emitted, and the entire difference is work the
+    checker did — inheritance-chain resolution, structural conformance,
+    variance, intersection reduction. That is the paper's
+    declare/compile-time-only trigger with no runtime component at all.
+    """
+
+    # Donor declarations, with the span of the whole declaration so it can
+    # be copied into the child.
+    _TS_DECL_HEAD_RE = re.compile(
+        r'^(?P<exp>export\s+)?(?P<dec>declare\s+)?(?P<abs>abstract\s+)?'
+        r'(?P<kind>interface|type|class|enum)\s+(?P<name>[A-Za-z_$][\w$]*)'
+        r'(?P<tp><[^<>]*(?:<[^<>]*>[^<>]*)*>)?')
+    _TS_CLASS_HEAD_RE = re.compile(
+        r'^(?P<pre>(?:export\s+)?(?:declare\s+)?(?:abstract\s+)?class\s+'
+        r'(?P<name>[A-Za-z_$][\w$]*)(?P<tp><[^<>]*(?:<[^<>]*>[^<>]*)*>)?)'
+        r'(?P<ext>\s+extends\s+[^{]+?)?(?P<impl>\s+implements\s+[^{]+?)?\s*\{')
+    _TS_IFACE_HEAD_RE = re.compile(
+        r'^(?P<pre>(?:export\s+)?(?:declare\s+)?interface\s+'
+        r'(?P<name>[A-Za-z_$][\w$]*)(?P<tp><[^<>]*(?:<[^<>]*>[^<>]*)*>)?)'
+        r'(?P<ext>\s+extends\s+[^{]+?)?\s*\{')
+    _TS_ALIAS_HEAD_RE = re.compile(
+        r'^(?P<pre>(?:export\s+)?(?:declare\s+)?type\s+'
+        r'(?P<name>[A-Za-z_$][\w$]*)(?P<tp><[^<>]*(?:<[^<>]*>[^<>]*)*>)?\s*=\s*)'
+        r'(?P<rhs>[^;\n]+);?\s*$')
+    _TS_ANNOT_RE = re.compile(
+        r'^(?:export\s+)?(?:declare\s+)?(?:let|const|var)\s+[A-Za-z_$][\w$]*\s*:\s*'
+        r'(?P<ty>[^=;\n]+?)\s*(?==|;|$)')
+    # A parameter or return annotation on a function or method signature.
+    # Far more common than a variable annotation in this corpus, and the
+    # checker path is a different one: a parameter type drives assignability
+    # at every call site, a return type drives inference in the caller.
+    _TS_PARAM_ANNOT_RE = re.compile(
+        r'^[ \t]*(?:export\s+)?(?:declare\s+)?(?:public\s+|private\s+|protected\s+|static\s+|abstract\s+|readonly\s+)*'
+        r'(?:function\s*\*?\s+)?[A-Za-z_$][\w$]*\s*(?:<[^<>()]*>)?\s*'
+        r'\([^()]*?[A-Za-z_$][\w$]*\s*\??\s*:\s*(?P<ty>[A-Za-z_$][\w$.]*(?:<[^<>()]*>)?)')
+    _TS_RETURN_ANNOT_RE = re.compile(
+        r'^[ \t]*(?:export\s+)?(?:declare\s+)?(?:public\s+|private\s+|protected\s+|static\s+|abstract\s+)*'
+        r'(?:function\s*\*?\s+)?[A-Za-z_$][\w$]*\s*(?:<[^<>()]*>)?\s*'
+        r'\([^()]*\)\s*:\s*(?P<ty>[A-Za-z_$][\w$.]*(?:<[^<>()]*>)?)')
+
+    @classmethod
+    def _donor_decls(cls, code):
+        """[(kind, name, generic, start, end)] for every column-zero
+        `interface`/`type`/`class`/`enum`, `end` exclusive.
+
+        A generic donor is kept separately: `class H extends D` needs a
+        type argument when D takes one, and supplying `any` is what makes
+        the injection check rather than fail on arity."""
+        lines = code.splitlines()
+        out = []
+        for i, line in enumerate(lines):
+            m = cls._TS_DECL_HEAD_RE.match(line)
+            if not m:
+                continue
+            kind, name = m.group("kind"), m.group("name")
+            tp = m.group("tp")
+            if kind == "type":
+                # A type alias ends at its `;` or at the first column-zero
+                # line that starts a new statement.
+                j = i
+                while j < len(lines) and not lines[j].rstrip().endswith(";"):
+                    if j > i and lines[j][:1].strip() and not lines[j].startswith(("|", "&", " ", "\t")):
+                        break
+                    j += 1
+                out.append((kind, name, tp, i, min(j + 1, len(lines))))
+                continue
+            # Brace-delimited: to the column-zero `}`.
+            for j in range(i + 1, len(lines)):
+                if lines[j].rstrip() == "}":
+                    out.append((kind, name, tp, i, j + 1))
+                    break
+        return out
+
+    def _host_sites(self, code):
+        """[(kind, line_index)] — where a donor type can be wired in."""
+        sites = []
+        for i, line in enumerate(code.splitlines()):
+            if self._TS_CLASS_HEAD_RE.match(line):
+                sites.append(("class", i))
+            elif self._TS_IFACE_HEAD_RE.match(line):
+                sites.append(("interface", i))
+            elif self._TS_ALIAS_HEAD_RE.match(line):
+                sites.append(("alias", i))
+            elif self._TS_ANNOT_RE.match(line):
+                sites.append(("annotation", i))
+            elif self._TS_RETURN_ANNOT_RE.match(line):
+                sites.append(("return_annotation", i))
+            elif self._TS_PARAM_ANNOT_RE.match(line):
+                sites.append(("param_annotation", i))
+        return sites
+
+    def is_viable_pair(self, parent_a: Seed, parent_b: Seed) -> bool:
+        host, _ = self._split_preamble(parent_a.content)
+        if not self._host_sites(host):
+            return False
+        donor, _ = self._split_preamble(parent_b.content)
+        return bool(self._donor_decls(donor))
+
+    @staticmethod
+    def _ref(name, generic):
+        """A reference to the donor type: `D` or `D<any, any>`. A generic
+        used bare is "requires N type arguments", which is an arity
+        complaint rather than the conformance check this is aiming at."""
+        if not generic:
+            return name
+        n = generic.count(",") + 1
+        return f"{name}<{', '.join(['any'] * n)}>"
+
+    def _wire(self, line, site_kind, donor_kind, ref):
+        """(new_line, applied) or (None, None)."""
+        tag = self._tag("declaration")
+        if site_kind == "class":
+            m = self._TS_CLASS_HEAD_RE.match(line)
+            if donor_kind == "class" and not m.group("ext"):
+                # Only where the host has no base of its own: TypeScript
+                # is single-inheritance, and replacing an existing base
+                # would delete the host's own hierarchy rather than
+                # deepening it.
+                new = m.group("pre") + f" extends {ref}" + (m.group("impl") or "") + " {"
+                return new + line[m.end():] + f"  {tag}", "extends_class"
+            if donor_kind in ("interface", "type", "class"):
+                impl = m.group("impl")
+                new = m.group("pre") + (m.group("ext") or "") + \
+                    ((impl + ", " + ref) if impl else f" implements {ref}") + " {"
+                return new + line[m.end():] + f"  {tag}", "implements"
+            return None, None
+        if site_kind == "interface":
+            if donor_kind not in ("interface", "class", "type"):
+                return None, None
+            m = self._TS_IFACE_HEAD_RE.match(line)
+            ext = m.group("ext")
+            new = m.group("pre") + ((ext + ", " + ref) if ext else f" extends {ref}") + " {"
+            return new + line[m.end():] + f"  {tag}", "interface_extends"
+        if site_kind == "alias":
+            m = self._TS_ALIAS_HEAD_RE.match(line)
+            op = random.choices(("&", "|"), weights=(7, 3))[0]
+            return f"{m.group('pre')}{m.group('rhs')} {op} {ref};  {tag}", \
+                ("alias_intersection" if op == "&" else "alias_union")
+        if site_kind in ("annotation", "param_annotation", "return_annotation"):
+            rx = {"annotation": self._TS_ANNOT_RE,
+                  "param_annotation": self._TS_PARAM_ANNOT_RE,
+                  "return_annotation": self._TS_RETURN_ANNOT_RE}[site_kind]
+            m = rx.match(line)
+            if m is None:
+                return None, None
+            # `A & B` binds tighter than `=>`, but a union or an
+            # intersection inside a parameter list still needs no
+            # parentheses here because the annotation captured is a
+            # single type reference, never a function type.
+            new = line[:m.start("ty")] + f"{m.group('ty')} & {ref}" + line[m.end("ty"):]
+            return new + f"  {tag}", f"{site_kind}_intersection"
+        return None, None
+
+    def _build_declaration_fused(self, host: Seed, donor: Seed, direction: str) -> Seed:
+        host_body, host_pre = self._split_preamble(host.content)
+        donor_body, donor_pre = self._split_preamble(donor.content)
+        if self.mutation:
+            host_body, donor_body = self.mut.mutate(host_body), self.mut.mutate(donor_body)
+        donor_body, collisions = self._dedupe_toplevel(host_body, donor_body, f"d{donor.id[:6]}")
+
+        applied = None
+        lines = host_body.splitlines()
+        sites = self._host_sites(host_body)
+        decls = self._donor_decls(donor_body)
+        if sites and decls:
+            random.shuffle(sites)
+            for site_kind, hi in sites[:4]:
+                kind, name, tp, ds, de = random.choice(decls)
+                new_line, applied = self._wire(lines[hi], site_kind, kind,
+                                               self._ref(name, tp))
+                if new_line is None:
+                    continue
+                lines[hi] = new_line
+                # The whole donor half goes in front of the host's, not
+                # just the chosen declaration. A declaration's body names
+                # other things the donor file declares — a member typed by
+                # a sibling interface, a base class two lines up — and
+                # copying it alone left those unresolved: "Cannot find
+                # name" was 55% of this strategy's failures. Both parents
+                # are present in the child either way, which is what the
+                # other executing-language adapters do (V8's assembles
+                # donor body then host body for the same reason).
+                donor_lines = donor_body.splitlines()
+                if ds < len(donor_lines):
+                    donor_lines[ds] = f"{donor_lines[ds]}  {self._tag('declaration')}"
+                lines[0:0] = donor_lines + [""]
+                break
+            else:
+                applied = None
+
+        content = ("\n".join(self._merge_preambles(host_pre, donor_pre)) + "\n"
+                   if (host_pre or donor_pre) else "") + "\n".join(lines).rstrip("\n") + "\n"
+        return Seed(content=content, metadata={
+            "parents": [host.id, donor.id],
+            "type": "typescript",
+            "extension": ".ts",
+            "renamed": sorted(collisions),
+            "mode": f"decl_{applied or 'none'}_{direction}",
+            "description": f"Declaration-fused {host.id} <- {donor.id} ({direction})",
+        })
+
+    def fuse(self, parent_a: Seed, parent_b: Seed) -> Seed:
+        return self._build_declaration_fused(parent_a, parent_b, "ab")
+
+    def fuse_bidirectional(self, parent_a: Seed, parent_b: Seed) -> List[Seed]:
+        return [self._build_declaration_fused(parent_a, parent_b, "ab"),
+                self._build_declaration_fused(parent_b, parent_a, "ba")]
+
+
+# ==========================================
+# R Specific Fusion Strategy
+# ==========================================
+
+class RFusionStrategy(FusionStrategy):
+    """R (projects/r). Seeds are *executed*, so "valid" means the fused
+    script ran to completion (projects/r/config.yaml).
+
+    R has one scope rule that decides what a rename can reach: an
+    assignment anywhere in top-level code creates a global, including
+    inside an `if`/`for`/`while` body, because R scopes to the function
+    and not to the block. Only a `function(...) { ... }` body is a new
+    scope. So A donates every name it assigns outside a function body,
+    and B's uses of it really do read A's value once the two halves are
+    concatenated.
+
+    The kinded draw (85%) is CPython's: a name B *calls* is replaced by
+    one of A's functions, a name B uses as a value by one of A's values.
+    "attempt to apply non-function" is R's version of "'X' object is not
+    callable", and it is raised before the call's arguments are even
+    evaluated.
+    """
+
+    LANGUAGE = "r"
+
+    _DATAFLOW_KEYWORDS = frozenset({
+        "if", "else", "for", "while", "repeat", "function", "return",
+        "break", "next", "in", "TRUE", "FALSE", "NULL", "NA", "Inf", "NaN",
+        "NA_integer_", "NA_real_", "NA_character_", "Recall", "on.exit",
+        "library", "require", "requireNamespace", "invisible", "print",
+        "cat", "paste", "paste0", "c", "list", "vector", "matrix", "array",
+        "data.frame", "length", "names", "dim", "nrow", "ncol", "sum",
+        "mean", "seq", "seq_len", "seq_along", "rep", "which", "sapply",
+        "lapply", "vapply", "mapply", "apply", "Reduce", "Filter", "Map",
+        "do.call", "stopifnot", "identical", "all.equal", "is.null",
+        "class", "attr", "attributes", "structure", "inherits", "setClass",
+        "setGeneric", "setMethod", "setValidity", "new", "slot", "methods",
+        "UseMethod", "NextMethod", "standardGeneric", "suppressWarnings",
+        "tryCatch", "try", "stop", "warning", "message", "quote", "eval",
+        "parse", "deparse", "substitute", "match.arg", "missing", "nargs",
+        "Sys.time", "set.seed", "options", "environment", "globalenv",
+        "T", "F", "pi", "letters", "LETTERS", "x", "i",
+    })
+
+    _R_ASSIGN_RE = re.compile(
+        r'^(\s*)([A-Za-z._][\w._]*)\s*(<<?-|=(?!=))', re.M)
+    _R_FUN_ASSIGN_RE = re.compile(
+        r'^\s*([A-Za-z._][\w._]*)\s*(?:<<?-|=(?!=))\s*function\s*\(', re.M)
+    _R_ARROW_RIGHT_RE = re.compile(r'->>?\s*([A-Za-z._][\w._]*)')
+    _R_CALL_RE = re.compile(r'(?<![\w._$@])([A-Za-z._][\w._]*)\s*\(')
+    _KIND_AWARE_SHARE = 0.85
+    _UNGATED_SHARE = 0.1
+
+    def __init__(self, project_root="projects/r", lightweight: bool = False):
+        self.project_root = project_root
+        self.mutation = True
+        self.mut = BaseMutator()
+        self.lightweight = lightweight
+
+    # ── scope ────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _function_spans(code):
+        """Character spans of `function(...) { ... }` bodies — R's only
+        block that introduces a scope. An assignment inside one is local
+        to the call, so it is not a name A can donate."""
+        spans = []
+        for m in re.finditer(r'\bfunction\s*\(', code):
+            i, depth = m.end() - 1, 0
+            n = len(code)
+            while i < n:                       # skip the formals
+                if code[i] == "(":
+                    depth += 1
+                elif code[i] == ")":
+                    depth -= 1
+                    if depth == 0:
+                        i += 1
+                        break
+                i += 1
+            while i < n and code[i] in " \t\n":
+                i += 1
+            if i < n and code[i] == "{":
+                depth, start = 0, i
+                while i < n:
+                    if code[i] == "{":
+                        depth += 1
+                    elif code[i] == "}":
+                        depth -= 1
+                        if depth == 0:
+                            spans.append((start, i + 1))
+                            break
+                    i += 1
+            elif i < n:                        # one-expression body
+                nl = code.find("\n", i)
+                spans.append((i, nl if nl != -1 else n))
+        return spans
+
+    def _toplevel_names(self, code):
+        """Names assigned in top-level code (any indentation, outside a
+        function body) — R's globals."""
+        clean = self._strip_comments(code)
+        spans = self._function_spans(clean)
+        out = set()
+        for m in self._R_ASSIGN_RE.finditer(clean):
+            if not any(a <= m.start(2) < b for a, b in spans):
+                out.add(m.group(2))
+        for m in self._R_ARROW_RIGHT_RE.finditer(clean):
+            if not any(a <= m.start(1) < b for a, b in spans):
+                out.add(m.group(1))
+        return {n for n in out if n not in self._DATAFLOW_KEYWORDS}
+
+    def _toplevel_functions(self, code):
+        clean = self._strip_comments(code)
+        spans = self._function_spans(clean)
+        return {m.group(1) for m in self._R_FUN_ASSIGN_RE.finditer(clean)
+                if not any(a <= m.start(1) < b for a, b in spans)
+                and m.group(1) not in self._DATAFLOW_KEYWORDS}
+
+    # ── dataflow hooks ───────────────────────────────────────────────
+
+    def _dataflow_names(self, code: str) -> List[str]:
+        clean = self._strip_comments(code)
+        names = [m.group(2) for m in self._R_ASSIGN_RE.finditer(clean)]
+        names += self._R_ARROW_RIGHT_RE.findall(clean)
+        names += self._R_CALL_RE.findall(clean)
+        return [n for n in dict.fromkeys(names) if n not in self._DATAFLOW_KEYWORDS]
+
+    def _visible_dataflow_names(self, code: str):
+        return self._toplevel_names(code)
+
+    def _dataflow_replace(self, code: str, old: str, new: str) -> str:
+        """Rename use sites: never after `$`, `@` or `::` (a component or
+        a namespaced name), never a `name =` argument label, never the
+        left side of the assignment that defines it, and never in a
+        comment."""
+        pat = re.compile(r'(?<![\w._$@])' + re.escape(old) + r'(?![\w._])')
+        matches, lhs = [], []
+        for m in pat.finditer(code):
+            ls = code.rfind("\n", 0, m.start()) + 1
+            head = code[ls:m.start()]
+            if head.lstrip().startswith("#"):
+                continue
+            if re.match(r'\s*::', code[m.end():]):
+                continue
+            tail = code[m.end():m.end() + 4]
+            # `f(name = value)` is an argument label, not a use of `name`.
+            if re.match(r'\s*=(?!=)', tail) and not re.match(r'^\s*$', head) \
+                    and head.rstrip().endswith((",", "(")):
+                continue
+            if re.match(r'\s*(?:<<?-|=(?!=))', tail):
+                lhs.append(m)
+            else:
+                matches.append(m)
+        matches = matches or lhs
+        if not matches:
+            return code
+        n = min(pick_occurrence_count(), len(matches))
+        for m in sorted(random.sample(matches, n), key=lambda x: x.start(), reverse=True):
+            code = code[:m.start()] + new + code[m.end():]
+        return code
+
+    def _kind(self, name, code):
+        if re.search(r'(?<![\w._$@])' + re.escape(name) + r'\s*\(', code):
+            return "callable"
+        return "value"
+
+    # What a name was assigned, when the right-hand side says so plainly.
+    # R is dynamically typed, so this is the same trick the C adapter's
+    # _infer_c_var_types plays: pair like with like where the corpus
+    # makes the type obvious, and fall back to any value otherwise.
+    _R_TYPE_PATTERNS = (
+        ("character", re.compile(r'^\s*(?:["\']|c\s*\(\s*["\']|paste0?\s*\(|'
+                                 r'sprintf\s*\(|format\s*\(|letters\b|LETTERS\b|month\.name\b)')),
+        ("logical", re.compile(r'^\s*(?:TRUE\b|FALSE\b|T\b|F\b|is\.\w+\s*\(|'
+                               r'c\s*\(\s*(?:TRUE|FALSE)\b|!)')),
+        ("list", re.compile(r'^\s*(?:list\s*\(|data\.frame\s*\(|as\.list\s*\(|'
+                            r'split\s*\(|lapply\s*\(|strsplit\s*\()')),
+        ("function", re.compile(r'^\s*function\s*\(')),
+        ("numeric", re.compile(r'^\s*(?:-?\d|c\s*\(\s*-?[\d.]|seq\w*\s*\(|rep\s*\(|'
+                               r'r(?:norm|unif|pois|binom|exp|gamma|beta|cauchy|t|chisq)\s*\(|'
+                               r'numeric\s*\(|1:|matrix\s*\(|array\s*\(|sum\s*\(|mean\s*\(|'
+                               r'length\s*\(|sample\s*\(|apply\s*\(|colSums\s*\(|rowSums\s*\(|'
+                               r'sapply\s*\(|vapply\s*\(|nchar\s*\(|which\s*\(|round\s*\()')),
+        # The four kinds this corpus is actually made of, past the
+        # primitives: R's documentation examples are statistics, and 40%
+        # of top-level names had no inferred type at all — the misses
+        # were dominated by fitted models (lm/glm/nls and everything
+        # derived from them), factors, graphics objects and connections.
+        # Pairing a model with a model keeps `coef(x)`/`predict(x)`
+        # working in the other half; pairing one with a number does not.
+        ("model", re.compile(r'^\s*(?:lm|glm|nls|aov|loess|lqs|rlm|gam|arima|princomp|'
+                             r'prcomp|kmeans|hclust|dist|density|ecdf|smooth\.spline|'
+                             r'update|anova|summary|predict|fitted|resid(?:uals)?|coef)\s*\(')),
+        ("factor", re.compile(r'^\s*(?:factor|as\.factor|cut|gl|interaction|droplevels)\s*\(')),
+        ("grob", re.compile(r'^\s*(?:\w*[Gg]rob|gpar|unit|viewport|par|trellis\.\w+)\s*\(')),
+        ("connection", re.compile(r'^\s*(?:file|tempfile|url|gzfile|bzfile|textConnection|'
+                                  r'rawConnection|pipe|socketConnection)\s*\(')),
+        ("s4", re.compile(r'^\s*(?:new|methods::new)\s*\(')),
+        ("environment", re.compile(r'^\s*(?:new\.env|globalenv|emptyenv|environment|as\.environment)\s*\(')),
+        ("formula", re.compile(r'^\s*(?:~|as\.formula\s*\(|formula\s*\()')),
+        ("date", re.compile(r'^\s*(?:Sys\.time|Sys\.Date|as\.Date|as\.POSIXct|as\.POSIXlt|strptime)\s*\(')),
+    )
+    _TYPED_RENAME_SHARE = 0.9
+
+    def _infer_r_types(self, code):
+        """{name: type} for names whose assignment gives the type away."""
+        clean = self._strip_comments(code)
+        spans = self._function_spans(clean)
+        out = {}
+        for m in self._R_ASSIGN_RE.finditer(clean):
+            if any(a <= m.start(2) < b for a, b in spans):
+                continue
+            rhs = clean[m.end():clean.find("\n", m.end()) if clean.find("\n", m.end()) != -1 else len(clean)]
+            for tname, rx in self._R_TYPE_PATTERNS:
+                if rx.match(rhs):
+                    out[m.group(2)] = tname
+                    break
+        return out
+
+    def rename_across(self, code_a: str, code_b: str, names_a=None, names_b=None):
+        names_a = [n for n in (names_a or self._dataflow_names(code_a))
+                   if n not in self._DATAFLOW_KEYWORDS]
+        names_b = [n for n in (names_b or self._dataflow_names(code_b))
+                   if n not in self._DATAFLOW_KEYWORDS]
+        if names_b and random.random() < self._KIND_AWARE_SHARE:
+            funs_a = self._toplevel_functions(code_a)
+            vals_a = self._toplevel_names(code_a) - funs_a
+            usable = [n for n in names_b
+                      if self._dataflow_replace(code_b, n, n + ".fflprobe") != code_b] or names_b
+            types_a = self._infer_r_types(code_a)
+            types_b = self._infer_r_types(code_b)
+            for var_b in random.sample(usable, min(len(usable), 8)):
+                pool = funs_a if self._kind(var_b, code_b) == "callable" else vals_a
+                pool = [n for n in sorted(pool) if n != var_b]
+                want = types_b.get(var_b)
+                if want and random.random() < self._TYPED_RENAME_SHARE:
+                    same = [n for n in pool if types_a.get(n) == want]
+                    pool = same or pool
+                if not pool:
+                    continue
+                renamed = self._dataflow_replace(code_b, var_b, random.choice(pool))
+                if renamed != code_b:
+                    return code_a, self._tag_renamed_lines(code_b, renamed)
+            if random.random() >= self._UNGATED_SHARE:
+                return code_a, code_b
+        return super().rename_across(code_a, code_b, names_a, names_b)
+
+    # ── instrumentation ─────────────────────────────────────────────
+
+    def _instrumentation_r(self, names):
+        """Probes over whatever the two halves left behind, each wrapped
+        so it cannot fail the child on its own: a garbage collection with
+        the write barrier active, a serialize/unserialize round trip, and
+        a forced byte-compilation of a value's deparse — the paths where
+        an object the fusion built wrongly shows up."""
+        if not names or random.random() < 0.5:
+            return ""
+        v = random.choice(sorted(names))
+        primitives = [
+            "gc(verbose = FALSE, full = TRUE)",
+            f"invisible(unserialize(serialize({v}, NULL)))",
+            f"invisible(capture.output(str({v})))",
+            f"invisible(identical({v}, {v}))",
+            f"invisible(tryCatch(compiler::compile(quote({v})), error = function(e) NULL))",
+            f"invisible(attributes({v}))",
+            f"invisible(format({v}))",
+        ]
+        body = "\n".join(f"  {p}" for p in random.sample(primitives, random.randint(1, 3)))
+        return (f"\ntry({{  {self._tag('dataflow')}\n{body}\n}}, silent = TRUE)\n")
+
+    # ── fuse ─────────────────────────────────────────────────────────
+
+    def fuse(self, parent_a: Seed, parent_b: Seed) -> Seed:
+        a_body, b_body = parent_a.content, parent_b.content
+        if self.mutation:
+            a_body, b_body = self.mut.mutate(a_body), self.mut.mutate(b_body)
+        # A donates, so A's half runs first. When A assigns nothing at
+        # top level and B does, the two swap: R reads a global only after
+        # the assignment that created it has run.
+        swapped = False
+        if not self._toplevel_names(a_body) and self._toplevel_names(b_body) \
+                and random.random() < self._VISIBLE_RENAME_SHARE:
+            swapped = True
+            a_body, b_body = b_body, a_body
+        before_b = b_body
+        a_body, b_body = self.rename_across(a_body, b_body)
+        renamed_any = b_body != before_b
+        if not renamed_any and not swapped:
+            # Nothing in A could stand in for anything B uses — almost
+            # always because B's names are calls and A defines no
+            # function of its own (78 of 84 no-edge pairs). The reverse
+            # direction is a different question with a different answer,
+            # so it is asked before giving up: B donates, and B's half
+            # goes first because R resolves a name only once the
+            # assignment that created it has run.
+            swapped_a, swapped_b = b_body, a_body
+            before = swapped_b
+            swapped_a, swapped_b = self.rename_across(swapped_a, swapped_b)
+            if swapped_b != before:
+                a_body, b_body = swapped_a, swapped_b
+                renamed_any, swapped = True, True
+        content = a_body.rstrip("\n") + "\n\n" + b_body.rstrip("\n") + "\n"
+        content += self._instrumentation_r(self._toplevel_names(a_body))
+        return Seed(content=content, metadata={
+            "parents": [parent_a.id, parent_b.id],
+            "type": "r",
+            "extension": ".R",
+            "mode": ("df_ba" if swapped else "df_ab") if renamed_any else "df_none_ab",
+            "description": f"Fused {parent_a.id} + {parent_b.id}",
+        })
+
+
+class RStateFusionStrategy(RFusionStrategy):
+    """State fusion for R (core/state_analysis.py): the four-segment
+    interleave. R's globals make this the strongest of the three here —
+    B's continuation runs against every binding A's prefix created, and
+    R resolves a name at *use* time, so the second half sees whatever the
+    first half last assigned rather than what its author wrote."""
+
+    def _state_prepare(self, host: Seed, donor: Seed):
+        host_body, donor_body = host.content, donor.content
+        if self.mutation:
+            host_body, donor_body = self.mut.mutate(host_body), self.mut.mutate(donor_body)
+        return host_body, donor_body, []
+
+    def _state_seed_metadata(self, host: Seed, donor: Seed) -> dict:
+        return {"type": "r", "extension": ".R"}
+
+    def fuse(self, parent_a: Seed, parent_b: Seed) -> Seed:
+        return self._build_state_fused(parent_a, parent_b, "ab")
+
+    def fuse_bidirectional(self, parent_a: Seed, parent_b: Seed) -> List[Seed]:
+        return [self._build_state_fused(parent_a, parent_b, "ab"),
+                self._build_state_fused(parent_b, parent_a, "ba")]
+
+
+class RDeclarationFusionStrategy(RFusionStrategy):
+    """Declaration fusion for R, through the S4 class system.
+
+    `setClass`, `setGeneric` and `setMethod` are ordinary function calls,
+    but what they do is declaration work and they do all of it when the
+    call is reached: `setClass` resolves `contains=`, linearises the
+    superclass chain, builds and validates the prototype;  `setMethod`
+    checks the method's formal arguments against the generic's and
+    inserts it into the method table. None of that needs the class to be
+    instantiated or the method to be called, which is what makes it R's
+    analogue of a compile-time-only declaration check.
+
+    Two modes, because only 27 of this corpus's seeds call `setClass` at
+    all:
+      * `contains` — the donor declares a class, the host's own
+        `setClass` gains it as a superclass;
+      * `generic` — the donor declares a plain function, which becomes
+        the method of a new generic whose formals must match it.
+    """
+
+    _R_SETCLASS_RE = re.compile(
+        r'^\s*(?:([A-Za-z._][\w._]*)\s*(?:<<?-|=)\s*)?set(?:Class|RefClass)\s*\(\s*'
+        r'(["\'])([A-Za-z._][\w._]*)\2', re.M)
+    _R_FUN_DEF_RE = re.compile(
+        r'^([A-Za-z._][\w._]*)\s*(?:<<?-|=(?!=))\s*function\s*\(([^)]*)\)', re.M)
+
+    def _donor_classes(self, code):
+        return [m.group(3) for m in self._R_SETCLASS_RE.finditer(self._strip_comments(code))]
+
+    def _donor_functions(self, code):
+        """[(name, formals)] for top-level `f <- function(...)`, formals
+        free of defaults that name other things the donor declares."""
+        clean = self._strip_comments(code)
+        spans = self._function_spans(clean)
+        out = []
+        for m in self._R_FUN_DEF_RE.finditer(clean):
+            if any(a <= m.start(1) < b for a, b in spans):
+                continue
+            raw = m.group(2)
+            # Names only, defaults dropped, `...` noted separately.
+            # `setMethod` matches the method's formals against the
+            # generic's and neither a default nor `...` survives that
+            # comparison — "Error in matchSignature(signature, fdef)" was
+            # every one of this mode's failures. Rather than skip such a
+            # donor (which halved how often the strategy fired), the
+            # method is a plain-formals wrapper that forwards to it.
+            dots = "..." in raw
+            formals = []
+            for part in raw.split(","):
+                name = part.split("=")[0].strip()
+                if re.fullmatch(r'[A-Za-z._][\w._]*', name or ""):
+                    formals.append(name)
+            if formals:
+                out.append((m.group(1), formals, dots))
+        return out
+
+    def _host_setclass_lines(self, code):
+        return [i for i, line in enumerate(code.splitlines())
+                if self._R_SETCLASS_RE.match(line) and "contains" not in line]
+
+    def is_viable_pair(self, parent_a: Seed, parent_b: Seed) -> bool:
+        donor = parent_b.content
+        if self._donor_classes(donor) and self._host_setclass_lines(parent_a.content):
+            return True
+        return bool(self._donor_functions(donor))
+
+    def _build_declaration_fused(self, host: Seed, donor: Seed, direction: str) -> Seed:
+        host_body, donor_body = host.content, donor.content
+        if self.mutation:
+            host_body, donor_body = self.mut.mutate(host_body), self.mut.mutate(donor_body)
+        tag = self._tag("declaration")
+        applied = None
+        lines = host_body.splitlines()
+
+        classes = self._donor_classes(donor_body)
+        sites = self._host_setclass_lines(host_body)
+        if classes and sites:
+            cls = random.choice(classes)
+            hi = random.choice(sites)
+            line = lines[hi]
+            # Insert `contains=` as the last argument of the setClass call
+            # on this line; a call that spans lines is left alone.
+            k = line.rfind(")")
+            if k != -1:
+                lines[hi] = f'{line[:k]}, contains = "{cls}"{line[k:]}  {tag}'
+                applied = "contains"
+        if applied is None:
+            funs = self._donor_functions(donor_body)
+            if funs:
+                name, formals, dots = random.choice(funs)
+                gen = f"ffl.g{abs(hash(name)) % 9973}"
+                sig = ", ".join('"ANY"' for _ in formals)
+                arglist = ", ".join(formals) + (", ..." if dots else "")
+                call = ", ".join(formals) + (", ..." if dots else "")
+                # Both calls on one physical line. They are two separate
+                # top-level statements, so a state cut in a chain may
+                # legally land between them — and a `setMethod` for a
+                # generic that the other program's text now separates
+                # from its `setGeneric` fails. Chains beginning with
+                # declaration measured 14% valid against state's 95%.
+                # A wrapper, not the donor itself: the donor may carry
+                # defaults or `...` that setMethod's formals check
+                # rejects, and forwarding still runs the donor's body
+                # under the generic's dispatch.
+                block = [
+                    f'setGeneric("{gen}", function({arglist}) standardGeneric("{gen}")); '
+                    f'setMethod("{gen}", signature({sig}), '
+                    f'function({arglist}) {name}({call}))  {tag}',
+                ]
+                lines = lines + [""] + block
+                applied = "generic"
+
+        content = donor_body.rstrip("\n") + "\n\n" + "\n".join(lines).rstrip("\n") + "\n"
+        return Seed(content=content, metadata={
+            "parents": [host.id, donor.id],
+            "type": "r",
+            "extension": ".R",
+            "mode": f"decl_{applied or 'none'}_{direction}",
+            "description": f"Declaration-fused {host.id} <- {donor.id} ({direction})",
+        })
+
+    def fuse(self, parent_a: Seed, parent_b: Seed) -> Seed:
+        return self._build_declaration_fused(parent_a, parent_b, "ab")
+
+    def fuse_bidirectional(self, parent_a: Seed, parent_b: Seed) -> List[Seed]:
+        return [self._build_declaration_fused(parent_a, parent_b, "ab"),
+                self._build_declaration_fused(parent_b, parent_a, "ba")]
+
+
+# ==========================================
+# Julia Specific Fusion Strategy
+# ==========================================
+
+class JuliaFusionStrategy(FusionStrategy):
+    """Julia (projects/julia). Seeds are *executed*, and Julia compiles
+    as it runs: a single script goes through the parser, lowering, type
+    inference, the optimiser and LLVM before any of its own work
+    happens, so a fused program exercises a compiler and a runtime at
+    once.
+
+    Scope decides what a rename can reach, and Julia's rule is stricter
+    than Ruby's or R's: a `for`, `while` or `let` body at top level is
+    its own scope, so an assignment inside one is *not* a global. Only
+    an assignment at top level outside every block donates a name that
+    B's half can read. Functions, `struct`s and `abstract type`s are
+    global wherever they are declared.
+
+    The kinded draw (85%) has three namespaces rather than two: a name B
+    *calls* is replaced by one of A's functions, a name B uses in a type
+    position (after `::`, `<:`, or inside `{}`) by one of A's types, and
+    a plain value by one of A's globals. Julia reports the mismatches as
+    `MethodError` and `UndefVarError` — before running anything, since
+    the call is resolved by dispatch.
+    """
+
+    LANGUAGE = "julia"
+
+    _DATAFLOW_KEYWORDS = frozenset({
+        "function", "end", "if", "else", "elseif", "for", "while", "begin",
+        "let", "do", "try", "catch", "finally", "return", "break", "continue",
+        "struct", "mutable", "abstract", "type", "primitive", "module",
+        "using", "import", "export", "const", "global", "local", "quote",
+        "macro", "where", "in", "isa", "true", "false", "nothing", "missing",
+        "Inf", "NaN", "Any", "Nothing", "Missing", "Union", "Tuple", "Vector",
+        "Matrix", "Array", "Dict", "Set", "String", "Symbol", "Int", "Int8",
+        "Int16", "Int32", "Int64", "UInt", "UInt8", "Float16", "Float32",
+        "Float64", "Bool", "Char", "Number", "Real", "Integer", "AbstractArray",
+        "AbstractString", "Base", "Core", "Main", "Test", "print", "println",
+        "push!", "length", "size", "zeros", "ones", "rand", "collect", "map",
+        "filter", "reduce", "sum", "typeof", "eltype", "convert", "error",
+        "throw", "@test", "@testset", "@test_throws", "@inferred",
+        # The corpus's own value digest (projects/julia/setup.py
+        # _DIGEST_LINE). Renaming it would break the child on the probe
+        # rather than on the program.
+        "FFLD", "fflv", "fflx", "fflk",
+    })
+
+    _JL_ASSIGN_RE = re.compile(
+        r'^(?P<indent>[ \t]*)(?:const\s+|global\s+)?(?P<name>[A-Za-z_][\w!]*)'
+        r'\s*(?:::[^=\n]+)?=(?![=>])', re.M)
+    _JL_FUNC_RE = re.compile(
+        r'^[ \t]*function\s+([A-Za-z_][\w!]*)|^[ \t]*([A-Za-z_][\w!]*)\s*\([^)\n]*\)\s*=(?![=>])',
+        re.M)
+    _JL_TYPE_RE = re.compile(
+        r'^[ \t]*(?:mutable\s+)?struct\s+([A-Za-z_]\w*)|'
+        r'^[ \t]*abstract\s+type\s+([A-Za-z_]\w*)|'
+        r'^[ \t]*primitive\s+type\s+([A-Za-z_]\w*)', re.M)
+    _JL_CALL_RE = re.compile(r'(?<![\w.!@])([A-Za-z_][\w!]*)\s*\(')
+    # A type position: after `::`, after `<:`, or inside `{...}`.
+    _JL_TYPE_POS_RE = re.compile(r'(?:::\s*|<:\s*|\{\s*|,\s*(?=[^()]*\})|\bisa\s+)$')
+    _KIND_AWARE_SHARE = 0.85
+    _UNGATED_SHARE = 0.1
+
+    def __init__(self, project_root="projects/julia", lightweight: bool = False):
+        self.project_root = project_root
+        self.mutation = True
+        self.mut = BaseMutator()
+        self.lightweight = lightweight
+
+    # ── scope ────────────────────────────────────────────────────────
+
+    def _global_names(self, code):
+        """Names a fused second half can actually read: assignments at
+        top level (column zero, outside every block) plus every function
+        and type, which are global wherever they are written."""
+        clean = self._strip_comments(code)
+        out = {m.group("name") for m in self._JL_ASSIGN_RE.finditer(clean)
+               if not m.group("indent")}
+        out |= self._function_names(code) | self._type_names(code)
+        return {n for n in out if n not in self._DATAFLOW_KEYWORDS}
+
+    def _function_names(self, code):
+        clean = self._strip_comments(code)
+        return {g for m in self._JL_FUNC_RE.finditer(clean) for g in m.groups()
+                if g and g not in self._DATAFLOW_KEYWORDS}
+
+    def _type_names(self, code):
+        clean = self._strip_comments(code)
+        return {g for m in self._JL_TYPE_RE.finditer(clean) for g in m.groups()
+                if g and g not in self._DATAFLOW_KEYWORDS}
+
+    # ── dataflow hooks ───────────────────────────────────────────────
+
+    def _dataflow_names(self, code: str) -> List[str]:
+        clean = self._strip_comments(code)
+        names = [m.group("name") for m in self._JL_ASSIGN_RE.finditer(clean)]
+        names += [g for m in self._JL_FUNC_RE.finditer(clean) for g in m.groups() if g]
+        names += [g for m in self._JL_TYPE_RE.finditer(clean) for g in m.groups() if g]
+        names += self._JL_CALL_RE.findall(clean)
+        return [n for n in dict.fromkeys(names) if n not in self._DATAFLOW_KEYWORDS]
+
+    def _visible_dataflow_names(self, code: str):
+        return self._global_names(code)
+
+    def _dataflow_replace(self, code: str, old: str, new: str) -> str:
+        """Rename use sites: never after `.` (a field or a module member),
+        never after `@` (a macro), never the name being defined, and
+        never on a comment line."""
+        pat = re.compile(r'(?<![\w.!@])' + re.escape(old) + r'(?![\w!])')
+        decl = re.compile(r'(?:function|struct|abstract\s+type|primitive\s+type|macro)\s+$')
+        matches, lhs = [], []
+        for m in pat.finditer(code):
+            ls = code.rfind("\n", 0, m.start()) + 1
+            head = code[ls:m.start()]
+            if head.lstrip().startswith("#") or decl.search(head):
+                continue
+            if re.match(r'\s*=(?![=>])', code[m.end():m.end() + 3]):
+                lhs.append(m)
+            else:
+                matches.append(m)
+        matches = matches or lhs
+        if not matches:
+            return code
+        n = min(pick_occurrence_count(), len(matches))
+        for m in sorted(random.sample(matches, n), key=lambda x: x.start(), reverse=True):
+            code = code[:m.start()] + new + code[m.end():]
+        return code
+
+    def _use_kind(self, name, code):
+        if name in self._type_names(code):
+            return "type"
+        for m in re.finditer(r'(?<![\w.!@])' + re.escape(name) + r'(?![\w!])', code):
+            ls = code.rfind("\n", 0, m.start()) + 1
+            if self._JL_TYPE_POS_RE.search(code[ls:m.start()]):
+                return "type"
+        if re.search(r'(?<![\w.!@])' + re.escape(name) + r'\s*\(', code):
+            return "callable"
+        return "value"
+
+    def rename_across(self, code_a: str, code_b: str, names_a=None, names_b=None):
+        names_a = [n for n in (names_a or self._dataflow_names(code_a))
+                   if n not in self._DATAFLOW_KEYWORDS]
+        names_b = [n for n in (names_b or self._dataflow_names(code_b))
+                   if n not in self._DATAFLOW_KEYWORDS]
+        if names_b and random.random() < self._KIND_AWARE_SHARE:
+            globals_a = self._global_names(code_a)
+            funs_a = self._function_names(code_a) & globals_a
+            types_a = self._type_names(code_a) & globals_a
+            values_a = globals_a - funs_a - types_a
+            usable = [n for n in names_b
+                      if self._dataflow_replace(code_b, n, n + "_fflprobe") != code_b] or names_b
+            for var_b in random.sample(usable, min(len(usable), 8)):
+                kind = self._use_kind(var_b, code_b)
+                pool = types_a if kind == "type" else funs_a if kind == "callable" else values_a
+                pool = [n for n in sorted(pool) if n != var_b]
+                if not pool:
+                    continue
+                renamed = self._dataflow_replace(code_b, var_b, random.choice(pool))
+                if renamed != code_b:
+                    return code_a, self._tag_renamed_lines(code_b, renamed)
+            if random.random() >= self._UNGATED_SHARE:
+                return code_a, code_b
+        return super().rename_across(code_a, code_b, names_a, names_b)
+
+    # ── instrumentation ─────────────────────────────────────────────
+
+    def _instrumentation_julia(self, names):
+        """Probes over what the two halves left behind, on one physical
+        line so a later state cut cannot split them, and inside a `try`
+        so they cannot fail the child on their own. Aimed at the parts
+        that carry Julia's invariants: the garbage collector, type
+        inference over a value whose type the fusion changed, and the
+        code generator asked to specialise for it."""
+        if not names or random.random() < 0.5:
+            return ""
+        v = random.choice(sorted(names))
+        primitives = [
+            "GC.gc(true)",
+            "GC.gc(false); GC.safepoint()",
+            f"typeof({v}); Base.summarysize({v})",
+            f"sprint(show, {v})",
+            f"deepcopy({v})",
+            f"hash({v}); objectid({v})",
+            f"Base.return_types(identity, (typeof({v}),))",
+            f"code_typed(identity, (typeof({v}),); optimize=true)",
+            f"isbits({v}) || isstructtype(typeof({v}))",
+        ]
+        body = "; ".join(random.sample(primitives, random.randint(1, 3)))
+        return f"\ntry; {body}; catch; end  {self._tag('dataflow')}\n"
+
+    # ── fuse ─────────────────────────────────────────────────────────
+
+    # `using`/`import`, and the corpus's own value-digest line, which
+    # defines `fflv`. Both parents carry a digest line and the callers
+    # deduplicate the preamble, so a fused child gets exactly one, at
+    # the top — where it has to be: a state cut can put a half that
+    # *calls* `fflv` ahead of the half that defines it, and the child
+    # would then die with `UndefVarError: fflv` on the instrumentation
+    # rather than on the program.
+    _JL_PREAMBLE_RE = re.compile(
+        r'^\s*(?:using|import)\s+[\w.,: ]+$|^const FFLD = Base\.Ref\(')
+
+    def _split_preamble(self, code):
+        """(body, preamble). `using`/`import` belong at the top of the
+        fused file; Julia allows them anywhere at top level, but a
+        `using` after the code that needs it is a name error."""
+        pre, body = [], []
+        for line in code.splitlines():
+            (pre if self._JL_PREAMBLE_RE.match(line) else body).append(line)
+        return "\n".join(body), pre
+
+    def fuse(self, parent_a: Seed, parent_b: Seed) -> Seed:
+        a_body, a_pre = self._split_preamble(parent_a.content)
+        b_body, b_pre = self._split_preamble(parent_b.content)
+        if self.mutation:
+            a_body, b_body = self.mut.mutate(a_body), self.mut.mutate(b_body)
+        swapped = False
+        if not self._global_names(a_body) and self._global_names(b_body) \
+                and random.random() < self._VISIBLE_RENAME_SHARE:
+            swapped = True
+            a_body, b_body = b_body, a_body
+            a_pre, b_pre = b_pre, a_pre
+        before_b = b_body
+        a_body, b_body = self.rename_across(a_body, b_body)
+        renamed_any = b_body != before_b
+        if not renamed_any and not swapped:
+            # Nothing of A's could stand in for anything B uses — most
+            # often because B's names are calls and A defines no
+            # function of its own. The reverse direction is a different
+            # question with a different answer, so it is asked before
+            # giving up (the R adapter does the same).
+            sa, sb = b_body, a_body
+            before = sb
+            sa, sb = self.rename_across(sa, sb)
+            if sb != before:
+                a_body, b_body = sa, sb
+                a_pre, b_pre = b_pre, a_pre
+                renamed_any, swapped = True, True
+        pre = list(dict.fromkeys([p.strip() for p in a_pre + b_pre if p.strip()]))
+        content = ("\n".join(pre) + "\n\n" if pre else "") + \
+                  a_body.rstrip("\n") + "\n\n" + b_body.rstrip("\n") + "\n"
+        content += self._instrumentation_julia(self._global_names(a_body))
+        return Seed(content=content, metadata={
+            "parents": [parent_a.id, parent_b.id],
+            "type": "julia",
+            "extension": ".jl",
+            "mode": ("df_ba" if swapped else "df_ab") if renamed_any else "df_none_ab",
+            "description": f"Fused {parent_a.id} + {parent_b.id}",
+        })
+
+
+class JuliaStateFusionStrategy(JuliaFusionStrategy):
+    """State fusion for Julia (core/state_analysis.py): the four-segment
+    interleave. What makes it worth more here than in a purely
+    interpreted language is that Julia specialises code on the types it
+    sees: B's continuation running against A's bindings asks type
+    inference and the optimiser to specialise a function for an argument
+    type its author never wrote it for."""
+
+    def _state_prepare(self, host: Seed, donor: Seed):
+        host_body, host_pre = self._split_preamble(host.content)
+        donor_body, donor_pre = self._split_preamble(donor.content)
+        if self.mutation:
+            host_body, donor_body = self.mut.mutate(host_body), self.mut.mutate(donor_body)
+        pre = list(dict.fromkeys([p.strip() for p in host_pre + donor_pre if p.strip()]))
+        return host_body, donor_body, pre
+
+    def _state_seed_metadata(self, host: Seed, donor: Seed) -> dict:
+        return {"type": "julia", "extension": ".jl"}
+
+    def fuse(self, parent_a: Seed, parent_b: Seed) -> Seed:
+        return self._build_state_fused(parent_a, parent_b, "ab")
+
+    def fuse_bidirectional(self, parent_a: Seed, parent_b: Seed) -> List[Seed]:
+        return [self._build_state_fused(parent_a, parent_b, "ab"),
+                self._build_state_fused(parent_b, parent_a, "ba")]
+
+
+class JuliaDeclarationFusionStrategy(JuliaFusionStrategy):
+    """Declaration fusion for Julia, through the type system.
+
+    Julia does its declaration work when the definition is *evaluated*:
+    `struct H <: D` checks that D is an abstract type and not a concrete
+    one, computes the layout and the `isbits`-ness, and registers the
+    subtype relation; a new method definition updates the method table
+    and invalidates whatever was specialised on the old one. None of it
+    needs an instance or a call, which is what makes it the Julia
+    analogue of a compile-time-only declaration check.
+
+    Two modes, because a donor that declares an abstract type is the
+    minority:
+      * `subtype` — the donor declares `abstract type D`, and one of the
+        host's own type declarations gains it as a supertype;
+      * `method` — the donor declares a function, and a method of it is
+        added for one of the host's types, which is a method-table
+        update checked against the existing signatures.
+    """
+
+    _JL_ABSTRACT_RE = re.compile(r'^[ \t]*abstract\s+type\s+([A-Za-z_]\w*)', re.M)
+    _JL_STRUCT_HEAD_RE = re.compile(
+        r'^(?P<pre>[ \t]*(?:mutable\s+)?struct\s+(?P<name>[A-Za-z_]\w*)'
+        r'(?P<params>\{[^{}]*\})?)(?P<sup>\s*<:\s*[\w.{}, ]+)?\s*$')
+    _JL_ABSTRACT_HEAD_RE = re.compile(
+        r'^(?P<pre>[ \t]*abstract\s+type\s+(?P<name>[A-Za-z_]\w*)'
+        r'(?P<params>\{[^{}]*\})?)(?P<sup>\s*<:\s*[\w.{}, ]+)?\s*(?P<end>end)?\s*$')
+
+    def _donor_abstracts(self, code):
+        return [m.group(1) for m in self._JL_ABSTRACT_RE.finditer(self._strip_comments(code))]
+
+    def _donor_functions(self, code):
+        return sorted(self._function_names(code))
+
+    def _host_type_lines(self, code):
+        """[(kind, line_index)] for a host type declaration with no
+        supertype of its own — Julia allows one supertype only, and
+        replacing the host's own would delete its hierarchy."""
+        out = []
+        for i, line in enumerate(code.splitlines()):
+            m = self._JL_STRUCT_HEAD_RE.match(line)
+            if m and not m.group("sup"):
+                out.append(("struct", i))
+                continue
+            m = self._JL_ABSTRACT_HEAD_RE.match(line)
+            if m and not m.group("sup"):
+                out.append(("abstract", i))
+        return out
+
+    # Concrete types a host is likely to actually pass: the ones it
+    # annotates with, then the ones its literals imply.
+    _JL_ANNOT_RE = re.compile(r'::\s*([A-Z][\w.]*(?:\{[^{}]*\})?)')
+
+    def _host_types(self, code):
+        """Type names the host mentions, best first: its own
+        declarations, then what it annotates with, then `Int` — a method
+        has to be added *for* something, and a type the host never
+        touches would leave the new method unreachable."""
+        own = sorted(self._type_names(code))
+        annot = [t for t in dict.fromkeys(self._JL_ANNOT_RE.findall(self._strip_comments(code)))
+                 if t not in ("Any",)]
+        return own + annot + ["Int"]
+
+    def is_viable_pair(self, parent_a: Seed, parent_b: Seed) -> bool:
+        host = self._split_preamble(parent_a.content)[0]
+        donor = self._split_preamble(parent_b.content)[0]
+        if self._host_type_lines(host) and self._donor_abstracts(donor):
+            return True
+        # A method of a donor function, added for a type the host uses.
+        # Only 89 of 4,037 seeds declare a type and none declares an
+        # abstract one, so requiring both sides to declare types made
+        # this strategy fire on 0 of 300 pairs; a donor function and any
+        # host is the widening that makes it real, and adding a method
+        # is still declaration-time work — the method table is updated
+        # and whatever was specialised on the old table is invalidated.
+        return bool(self._donor_functions(donor))
+
+    def _build_declaration_fused(self, host: Seed, donor: Seed, direction: str) -> Seed:
+        host_body, host_pre = self._split_preamble(host.content)
+        donor_body, donor_pre = self._split_preamble(donor.content)
+        if self.mutation:
+            host_body, donor_body = self.mut.mutate(host_body), self.mut.mutate(donor_body)
+        tag = self._tag("declaration")
+        applied = None
+        lines = host_body.splitlines()
+
+        sites = self._host_type_lines(host_body)
+        abstracts = self._donor_abstracts(donor_body)
+        if sites and abstracts:
+            kind, hi = random.choice(sites)
+            sup = random.choice(abstracts)
+            rx = self._JL_STRUCT_HEAD_RE if kind == "struct" else self._JL_ABSTRACT_HEAD_RE
+            m = rx.match(lines[hi])
+            tail = " end" if (kind == "abstract" and m.groupdict().get("end")) else ""
+            lines[hi] = f"{m.group('pre')} <: {sup}{tail}  {tag}"
+            applied = "subtype"
+        if applied is None:
+            funs = self._donor_functions(donor_body)
+            types = self._host_types(host_body)
+            if funs and types:
+                fname = random.choice(funs)
+                tname = random.choice(types[:4])
+                # A method of the donor's function for a type the host
+                # uses: the method table is updated and checked against
+                # the signatures already there, at definition time, and
+                # anything already specialised on the old table is
+                # invalidated. When the donor's own code then calls the
+                # function with that type, it reaches this method.
+                lines = lines + ["", f"{fname}(::{tname}) = nothing  {tag}"]
+                applied = "method"
+
+        # The donor's whole half goes first: a supertype must exist when
+        # the host's declaration is evaluated, and a method needs its
+        # function to be defined.
+        pre = list(dict.fromkeys([p.strip() for p in donor_pre + host_pre if p.strip()]))
+        content = ("\n".join(pre) + "\n\n" if pre else "") + \
+                  donor_body.rstrip("\n") + "\n\n" + "\n".join(lines).rstrip("\n") + "\n"
+        return Seed(content=content, metadata={
+            "parents": [host.id, donor.id],
+            "type": "julia",
+            "extension": ".jl",
+            "mode": f"decl_{applied or 'none'}_{direction}",
+            "description": f"Declaration-fused {host.id} <- {donor.id} ({direction})",
+        })
+
+    def fuse(self, parent_a: Seed, parent_b: Seed) -> Seed:
+        return self._build_declaration_fused(parent_a, parent_b, "ab")
+
+    def fuse_bidirectional(self, parent_a: Seed, parent_b: Seed) -> List[Seed]:
+        return [self._build_declaration_fused(parent_a, parent_b, "ab"),
+                self._build_declaration_fused(parent_b, parent_a, "ba")]
+
+
 STRATEGY_REGISTRY = {
     "haskell":  _StrategySet("projects/haskell",  HaskellFusionStrategy,
                              HaskellDeclarationFusionStrategy, HaskellStateFusionStrategy),
@@ -11286,6 +14952,15 @@ STRATEGY_REGISTRY = {
                              LFortranDeclarationFusionStrategy, LFortranStateFusionStrategy),
     "cpython":  _StrategySet("projects/cpython",  CPythonFusionStrategy,
                              CPythonDeclarationFusionStrategy, CPythonStateFusionStrategy),
+    "ruby":     _StrategySet("projects/ruby",     RubyFusionStrategy,
+                             RubyDeclarationFusionStrategy, RubyStateFusionStrategy),
+    "typescript": _StrategySet("projects/typescript", TypeScriptFusionStrategy,
+                               TypeScriptDeclarationFusionStrategy,
+                               TypeScriptStateFusionStrategy),
+    "r":        _StrategySet("projects/r",        RFusionStrategy,
+                             RDeclarationFusionStrategy, RStateFusionStrategy),
+    "julia":    _StrategySet("projects/julia",    JuliaFusionStrategy,
+                             JuliaDeclarationFusionStrategy, JuliaStateFusionStrategy),
     "mlir":     _StrategySet("projects/mlir",     MLIRFusionStrategy,
                              MLIRDeclarationFusionStrategy, MLIRStateFusionStrategy),
     # Triton's triton-opt is an MLIR pass driver reading and writing the

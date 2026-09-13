@@ -160,7 +160,7 @@ if __name__ == "__main__":
                              "Alias of --declaration-fusion for rust. Requires --pre-analysis "
                              "(disabled otherwise, with a warning).")
     parser.add_argument("--state-fusion", action="store_true", default=False,
-                        help="[php/cpython/clang/flang/lfortran/swift/haskell/mlir/naga] Enable the state-of-"
+                        help="[php/cpython/ruby/clang/flang/lfortran/swift/haskell/mlir/naga] Enable the state-of-"
                              "interest-driven fusion strategy (core/state_analysis.py): profiles "
                              "each seed for the point with the most live, still-in-scope variables, "
                              "then grafts one seed's continuation into the other's state at that "
@@ -196,6 +196,7 @@ if __name__ == "__main__":
                              "item nesting. [php] implements/extends + trait-use injection. "
                              "[swift] protocol conformance injection. [cpython] extra base-class "
                              "injection (MRO/metaclass conflicts at class-statement time). "
+                             "[ruby] superclass / include / prepend injection at class-statement time. "
                              "[haskell] typeclass superclass constraint injection. [flang/"
                              "lfortran] derived-type EXTENDS() injection. [mlir] function-signature "
                              "operand/result type swap. [naga] WGSL struct/member/function type "
@@ -470,7 +471,8 @@ if __name__ == "__main__":
         "go": "go", "rust": "rust", "php": "php",
         "swift": "swift", "lean": "lean", "mlir": "mlir",
         "naga": "wgsl", "tint": "wgsl", "wgslc": "wgsl", "sql": "sql",
-        "flang": "fortran", "lfortran": "fortran",
+        "flang": "fortran", "lfortran": "fortran", "ruby": "ruby",
+        "typescript": "typescript", "r": "r", "julia": "julia",
     }
     _tgt_lang = _LANG_MAP.get(args.project.lower(), args.project.lower())
 
