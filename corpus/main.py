@@ -58,6 +58,13 @@ PROJECT_FAMILY = {
     "flang": "fortran", "lfortran": "fortran",
     "mlir": "mlir", "triton": "mlir",
     "tint": "wgsl", "naga": "wgsl",
+    # One project each: no other adapter reads these, so unlike c/cpp or
+    # wgsl there is no free reuse to be had here — every seed for them is
+    # either native or translated.
+    "ruby": "ruby",
+    "typescript": "typescript",
+    "r": "r",
+    "julia": "julia",
 }
 
 # A family maps back to the language to generate for it. For families with
@@ -66,7 +73,8 @@ FAMILY_LANG = {
     "c/cpp": "c", "python": "python", "phpt": "php", "rust": "rust",
     "go": "go", "swift": "swift", "haskell": "haskell",
     "javascript": "javascript", "fortran": "fortran", "mlir": "mlir",
-    "wgsl": "wgsl",
+    "wgsl": "wgsl", "ruby": "ruby", "typescript": "typescript",
+    "r": "r", "julia": "julia",
 }
 
 # Kept only so an existing translations JSON stays readable.
