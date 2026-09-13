@@ -158,3 +158,46 @@ projects/triton/triton-src/
 projects/triton/triton-build/
 projects/triton/deps/
 projects/triton/seeds/
+
+# ---------------------------------
+# Targets added in the 2026-09 campaign
+# ---------------------------------
+# Same rule as every older target: the fetched source tree, the build
+# output, the collected seeds and the corpus are build inputs, not
+# repository content. Only the adapter (Dockerfile, config.yaml,
+# setup.py, parser.py, driver.py, reduce.py) is versioned. Listed one
+# path at a time rather than as `projects/<name>/`, because a blanket
+# rule is what hid the clang and triton adapter files from git.
+
+# Ruby
+projects/ruby/ruby-src/
+projects/ruby/install/
+projects/ruby/seeds/
+
+# R
+projects/r/r-src/
+projects/r/install/
+projects/r/seeds/
+
+# TypeScript — tsc-bin is the 40 MB compiled tsgo binary produced by
+# setup.py from typescript-src.
+projects/typescript/typescript-src/
+projects/typescript/tsc-bin
+projects/typescript/seeds/
+
+# Julia
+projects/julia/julia-src/
+projects/julia/seeds/
+
+# Flang's build tree, 3.1 GB. Its `llvm-project/` source was already
+# ignored; the build directory was not, and every saved flang
+# reproducer's test.sh invokes the binaries inside it.
+projects/flang/llvm-flang-build/
+
+# Swift's collected seeds, 64 MB, the same class as gcc/seeds.
+projects/swift/seeds/
+
+# The HEAD-of-campaign worktree the validity harness measures its
+# baseline column against (2.6 GB). Reproducible with
+# `git worktree add .baseline <commit>`.
+.baseline/
