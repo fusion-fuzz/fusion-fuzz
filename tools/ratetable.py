@@ -21,12 +21,26 @@ def main():
     ap.add_argument("--history", default="output/validrate/history.tsv")
     ap.add_argument("--since", default=None, help="timestamp (YYYYmmdd-HHMMSS) of the previous report")
     ap.add_argument("--markdown", action="store_true")
+    ap.add_argument("--include-stratified", action="store_true",
+                    help="also show `pc*` rows (--parents-compile measurements)")
+    ap.add_argument("--only-stratified", action="store_true",
+                    help="show only the `pc*` rows")
     args = ap.parse_args()
 
     rows = list(csv.DictReader(open(args.history), delimiter="\t"))
     by = collections.defaultdict(list)
     for r in rows:
         if r["tag"] in ("smoke", "diag", "now1"):
+            continue
+        # `pc*` rows are the stratified measurement (`--parents-compile`,
+        # only seeds that succeed on their own). They answer a different
+        # question over a different corpus, so putting one in the "now"
+        # column beside a mixed-corpus "previous" would read as a jump
+        # that never happened. They get their own table.
+        if args.only_stratified:
+            if not r["tag"].startswith("pc"):
+                continue
+        elif r["tag"].startswith("pc") and not args.include_stratified:
             continue
         by[(r["project"], r["sample_seed"])].append(r)
 

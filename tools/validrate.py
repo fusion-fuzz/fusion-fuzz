@@ -250,6 +250,14 @@ def main():
     ap.add_argument("--dump-fail", type=int, default=0, help="write this many failing children per class to out-dir")
     ap.add_argument("--dump-all", action="store_true", help="write every child program + output to out-dir")
     ap.add_argument("--no-diversity", action="store_true", help="skip the diversity proxies (and parent execution)")
+    ap.add_argument("--parents-compile", action="store_true",
+                    help="sample only seeds that succeed on their own (metadata rc == 0). "
+                         "Five adapters deliberately keep seeds that are *meant* to fail "
+                         "(rust's `//~ ERROR` ui tests, gcc's dg-error, go's errorcheck, "
+                         "flang's !ERROR, clang's expected-error), because a compile-fail "
+                         "test still exercises the compiler. A child of two such parents "
+                         "cannot compile either, so the plain rate mixes two different "
+                         "questions; this flag measures the one about fusion.")
     args = ap.parse_args()
 
     config = load_project_config(args.project)
@@ -259,6 +267,13 @@ def main():
 
     corpus = load_corpus(args.project, config, args.bug_corpus)
     print(f"[corpus] {len(corpus)} seeds loaded for {args.project}")
+    if args.parents_compile:
+        before = len(corpus)
+        corpus = [s for s in corpus if (s.metadata or {}).get("rc") == 0]
+        print(f"[corpus] --parents-compile: {len(corpus)}/{before} seeds succeed on their own")
+        if len(corpus) < 2:
+            sys.exit("--parents-compile left fewer than 2 seeds; the corpus has no "
+                     "recorded per-seed rc (run main.py --pre-analysis first)")
 
     rng = random.Random(args.sample_seed)
     if args.sample_file and os.path.exists(args.sample_file):
@@ -439,12 +454,28 @@ def main():
                 # A crash is the whole point; keep the child regardless of
                 # --dump-fail so it can be reproduced and bundled.
                 os.makedirs(dump_dir, exist_ok=True)
+                _header = f"# rc={res.return_code} mode={mode} parents={a.id} + {b.id}\n"
+                _body = (res.stderr or "")[:20000] + "\n--- stdout ---\n" + (res.stdout or "")[:5000]
                 _stem = os.path.join(dump_dir, f"crash-{kind}-{n_crash}")
                 with open(_stem + loop._seed_extension(child), "w") as f:
                     f.write(child.content)
                 with open(_stem + ".out", "w") as f:
-                    f.write(f"# rc={res.return_code} mode={mode} parents={a.id} + {b.id}\n")
-                    f.write((res.stderr or "")[:20000] + "\n--- stdout ---\n" + (res.stdout or "")[:5000])
+                    f.write(_header + _body)
+                # And a second copy outside the per-run dump directory.
+                # Dumps are pruned when they are superseded — that is how
+                # the measurement records are kept to a sane size — and a
+                # crashing child is the one thing in there that is not
+                # reproducible from history.tsv. 474 of them were sitting
+                # in dump directories on 2026-09-10, one prune away from
+                # being lost.
+                _keep = os.path.join(args.out_dir, "crashes", args.project)
+                os.makedirs(_keep, exist_ok=True)
+                _kstem = os.path.join(
+                    _keep, f"{args.tag}-s{args.sample_seed}-{kind}-{n_crash}")
+                with open(_kstem + loop._seed_extension(child), "w") as f:
+                    f.write(child.content)
+                with open(_kstem + ".out", "w") as f:
+                    f.write(_header + _body)
             if invalid:
                 n_invalid += 1
                 diag = first_diagnostic(res.stdout, res.stderr, res.return_code)
