@@ -1,0 +1,102 @@
+project_name: "julia"
+
+execution:
+  # projects/julia/driver.py builds the real command (flags, bounds
+  # checking, optimisation level, compile mode); this is BaseDriver's
+  # fallback.
+  command: "projects/julia/julia-src/julia --startup-file=no {seed_path}"
+  # Julia compiles as it runs: a first call to a generic function goes
+  # through type inference and LLVM. A short script can still spend
+  # seconds in the compiler, so this is well above the other executing
+  # targets' timeout.
+  timeout: 60
+  concurrency: 8
+  mem_limit_mb: 4096
+
+analysis:
+  # Julia exits 1 on an uncaught exception. Every seed here is
+  # *executed*, so "invalid" means the fused program threw, not that a
+  # compiler rejected it.
+  error_return_codes: [1]
+  drop_seeds_failing_alone: true
+  crash_patterns:
+    # The runtime's own words for "this should not have happened".
+    - "Internal error: encountered unexpected error"
+    - "Internal error: stack overflow in type inference"
+    - "Assertion failed"
+    - "assertion failed"
+    - "julia: "                       # jl_error from the runtime
+    - "signal (11)"
+    - "signal (6)"
+    - "signal (4)"
+    - "segmentation fault"
+    - "Segmentation fault"
+    - "Bus error"
+    - "LLVM ERROR"
+    - "AddressSanitizer"
+    - "double free"
+    - "corrupted"
+    - "GC error"
+    - "Unreachable reached"
+
+  # Ordinary Julia exceptions: a runtime that throws is doing its job.
+  syntax_patterns:
+    - "ERROR: LoadError"
+    - "ERROR: MethodError"
+    - "ERROR: UndefVarError"
+    - "ERROR: BoundsError"
+    - "ERROR: TypeError"
+    - "ERROR: ArgumentError"
+    - "ERROR: DomainError"
+    - "ERROR: DimensionMismatch"
+    - "ERROR: InexactError"
+    - "ERROR: KeyError"
+    - "ERROR: OverflowError"
+    - "ERROR: DivideError"
+    - "ERROR: StackOverflowError"
+    - "ERROR: AssertionError"
+    - "ERROR: ErrorException"
+    - "ERROR: syntax:"
+    - "ERROR: Test"
+    - "Test Failed"
+    - "Some tests did not pass"
+    - "ERROR: UndefKeywordError"
+    - "ERROR: InitError"
+    - "ERROR: SystemError"
+
+paths:
+  seed_source: "projects/julia/seeds"
+  seed_corpus: "projects/julia/corpus.db"
+
+  seed_exclude_patterns:
+    - pattern: '\b(?:Threads\.|@spawn|@async|@distributed|addprocs|remotecall|Channel\()'
+      reason: "concurrency: a fused program deadlocks and burns the whole timeout"
+    - pattern: '\brun\s*\(`|\bread\s*\(`|\bopen\s*\(`|\bpipeline\s*\('
+      reason: "spawns processes; a concurrent loop would fork-bomb itself"
+    - pattern: '\b(?:mktempdir|mktemp|tempname|touch|rm\s*\(|write\s*\(\s*"|open\s*\(\s*")'
+      reason: "writes or deletes files; the execution has no sandbox beyond its temp directory"
+    - pattern: '\bccall\s*\(|\bunsafe_(?:load|store|wrap|pointer)|pointer_from_objref|\bLibdl\.'
+      reason: "reaches raw memory through the C ABI; a crash there proves nothing about Julia"
+    - pattern: '\b(?:download|Downloads\.|HTTP\.|Sockets\.|connect\s*\(|listen\s*\()'
+      reason: "reaches the network; nothing to connect to"
+    - pattern: '\bPkg\.|\busing\s+(?!Test|Base|LinearAlgebra|Random|Printf|Dates|Statistics|Unicode|Markdown|Serialization|SparseArrays|Logging)'
+      reason: "needs a package this build does not ship"
+    - pattern: '\bsleep\s*\(\s*(?:[1-9]|0?\.[5-9])'
+      reason: "sleeps for a large part of the timeout and learns nothing"
+    - pattern: '\b(?:@allocated|@time|@timev|@elapsed|@benchmark)\b'
+      reason: "asserts on timing or allocation counts, which vary with the fused program"
+    # `Base.atexit(` is exempt because the corpus's own value digest
+    # (projects/julia/setup.py _DIGEST_LINE) registers its print through
+    # it. Without the exemption every seed carrying the digest was
+    # excluded, and the corpus silently fell from 3,910 usable seeds to
+    # the 1,031 that had no digest. A bare `exit(`, and `Base.exit(`,
+    # still exclude: those end the process early and hide the outcome,
+    # which is what the rule is for. `atexit` does not.
+    - pattern: '\bexit\s*\(|(?<!Base\.)\batexit\s*\('
+      reason: "ends the process early and hides the outcome"
+
+llm:
+  provider: "deepseek"
+  model: "deepseek-v4-flash"
+  api_key: ""
+  timeout: 30

@@ -121,9 +121,15 @@ class HaskellDriver(BaseDriver):
     def extract_crash_signature(self, stdout, stderr, return_code):
         combined = stderr + "\n" + stdout
 
-        m = re.search(r"ghc: panic!\s*\(the 'impossible' happened\)([^\n]*(?:\n[^\n]*){0,3})", combined)
+        # The executable prints its versioned name ("ghc-9.14.1: panic!");
+        # the site of the pprPanic call is the stable part of the message,
+        # the first detail line (e.g. "lookupIdSubst") names the check.
+        m = re.search(r"ghc(?:-[\d.]+)?: panic!\s*\(the 'impossible' happened\)"
+                      r"\s*\n\s*GHC version[^\n]*\n\s*([^\n]*)", combined)
         if m:
-            return f"ghc panic: {m.group(1).strip()[:200]}"
+            site = re.search(r"pprPanic, called at (compiler/[^\s:]+:\d+)", combined)
+            detail = m.group(1).strip()[:120]
+            return f"ghc panic: {detail}" + (f" @ {site.group(1)}" if site else "")
 
         m = re.search(r"GHC internal error:\s*([^\n]+)", combined)
         if m:

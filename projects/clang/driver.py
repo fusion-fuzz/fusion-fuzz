@@ -21,6 +21,8 @@ class ClangDriver(BaseDriver):
     STD_C = ["c99", "c11", "c17", "c23", "gnu99", "gnu11", "gnu17", "c89"]
     STD_C_WEIGHTS = [15, 15, 15, 15, 15, 15, 15, 5]
     STD_CXX = ["c++03", "c++11", "c++14", "c++17", "c++20", "c++23", "gnu++17", "gnu++20"]
+    _CXX_RANK = {"98": 0, "03": 0, "0x": 1, "11": 1, "1y": 2, "14": 2, "1z": 3, "17": 3,
+                 "2a": 4, "20": 4, "2b": 5, "23": 5, "2c": 6, "26": 6}
     OPT_LEVELS = ["-O0", "-O1", "-O2", "-O3", "-Os", "-Oz"]
 
     # Compilation "depth" to exercise: syntax-only is cheap and hits the
@@ -130,8 +132,25 @@ class ClangDriver(BaseDriver):
         target_flags, cross = self._target_flags(content)
         flags = [random.choices(self.MODES, weights=self.MODE_WEIGHTS, k=1)[0]]
         flags.append(random.choice(self.OPT_LEVELS))
-        if stds and random.random() > 0.3:
+        need = 0
+        if stds is self.STD_CXX:
+            # The seed's own RUN line and its C++ vocabulary bound the
+            # standard from below: `concept` under -std=c++11 is
+            # "unknown type name 'concept'" before anything runs.
+            for m in re.finditer(r'-std=(?:c|gnu)\+\+(\d\d|2[abc])', content or ""):
+                need = max(need, self._CXX_RANK.get(m.group(1), 0))
+            if re.search(r'\b(?:concept|requires|consteval|co_await|co_return|co_yield|constinit)\b', content or ""):
+                need = max(need, self._CXX_RANK["20"])
+            elif re.search(r'\b(?:constexpr|decltype|nullptr|static_assert|noexcept|override|final)\b|\bauto\s+\w+\s*=', content or ""):
+                need = max(need, self._CXX_RANK["11"])
+        # A seed needing more than the default (gnu++17) gets a -std even on
+        # the 30% of draws that would add none.
+        if stds and (random.random() > 0.3 or need > self._CXX_RANK["17"]):
             weights = self.STD_C_WEIGHTS if stds is self.STD_C else None
+            if stds is self.STD_CXX:
+                newer = [x for x in stds if self._CXX_RANK.get(x[-2:], 0) >= need]
+                stds = newer or stds
+                weights = None
             std = random.choices(stds, weights=weights, k=1)[0] if weights else random.choice(stds)
             # C89 rejects `//` comments and `for (int ...)` outright; a seed
             # written with them cannot be valid under it (same rule as gcc).
@@ -326,6 +345,11 @@ class ClangDriver(BaseDriver):
         # which differs between two hits of the same crash; the frames say
         # where it crashed.
         message = re.sub(r"current parser token '.*?'", "current parser token", message)
+        # The parser-state phrase is where the parser *was* when the crash
+        # hit, not the crash: the same GetAddrOfConstantCFString site was
+        # bundled three times as "current parser token", "at annotation
+        # token" and "<eof> parser at end of file". Drop it.
+        message = re.sub(r"(?:<eof> parser at end of file|current parser token|at annotation token)\s*[.:]?\s*", "", message).strip()
 
         frames = []
         for fm in self._STACK_FRAME_RE.finditer(body):

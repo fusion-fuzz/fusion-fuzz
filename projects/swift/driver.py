@@ -49,16 +49,23 @@ class SwiftDriver(BaseDriver):
     # in its gutter (`74 | // CHECK-NOT: Please submit ...`) — one false
     # bundle per run before this. The marker counts only when the crash
     # apparatus is there too.
-    _GUTTER_ECHO_RE = re.compile(r'^\s*\d+\s*\|.*Please submit a bug report', re.M)
+    # A diagnostic echoes the offending source line (`59 | // Assertion
+    # failed: ...`); a seed that quotes an old crash in a comment then
+    # matched the crash patterns with rc 0. Every echoed line is dropped
+    # before matching, and a text match needs a non-zero exit.
+    _GUTTER_ECHO_RE = re.compile(r'^\s*\d+\s*\|.*$', re.M)
 
     def _check_crash(self, stdout, stderr, return_code):
         if not super()._check_crash(stdout, stderr, return_code):
             return False
         text = (stderr or "") + "\n" + (stdout or "")
-        if "Stack dump:" in text or "Assertion failed:" in text or return_code >= 128 or return_code in (134, 139):
+        if return_code >= 128 or return_code in (134, 139):
             return True
         stripped = self._GUTTER_ECHO_RE.sub('', text)
-        return "Please submit a bug report" in stripped
+        if return_code == 0:
+            return False
+        return ("Stack dump:" in stripped or "Assertion failed:" in stripped
+                or "Please submit a bug report" in stripped)
 
     def execute(self, seed):
         start = time.time()
@@ -111,6 +118,18 @@ class SwiftDriver(BaseDriver):
         line = re.sub(r'\b\w+\.\(file\)', '(file)', line)          # module prefix
         line = re.sub(r'RangeText="[^"]*"?', 'RangeText', line)
         line = re.sub(r'_[0-9a-f]{7,8}\b', '', line)
+        # A request's argument names the declaration it was evaluating
+        # (`CompareDeclSpecializationRequest(<hex> AbstractFunctionDecl
+        # name=init() : ...)`), which differs per pair: nine bundles for
+        # one site. Keep the request name only.
+        line = re.sub(r'(While evaluating request \w+)\([^\n]*', r'\1(<args>)', line)
+        # `While canonicalizing ... SIL node %3 = differentiable_function
+        # [...] %2 : $@callee_guaranteed ...`: the node's operands and
+        # type are per pair; the canonicalization is the site.
+        line = re.sub(r'(SIL node\s+)%[^\n]*', r'\1<node>', line)
+        # `While type-checking extension of MyClass at <loc>`: the type is
+        # the pair's, the context kind is the site.
+        line = re.sub(r'\b(extension|declaration|conformance|body) of \S+', r'\1 of <T>', line)
         line = re.sub(r"'[^']*'", "'<id>'", line)
         line = re.sub(r'(τ_\d+_\d+)\s*:\s*[\w.]+', r'\1 : <id>', line)   # generic-signature constraints
         line = re.sub(r'\b0x[0-9a-fA-F]+\b', '<hex>', line)
@@ -121,7 +140,7 @@ class SwiftDriver(BaseDriver):
         if sig:
             return sig
         for text in (stderr, stdout):
-            m = re.search(r"(Assertion failed: .*)", text)
+            m = re.search(r"(Assertion failed: .*)", self._GUTTER_ECHO_RE.sub('', text or ""))
             if m:
                 return m.group(1).strip()
         # Previously only the *outermost* request ("While evaluating

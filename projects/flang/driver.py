@@ -346,25 +346,30 @@ class FlangDriver(BaseDriver):
         flags.extend(misc)
         return flags
 
-    def _get_random_flags(self, ext):
+    # bf16 (`real(kind=3)`) has no legalisation on the cross targets
+    # (`LLVM ERROR: Cannot select: bf16_to_fp` under powerpc64le is a
+    # backend gap, not a frontend finding): such seeds stay on the host.
+    _NO_CROSS_RE = re.compile(r'(?i)\bbf16\b|real\s*\(\s*(?:kind\s*=\s*)?3\s*\)|bfloat')
+
+    def _get_random_flags(self, ext, content=""):
         """Driver-mode command line."""
         flags = [random.choices(self.MODES, weights=self.MODE_WEIGHTS, k=1)[0]]
         flags.append(random.choice(self.OPT_LEVELS))
-        if self.TARGETS and random.random() < self.TARGET_RATE:
+        if self.TARGETS and random.random() < self.TARGET_RATE and not self._NO_CROSS_RE.search(content or ""):
             flags.append(f"--target={random.choice(self.TARGETS)}")
         flags.extend(self._shared_flags(ext, driver_mode=True))
         if self.VERIFIER_FLAGS and random.random() < self.VERIFIER_RATE:
             flags.append(random.choice(self.VERIFIER_FLAGS))
         return " ".join(flags)
 
-    def _get_random_fc1_flags(self, ext):
+    def _get_random_fc1_flags(self, ext, content=""):
         """`-fc1` command line: one frontend action plus the shared flags.
 
         -fc1 takes `-triple`, not `--target=`, and rejects the driver's
         `-mllvm` passthrough, so neither is drawn here."""
         flags = ["-fc1", random.choices(self.FC1_ACTIONS, weights=self.FC1_WEIGHTS, k=1)[0]]
         flags.append(random.choice(self.OPT_LEVELS))
-        if self.TARGETS and random.random() < self.TARGET_RATE:
+        if self.TARGETS and random.random() < self.TARGET_RATE and not self._NO_CROSS_RE.search(content or ""):
             flags.append(f"-triple {random.choice(self.TARGETS)}")
         flags.extend(self._shared_flags(ext, driver_mode=False))
         return " ".join(flags)
@@ -382,9 +387,9 @@ class FlangDriver(BaseDriver):
                 f.write(seed.content)
 
             if random.random() < self.FC1_RATE:
-                flags = self._get_random_fc1_flags(ext)
+                flags = self._get_random_fc1_flags(ext, seed.content)
             else:
-                flags = self._get_random_flags(ext)
+                flags = self._get_random_flags(ext, seed.content)
             # stdout carries only what was asked for — assembly, or a
             # -fdebug-dump-* rendering of the whole program, which for a
             # fused seed runs to megabytes. Every diagnostic and every
@@ -542,6 +547,15 @@ class FlangDriver(BaseDriver):
             tparam = re.search(r"_Tp = ([^,\]]+)", m.group("fn"))
             return (f"Assertion: {expr} [{tparam.group(1).strip()}]"
                     if tparam else f"Assertion: {expr}")
+
+        # `UNREACHABLE executed at .../Value.cpp:99!` with the message
+        # line above it ("Uses remain when a value is destroyed!"): the
+        # stack dump has no symbol names, so this used to fall through to
+        # a bare "Aborted".
+        m = re.search(r"(?:([^\n]*)\n)?UNREACHABLE executed at \S*?((?:[\w.-]+/){0,2}[\w.-]+:\d+)!", combined)
+        if m:
+            msg = re.sub(r"\s+", " ", (m.group(1) or "").strip())[:80]
+            return f"UNREACHABLE: {m.group(2)}" + (f" {msg}" if msg else "")
 
         fp = self._stack_dump_fingerprint(combined)
         if fp:

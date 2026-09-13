@@ -386,6 +386,40 @@ class GoDriver(BaseDriver):
                 continue
         return entries, total
 
+    # A go-tmp subdirectory older than this cannot belong to a live
+    # execution: the fuzz loop's own per-execution timeout is far shorter.
+    GOTMP_STALE_SECONDS = 1800
+
+    def _sweep_gotmp(self):
+        """Drop `go build` work directories left behind mid-run.
+
+        The startup sweep only fires when the orchestrator restarts, and a
+        run that keeps going for hours accumulates in between: 2.9 GB
+        collected here in the five hours after the last manual clean. `go`
+        removes its own work dir on a clean exit, so everything here was
+        left by a killed execution and nothing is reading it.
+        """
+        now = time.time()
+        # Called from the per-execution path, so it checks the clock
+        # before it touches the filesystem.
+        if now - getattr(self, "_last_gotmp_sweep", 0) < 300:
+            return
+        self._last_gotmp_sweep = now
+        cutoff = now - self.GOTMP_STALE_SECONDS
+        try:
+            with os.scandir(self.gotmp) as it:
+                for entry in it:
+                    if not entry.is_dir(follow_symlinks=False):
+                        continue
+                    try:
+                        if entry.stat(follow_symlinks=False).st_mtime > cutoff:
+                            continue
+                    except OSError:
+                        continue
+                    shutil.rmtree(entry.path, ignore_errors=True)
+        except OSError:
+            pass
+
     def _trim_cache(self, force=False):
         """Keep .fused/go-cache under execution.cache_limit_mb.
 
@@ -410,6 +444,8 @@ class GoDriver(BaseDriver):
         inside CACHE_GRACE_SECONDS are never touched, which is what keeps this
         safe to run while builds are in flight.
         """
+        self._sweep_gotmp()
+
         if self.cache_limit_bytes <= 0:
             return
 

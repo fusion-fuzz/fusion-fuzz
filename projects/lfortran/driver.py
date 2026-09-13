@@ -217,6 +217,7 @@ class LfortranDriver(BaseDriver):
         m = re.search(r"([\w./+-]+:\d+(?::\d+)?): runtime error: ([^\n]+)", combined)
         if m:
             msg = re.sub(r"\b\d+\b", "N", m.group(2)).strip()
+            msg = re.sub(r"0x[0-9a-fA-F]+", "0x<addr>", msg)   # "misaligned address 0x55bf..." is per run
             return f"UBSAN: {m.group(1)} {msg[:100]}"
 
         fp = self._stacktrace_fingerprint(combined)
@@ -225,6 +226,11 @@ class LfortranDriver(BaseDriver):
             tail = combined[combined.find("Internal Compiler Error"):]
             m = re.search(r'\n(\w[\w:]*): (.+)', tail)
             detail = f": {m.group(1)}: {m.group(2).strip()}" if m else ""
+            # A quoted string or a number in the assertion text is the
+            # input's symbol/size (`.find("deferred")`, `i32[3]`), not the
+            # site: two bundles for one `cdf_new_dt_name` assertion.
+            detail = re.sub(r'"[^"]*"', '"<s>"', detail)
+            detail = re.sub(r'\b\d+\b', 'N', detail)
             label = f"ICE{detail}"
             return f"{label} [{fp}]" if fp else label
 

@@ -1,0 +1,98 @@
+project_name: "r"
+
+execution:
+  # projects/r/driver.py builds the real command (interpreter flags, JIT
+  # level, GC tuning, sanitizer options); this is BaseDriver's fallback.
+  command: "projects/r/install/bin/Rscript --vanilla {seed_path}"
+  timeout: 25
+  concurrency: 12
+  mem_limit_mb: 3072
+
+analysis:
+  # R exits 1 on an uncaught error. Every seed here is *executed*, so
+  # "invalid" means the fused program raised, not that a compiler
+  # rejected it.
+  error_return_codes: [1]
+  # R's own documentation examples and tests: one that fails standalone
+  # fails identically inside every child (a missing recommended package,
+  # a locale, a stopifnot the fusion broke).
+  drop_seeds_failing_alone: true
+  crash_patterns:
+    - "caught segfault"
+    - "caught bus error"
+    - "caught illegal operation"
+    - "SUMMARY:"                        # ASan / UBSan
+    - "runtime error:"                  # UBSan
+    - "stack smashing detected"
+    - "double free or corruption"
+    - "malloc(): "
+    - "free(): "
+    - "corrupted size vs. prev_size"
+    - "Internal error"
+    # R's own consistency checks, restricted to the ones a *user*
+    # program cannot reach by passing a wrong argument. Deliberately
+    # absent: "unimplemented type '<t>' in '<fn>'". That message comes
+    # from R's UNIMPLEMENTED_TYPE macro, which is used both for
+    # unreachable internal states and as the catch-all for an argument
+    # of an unexpected type — `options(quote(x))` produces it, and the
+    # very first measured pair did exactly that. Too broad to be an
+    # oracle.
+    - "unprotected object"
+    - "not safe to modify"
+    - "R_Reprotect"
+    - "SET_VECTOR_ELT"
+    - "attempt to set index"
+    - "Assertion"
+    - "Aborted"
+    - "core dumped"
+
+  # Ordinary R errors: an interpreter that raises is doing its job.
+  syntax_patterns:
+    - "Error in"
+    - "Error:"
+    - "could not find function"
+    - "object of type"
+    - "unused argument"
+    - "argument is of length zero"
+    - "subscript out of bounds"
+    - "non-numeric argument"
+    - "invalid 'type'"
+    - "missing value where TRUE/FALSE needed"
+    - "there is no package called"
+    - "cannot open"
+    - "unexpected symbol"
+    - "unexpected end of input"
+    - "unexpected '"
+
+paths:
+  seed_source: "projects/r/seeds"
+  seed_corpus: "projects/r/corpus.db"
+
+  seed_exclude_patterns:
+    # Every seed here executes.
+    - pattern: '\b(?:install\.packages|download\.file|url\s*\(|readLines\s*\(\s*[\"'']https?:|curlGetHeaders|available\.packages)\b'
+      reason: "reaches the network; nothing to connect to and it would take the loop off this machine"
+    - pattern: '\b(?:system|system2|shell)\s*\('
+      reason: "spawns processes; a concurrent loop would fork-bomb itself"
+    - pattern: '\b(?:unlink|file\.remove|file\.rename|dir\.create|writeLines\s*\([^)]*con\s*=|write\.csv|saveRDS|save\s*\(|write\.table|sink)\s*\('
+      reason: "writes or deletes files; the execution has no sandbox beyond its temp directory"
+    - pattern: '\b(?:x11|X11|windows|quartz|dev\.new|png|pdf|jpeg|postscript|svg)\s*\('
+      reason: "opens a graphics device; there is no display"
+    - pattern: '\brequire\s*\(\s*(?!stats|utils|methods|base|graphics|grDevices|tools|parallel|compiler)|\blibrary\s*\(\s*(?!stats|utils|methods|base|graphics|grDevices|tools|parallel|compiler)'
+      reason: "needs a package this build does not ship (--with-recommended-packages=no)"
+    - pattern: 'package\s*=\s*["''](?!stats|utils|methods|base|graphics|grDevices|tools|parallel|compiler)'
+      reason: "names a package this build does not ship, through a package= argument"
+    - pattern: '\bmclapply\b|\bmakeCluster\b|\bparLapply\b|\bforkCluster\b|\bmcparallel\b'
+      reason: "forks worker processes; the loop already runs one per core"
+    - pattern: '\bSys\.sleep\s*\(\s*(?:[1-9]|0?\.[5-9])'
+      reason: "sleeps for a large part of the timeout and learns nothing"
+    - pattern: '\breadline\s*\(|\breadLines\s*\(\s*(?:stdin|"stdin")|\bscan\s*\(\s*\)'
+      reason: "reads stdin, which is /dev/null here; fails identically every run"
+    - pattern: '\bgctorture\s*\(\s*TRUE'
+      reason: "turns on full GC torture; one seed then takes the whole timeout"
+
+llm:
+  provider: "deepseek"
+  model: "deepseek-v4-flash"
+  api_key: ""
+  timeout: 30

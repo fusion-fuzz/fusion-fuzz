@@ -128,7 +128,14 @@ class GCCDriver(BaseDriver):
 
         flags = [random.choices(self.MODES, weights=self.MODE_WEIGHTS, k=1)[0],
                  random.choice(self.OPT_LEVELS)]
-        if random.random() > 0.3:
+        # A seed that needs a newer standard than the compiler's default
+        # (gnu++17) must get a -std even on the 30% of draws that add none.
+        need_rank = 0
+        if facts["is_cxx"]:
+            need_rank = max([self._CXX_RANK.get(v, 0) for v in self._TARGET_CXX_RE.findall(content)] + [0])
+            if "-freflection" in content:
+                need_rank = max(need_rank, self._CXX_RANK["26"])
+        if random.random() > 0.3 or need_rank > self._CXX_RANK["17"]:
             # C89 rejects `//` comments and mixed declarations outright:
             # a seed written with them cannot be valid under -std=c89/gnu89
             # (tools/flagnoise.py: 1 in 3 of gcc's flag-induced rejects).
@@ -138,6 +145,12 @@ class GCCDriver(BaseDriver):
                 need = [self._CXX_RANK.get(v, 0) for v in self._TARGET_CXX_RE.findall(content)]
                 if "-freflection" in " ".join(facts["dg_options"]):
                     need.append(self._CXX_RANK["26"])
+                # The seed's C++ vocabulary bounds the standard from below
+                # (same rule as the clang driver).
+                if re.search(r'\b(?:concept|requires|consteval|co_await|co_return|co_yield|constinit)\b', content):
+                    need.append(self._CXX_RANK["20"])
+                elif re.search(r'\b(?:constexpr|decltype|nullptr|static_assert|noexcept|override|final)\b|\bauto\s+\w+\s*=', content):
+                    need.append(self._CXX_RANK["11"])
                 if need:
                     lo = max(need)
                     newer = [x for x in stds if self._CXX_RANK.get(x[-2:], 0) >= lo]

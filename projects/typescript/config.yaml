@@ -1,0 +1,53 @@
+project_name: "typescript"
+
+execution:
+  # projects/typescript/driver.py builds the real command (options from
+  # the test case's `// @option:` directives plus random ones); this is
+  # BaseDriver's fallback.
+  command: "projects/typescript/tsc-bin --noEmit {seed_path}"
+  timeout: 20
+  concurrency: 16
+  mem_limit_mb: 4096
+
+analysis:
+  # tsc exit statuses (tsc/internal/execute/tsc/compile.go): 0 no
+  # diagnostics; 1 diagnostics, outputs skipped; 2 diagnostics, outputs
+  # generated; 3 invalid project. A fused program with type errors is the
+  # expected outcome, not a finding.
+  error_return_codes: [1, 2, 3]
+  # Two thirds of TypeScript's own test corpus are *negative* tests: the
+  # case exists to pin down a diagnostic, so it reports errors on its own
+  # and every child built from it reports at least those. Measured on 120
+  # seeds, 39 check cleanly. With --pre-analysis, drop the rest for the
+  # run — the same rule the CPython and Ruby adapters use, and the same
+  # reasoning the clang adapter's `-verify` exclusion uses.
+  drop_seeds_failing_alone: true
+  crash_patterns:
+    - "panic:"                     # Go panic (Debug failure, nil deref, index out of range)
+    - "fatal error:"               # Go runtime (stack overflow, concurrent map writes)
+    - "Debug failure"
+    - "Unexpected node"
+    - "SIGSEGV"
+    - "runtime error:"
+  syntax_patterns:
+    - "error TS"
+
+paths:
+  seed_source: "projects/typescript/seeds"
+  seed_corpus: "projects/typescript/corpus.db"
+
+  seed_exclude_patterns:
+    # A test case that references another file cannot be checked alone:
+    # every such child fails on the same unresolved import.
+    - pattern: '(?m)^\s*///\s*<reference\s'
+      reason: "triple-slash reference to a file that is not here"
+    - pattern: '\bfrom\s+[''"]\.{1,2}/|\brequire\s*\(\s*[''"]\.{1,2}/|\bimport\s+[''"]\.{1,2}/'
+      reason: "relative import of a sibling file that is not here"
+    - pattern: '(?m)^\s*//\s*@[Ff]ile[Nn]ame\s*:'
+      reason: "multi-file test case (split by setup.py; a leftover marker means it was not)"
+
+llm:
+  provider: "deepseek"
+  model: "deepseek-v4-flash"
+  api_key: ""
+  timeout: 30

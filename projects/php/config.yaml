@@ -31,6 +31,10 @@ paths:
     # on its own usage (start() twice -> "context.status ==
     # ZEND_FIBER_STATUS_INIT"). Any fusion that reuses the object trips
     # it, and an assertion inside the test extension is not an engine bug.
+    # ext/zend_test's string helpers write into a string's buffer on
+    # purpose (zend_terminate_string on an interned literal is a SEGV by
+    # design); a child calling them is a crash that says nothing about PHP.
+    - pattern: '\bzend_(?:terminate_string|create_unterminated_string|leak_bytes|leak_variable)\b'
     - pattern: '(?<![A-Za-z])_?ZendTestFiber\b'   # the class is spelled _ZendTestFiber in current php-src; \b missed the underscore
       reason: "ext/zend_test test double; its assertions guard its own usage, not the engine"
 

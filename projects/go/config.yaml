@@ -18,7 +18,7 @@ execution:
   # enforces this cap instead, evicting oldest-used-first the way cmd/go
   # does. Set to 0 to disable. The floor is roughly 400 MB: the thirteen
   # target standard libraries are ~30 MB each and are worth keeping resident.
-  cache_limit_mb: 8192
+  cache_limit_mb: 3072
   # Executions between cache size checks. Each check walks the cache's 256
   # shard directories, so it should be rare relative to execution but
   # frequent relative to how fast the cache grows by its headroom.

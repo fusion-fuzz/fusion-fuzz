@@ -1,0 +1,111 @@
+project_name: "ruby"
+
+execution:
+  # projects/ruby/driver.py builds the real command (interpreter flags,
+  # sanitizer options, the assertion shim); this is BaseDriver's fallback.
+  command: "projects/ruby/install/bin/ruby -I projects/ruby -rffl_shim {seed_path}"
+  timeout: 20
+  concurrency: 16
+  # Applied through ASan's hard_rss_limit_mb: an ASan-instrumented process
+  # reserves a huge virtual address space up front, so `ulimit -v` would
+  # stop it starting at all.
+  mem_limit_mb: 2048
+
+analysis:
+  # Ruby exits 1 on an uncaught exception. Like CPython, every seed here
+  # is *executed*, so "invalid" means the fused program raised, not that
+  # a compiler rejected it.
+  error_return_codes: [1]
+  # Seeds that raise on their own raise identically inside every child.
+  # With --pre-analysis, drop them for the run.
+  drop_seeds_failing_alone: true
+  crash_patterns:
+    - "[BUG]"                      # rb_bug: interpreter self-check failed
+    - "SUMMARY:"                   # ASan / UBSan
+    - "runtime error:"             # UBSan
+    - "Assertion Failed"           # RUBY_ASSERT (ruby_assert.h)
+    - "Assertion `"                # glibc assert
+    - "[FATAL]"
+    - "Segmentation fault"
+    - "Bus error"
+    - "core dumped"
+
+  # Ordinary Ruby exceptions; an interpreter that raises is doing its job.
+  syntax_patterns:
+    - "syntax error"
+    - "SyntaxError"
+    - "NameError"
+    - "NoMethodError"
+    - "ArgumentError"
+    - "TypeError"
+    - "FrozenError"
+    - "LoadError"
+    - "RuntimeError"
+    - "ZeroDivisionError"
+    - "KeyError"
+    - "IndexError"
+    - "RangeError"
+    - "LocalJumpError"
+    - "NotImplementedError"
+    - "FloatDomainError"
+    - "RegexpError"
+    - "EncodingError"
+    - "IOError"
+    - "SystemStackError"
+    - "NoMatchingPatternError"
+    - "StopIteration"
+
+paths:
+  seed_source: "projects/ruby/seeds"
+  seed_corpus: "projects/ruby/corpus.db"
+
+  seed_exclude_patterns:
+    # Ruby's own C-extension test helpers (ext/-test-/*) are not built
+    # into the install; a seed requiring one dies on LoadError every time.
+    - pattern: '(?m)^\s*require\s+[''"]-test-/'
+      reason: "needs ext/-test-/ helpers that the install does not ship"
+    - pattern: '(?m)^\s*require_relative\b'
+      reason: "require_relative cannot resolve from the temp directory a child runs in"
+    - pattern: '\bBug::|\bBug\.'
+      reason: "references ext/-test-/ Bug module"
+    - pattern: '\bEnvUtil\b|\bassert_separately\b|\bassert_in_out_err\b|\bassert_ruby_status\b|\bassert_normal_exit\b|\bassert_no_memory_leak\b'
+      reason: "spawns a child ruby through test/lib helpers that are not loaded"
+    # RubyVM::Shape exists only in a debug build (shape.c: `#if
+    # SHAPE_DEBUG`, i.e. VM_CHECK_MODE > 0, which -DRUBY_DEBUG=1 turns
+    # on) and its methods take a VALUE and use it unchecked —
+    # `class_max_iv_count` is `RCLASS_MAX_IV_COUNT(klass)` with no type
+    # test, so passing anything that is not a class segfaults by
+    # construction. That is Ruby's `_testcapi`: the crash is the API
+    # working as documented, not the interpreter being wrong. The first
+    # such bundle was dismissed by hand before this rule.
+    - pattern: '\bRubyVM::Shape\b'
+      reason: "debug-only introspection API with unchecked arguments; crashing it proves nothing"
+    # Loading arbitrary compiled bytecode is the same argument (CPython's
+    # types.CodeType is excluded for it too): a fused program that
+    # corrupts the binary crashes the VM on purpose.
+    - pattern: '\bInstructionSequence\.load(?:_from_binary)?\b|\bRubyVM::InstructionSequence\.load\b'
+      reason: "loads arbitrary compiled bytecode; crashing the VM with it is expected"
+    - pattern: '\bObjectSpace\._id2ref\b|\b_id2ref\b'
+      reason: "documented as unsafe: resolves an arbitrary integer as an object address"
+    # Every seed here executes. These would take the loop off this machine
+    # or hang a worker for the whole timeout.
+    - pattern: '\b(?:TCPSocket|TCPServer|UDPSocket|UNIXSocket|UNIXServer|Socket|Net::|OpenURI|URI\.open|open-uri)\b'
+      reason: "opens a socket; seeds here are executed, not just parsed"
+    - pattern: '\b(?:fork|spawn|exec|system)\s*[\(\s]|`[^`\n]*`|\bIO\.popen\b|\bProcess\.(?:kill|wait|spawn|daemon|fork)\b|\bOpen3\b'
+      reason: "spawns processes; a concurrent loop would fork-bomb itself"
+    - pattern: '\bThread\.(?:new|start|fork)\b|\bQueue\.new\b|\bMutex\.new\b|\bConditionVariable\b|\bRactor\.new\b|\bFiber\.scheduler\b'
+      reason: "concurrency primitives deadlock after fusion and burn the full timeout"
+    - pattern: '\b(?:File|IO)\.(?:write|binwrite|open|unlink|delete|rename|symlink|link|mkfifo|truncate)\b|\bFileUtils\b|\bDir\.(?:mkdir|rmdir|mktmpdir|chdir|unlink|delete)\b|\bTempfile\b|\bopen\s*\([^)]*[''"]\s*[wa]'
+      reason: "writes or deletes files; the execution has no sandbox beyond its temp directory"
+    - pattern: '\bSignal\.trap\b|\btrap\s*\(|\bProcess\.setrlimit\b|\bexit!\b|\bat_exit\b'
+      reason: "changes process-level state that hides or fakes the oracle's signals"
+    - pattern: '\bsleep\s*\(?\s*(?:[1-9]\d*|0?\.[5-9])'
+      reason: "sleeps for a large part of the timeout and learns nothing"
+    - pattern: '\$stdin\b|\bSTDIN\b|\bgets\b|\bARGF\b|\breadline\b'
+      reason: "reads stdin, which is /dev/null here; fails identically every run"
+
+llm:
+  provider: "deepseek"
+  model: "deepseek-v4-flash"
+  api_key: ""
+  timeout: 30
