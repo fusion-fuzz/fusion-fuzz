@@ -69,9 +69,17 @@ def _jobs():
 
 def cmake_args():
     """The CMake configuration. See the module docstring for the reasoning."""
-    asan = os.environ.get("FFL_TINT_ASAN", "1") == "1"
+    from core.toolchain import require_clang, sanitizers_enabled
+    asan = os.environ.get("FFL_TINT_ASAN", "1") == "1" and sanitizers_enabled()
+    # Without naming the compiler, cmake takes the system default and this
+    # build came out as pure gcc 13.3 — DAWN_ENABLE_ASAN then selects gcc's
+    # sanitizer runtime, whose reports do not line up with the LLVM ones
+    # every other adapter produces.
+    cc, cxx = require_clang()
     args = [
         "-GNinja",
+        f"-DCMAKE_C_COMPILER={cc}",
+        f"-DCMAKE_CXX_COMPILER={cxx}",
         "-DCMAKE_BUILD_TYPE=Debug",
         # Dawn fetches its own dependencies rather than needing depot_tools.
         "-DDAWN_FETCH_DEPENDENCIES=ON",
