@@ -47,22 +47,17 @@ RUN userdel -r ubuntu 2>/dev/null || true; \
     echo "fuzz:fuzz" | chpasswd && \
     usermod -aG sudo fuzz
 
-USER fuzz
-WORKDIR /home/fuzz/WorkSpace
-
-CMD ["/bin/bash"]
-
-# clang and its sanitizer runtime.
+# clang's sanitizer runtime.
 #
-# The package that carries compiler-rt differs by release: on 22.04 the
-# `clang` package includes it, on 24.04 it is a separate
-# libclang-rt-<version>-dev. So the version is read back from the clang that
-# got installed rather than pinned here.
+# The package carrying compiler-rt differs by release: 22.04's `clang`
+# includes it, 24.04 needs a separate libclang-rt-<version>-dev. So the
+# version is read back from the clang that got installed rather than pinned.
 #
-# The final compile is the point of this step, not a test of it: without
-# compiler-rt a sanitized build gets thousands of objects in before failing
-# on a missing sanitizer/asan_interface.h. Failing here instead makes the
-# image refuse to be built rather than produce one that cannot instrument.
+# The compile at the end is the point of this step, not a test of it:
+# without compiler-rt there is no sanitizer/asan_interface.h and no
+# libclang_rt.asan, and a sanitized build gets thousands of objects in
+# before failing. Failing here makes the image refuse to build instead of
+# producing one that cannot instrument.
 RUN apt-get update && apt-get install -y --no-install-recommends clang && \
     v="$(clang --version | sed -n 's/.*version \([0-9]*\).*/\1/p' | head -1)" && \
     (apt-get install -y --no-install-recommends "libclang-rt-$v-dev" || true) && \
@@ -70,3 +65,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends clang && \
     clang -fsanitize=address,undefined -fno-sanitize=function /tmp/rtprobe.c -o /tmp/rtprobe && \
     rm -f /tmp/rtprobe.c /tmp/rtprobe && \
     apt-get clean && rm -rf /var/lib/apt/lists/*
+
+USER fuzz
+WORKDIR /home/fuzz/WorkSpace
+
+CMD ["/bin/bash"]
+
