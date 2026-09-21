@@ -2,6 +2,8 @@
 Shared utilities for fusion-fuzz.
 """
 
+import re
+
 # Patterns that mark the beginning of a crash / sanitiser report.
 _CRASH_ANCHORS = [
     "SUMMARY: AddressSanitizer",
@@ -52,6 +54,31 @@ _LINES_AFTER_ANCHOR  = 300
 _MAX_OUTPUT_CHARS    = 48_000
 
 
+# One alternation over the anchors, longest first so a longer anchor
+# that contains a shorter one ("AddressSanitizer: heap-use-after-free"
+# vs "AddressSanitizer") still wins the same way the old first-match
+# loop did: the loop tested anchors in list order per line, and the
+# earliest *line* won; within a line the regex returns the leftmost
+# match, which is what the line-then-anchor loop returned too.
+_CRASH_ANCHOR_RE = re.compile(
+    "|".join(re.escape(a) for a in sorted(_CRASH_ANCHORS, key=len, reverse=True)))
+
+
+def _line_start(text: str, pos: int) -> int:
+    return text.rfind("\n", 0, pos) + 1
+
+
+def _line_offset(text: str, pos: int, n: int) -> int:
+    """Offset of the start of the line *n* lines after the one containing
+    *pos* (n >= 0); len(text) if there are fewer."""
+    for _ in range(n):
+        nxt = text.find("\n", pos)
+        if nxt == -1:
+            return len(text)
+        pos = nxt + 1
+    return pos
+
+
 def smart_truncate(text: str,
                    max_chars: int = _MAX_OUTPUT_CHARS,
                    lines_before: int = _LINES_BEFORE_ANCHOR,
@@ -67,50 +94,60 @@ def smart_truncate(text: str,
     3. Keep *lines_before* lines of context before the anchor and
        *lines_after* lines after it.
     4. Replace skipped sections with a concise marker line.
-    5. If no anchor is found, keep the tail (*lines_after* lines).
+    5. If no anchor is found, keep the head and the tail.
+
+    Cost is proportional to the part that is *kept*, not to the whole
+    output: the previous version split a multi-megabyte sanitizer dump
+    into lines and tested 34 anchors against every one of them, on the
+    orchestrator's main thread, at 30-140 ms a call — 10 s of a 150 s
+    php run, serialised behind every result.
     """
     if len(text) <= max_chars:
         return text
 
-    lines = text.splitlines()
-
-    anchor_idx = None
-    for i, line in enumerate(lines):
-        for pat in _CRASH_ANCHORS:
-            if pat in line:
-                anchor_idx = i
-                break
-        if anchor_idx is not None:
-            break
-
-    if anchor_idx is None:
+    m = _CRASH_ANCHOR_RE.search(text)
+    if m is None:
         # No anchor: keep the head as well as the tail. Whatever the
         # program printed first is the best remaining evidence of what
         # went wrong — a compiler writes its diagnosis before its stack
         # trace — and keeping only the tail threw exactly that away.
         head_lines = max(lines_before, 40)
-        head, tail = lines[:head_lines], lines[-lines_after:]
-        skipped = len(lines) - len(head) - len(tail)
+        body = text[:-1] if text.endswith("\n") else text
+        total = body.count("\n") + 1 if body else 0
+        skipped = total - head_lines - lines_after
         if skipped <= 0:
             return text
-        skipped_bytes = len(text) - sum(len(l) + 1 for l in head + tail)
+        head_end = _line_offset(body, 0, head_lines)          # after head's newline
+        # splitlines() counts a trailing empty line ("...x\n\n" ends in
+        # an empty line), so the walk back starts *on* it in that case.
+        tail_start = len(body)
+        steps = lines_after - 1 if body.endswith("\n") else lines_after
+        for _ in range(steps):
+            tail_start = _line_start(body, tail_start - 1)
+        head, tail = body[:head_end - 1], body[tail_start:]
+        skipped_bytes = len(text) - (len(head) + 1) - (len(tail) + 1)
         marker = (f"[... {skipped:,} lines / {skipped_bytes:,} bytes of output "
                   f"truncated — no crash signature found; head and tail kept ...]")
-        return "\n".join(head) + "\n" + marker + "\n" + "\n".join(tail)
+        return head + "\n" + marker + "\n" + tail
 
-    start = max(0, anchor_idx - lines_before)
-    end   = min(len(lines), anchor_idx + lines_after)
+    anchor_line_start = _line_start(text, m.start())
+    # Walk back lines_before line starts (or to the beginning).
+    start = anchor_line_start
+    for _ in range(lines_before):
+        if start == 0:
+            break
+        start = _line_start(text, start - 1)
+    end = _line_offset(text, anchor_line_start, lines_after)
+    kept = text[start:end]
+    if kept.endswith("\n"):
+        kept = kept[:-1]
+
     parts = []
-
     if start > 0:
-        skipped_bytes = sum(len(l) + 1 for l in lines[:start])
-        parts.append(f"[... {start:,} lines / {skipped_bytes:,} bytes of output "
+        parts.append(f"[... {text.count(chr(10), 0, start):,} lines / {start:,} bytes of output "
                      f"truncated before crash signature ...]")
-
-    parts.append("\n".join(lines[start:end]))
-
-    if end < len(lines):
-        remaining = len(lines) - end
+    parts.append(kept)
+    if end < len(text):
+        remaining = text.count("\n", end) + (0 if text.endswith("\n") else 1)
         parts.append(f"[... {remaining:,} more lines truncated after crash report ...]")
-
     return "\n".join(parts)

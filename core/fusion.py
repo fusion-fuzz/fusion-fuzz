@@ -1553,122 +1553,137 @@ class PHPFusionStrategy(GenericDataflowStrategy):
     _PHP_CONTINUATION_RE = re.compile(
         r'^\s*(?:catch\s*\(|finally\s*\{|else\s*\{|elseif\s*\(|else\s+if\s*\()')
 
+    _PHP_SPLIT_INTERESTING_RE = re.compile(r'[\\\'"#/<(){};]')
+    # _PHP_CONTINUATION_RE without its `^`: Pattern.match(code, k) keeps
+    # `^` anchored to the real start of the string, not to k.
+    _PHP_CONTINUATION_AT_RE = re.compile(
+        r'\s*(?:catch\s*\(|finally\s*\{|else\s*\{|elseif\s*\(|else\s+if\s*\()')
+
     @classmethod
     def _split_statements(cls, code: str) -> List[str]:
         """Split PHP code into statement units respecting brace/paren depth
         and string literals.  Compound blocks (functions, classes, control
         structures including try/catch/finally and if/elseif/else chains)
-        are kept as single units."""
+        are kept as single units.
+
+        Span-copying scanner: one compiled regex finds the next character
+        that can change the splitter's state and the text in between is
+        copied as a slice, instead of appending every character of the
+        program to a list one at a time under the GIL. Output identical."""
         statements: List[str] = []
         current: List[str] = []
         brace_depth = 0
         paren_depth = 0
-        in_sq = False
-        in_dq = False
-        in_heredoc = False
-        heredoc_tag = ""
-        escaped = False
-        i = 0
         n = len(code)
+        find = cls._PHP_SPLIT_INTERESTING_RE.search
+        cont = cls._PHP_CONTINUATION_AT_RE
 
-        def _lookahead_is_continuation(pos: int) -> bool:
-            """Check if text after pos starts with catch/finally/else/elseif."""
-            rest = code[pos:]
-            return bool(cls._PHP_CONTINUATION_RE.match(rest))
+        def _emit():
+            stmt = ''.join(current).strip()
+            if stmt:
+                statements.append(stmt)
 
+        i = 0
         while i < n:
-            ch = code[i]
-            nch = code[i + 1] if i + 1 < n else ''
+            m = find(code, i)
+            if m is None:
+                current.append(code[i:])
+                break
+            j = m.start()
+            if j > i:
+                current.append(code[i:j])
+            ch = code[j]
+            nch = code[j + 1] if j + 1 < n else ''
+            i = j
 
-            # ── string literal tracking ──
-            if escaped:
+            if ch == '\\':
+                # Outside a literal a backslash is an ordinary character.
                 current.append(ch)
-                escaped = False
                 i += 1
                 continue
-            if ch == '\\' and (in_sq or in_dq):
-                current.append(ch)
-                escaped = True
-                i += 1
-                continue
-            if in_sq:
-                current.append(ch)
-                if ch == "'":
-                    in_sq = False
-                i += 1
-                continue
-            if in_dq:
-                current.append(ch)
-                if ch == '"':
-                    in_dq = False
-                i += 1
-                continue
-            if in_heredoc:
-                current.append(ch)
-                if ch == '\n':
-                    rest = code[i + 1:]
-                    if rest.startswith(heredoc_tag + ';') or rest.startswith(heredoc_tag + '\n') or rest.rstrip() == heredoc_tag:
-                        end_len = len(heredoc_tag)
-                        current.append(code[i + 1:i + 1 + end_len])
-                        i += 1 + end_len
-                        in_heredoc = False
-                        if i < n and code[i] == ';':
-                            current.append(';')
-                            i += 1
+
+            if ch == "'" or ch == '"':
+                q = ch
+                k = j + 1
+                while k < n:
+                    c = code[k]
+                    if c == '\\':
+                        k += 2
                         continue
-                i += 1
+                    if c == q:
+                        k += 1
+                        break
+                    k += 1
+                else:
+                    k = n
+                k = min(k, n)
+                current.append(code[j:k])
+                i = k
                 continue
 
-            # ── skip single-line comments ──
+            # ── comments ──
             if ch == '/' and nch == '/':
-                while i < n and code[i] != '\n':
-                    current.append(code[i])
-                    i += 1
+                nl = code.find('\n', j)
+                k = n if nl == -1 else nl
+                current.append(code[j:k])
+                i = k
                 continue
             if ch == '#' and nch != '[':
-                while i < n and code[i] != '\n':
-                    current.append(code[i])
-                    i += 1
+                nl = code.find('\n', j)
+                k = n if nl == -1 else nl
+                current.append(code[j:k])
+                i = k
                 continue
-            # ── skip multi-line comments ──
             if ch == '/' and nch == '*':
-                current.append(ch)
-                i += 1
-                while i < n:
-                    current.append(code[i])
-                    if code[i] == '*' and i + 1 < n and code[i + 1] == '/':
-                        current.append('/')
-                        i += 2
-                        break
-                    i += 1
+                e = code.find('*/', j + 2)
+                k = n if e == -1 else e + 2
+                current.append(code[j:k])
+                i = k
                 continue
 
-            # ── detect string starts ──
-            if ch == "'" and brace_depth + paren_depth >= 0:
-                in_sq = True
-                current.append(ch)
-                i += 1
-                continue
-            if ch == '"' and brace_depth + paren_depth >= 0:
-                in_dq = True
-                current.append(ch)
-                i += 1
-                continue
             # ── heredoc / nowdoc ──
-            if ch == '<' and code[i:i+3] == '<<<':
+            if ch == '<' and code.startswith('<<<', j):
                 current.append('<<<')
-                i += 3
-                tag_start = i
-                while i < n and code[i] not in ('\n', '\r'):
-                    i += 1
-                raw_tag = code[tag_start:i].strip().strip("'\"")
-                heredoc_tag = raw_tag
-                current.append(code[tag_start:i])
-                in_heredoc = True
+                k = j + 3
+                tag_start = k
+                while k < n and code[k] not in ('\n', '\r'):
+                    k += 1
+                heredoc_tag = code[tag_start:k].strip().strip("'\"")
+                current.append(code[tag_start:k])
+                # The body runs to the line that is exactly the tag
+                # (followed by `;`, a newline, or only whitespace to EOF).
+                p = k
+                closed = False
+                while p < n:
+                    nl = code.find('\n', p)
+                    if nl == -1:
+                        break
+                    rest_start = nl + 1
+                    if (code.startswith(heredoc_tag + ';', rest_start)
+                            or code.startswith(heredoc_tag + '\n', rest_start)
+                            or code[rest_start:].rstrip() == heredoc_tag):
+                        # body up to and including this newline, then the tag
+                        current.append(code[k:rest_start])
+                        e = rest_start + len(heredoc_tag)
+                        current.append(code[rest_start:e])
+                        if e < n and code[e] == ';':
+                            current.append(';')
+                            e += 1
+                        i = e
+                        closed = True
+                        break
+                    p = nl + 1
+                if not closed:
+                    current.append(code[k:])
+                    i = n
+                continue
+
+            if ch == '/' or ch == '#' or ch == '<':
+                current.append(ch)
+                i += 1
                 continue
 
             current.append(ch)
-
             if ch == '(':
                 paren_depth += 1
             elif ch == ')':
@@ -1679,40 +1694,24 @@ class PHPFusionStrategy(GenericDataflowStrategy):
                 brace_depth -= 1
                 if brace_depth <= 0 and paren_depth <= 0:
                     brace_depth = 0
-                    # Before emitting, check if the next non-whitespace is a
-                    # continuation keyword (catch, finally, else, elseif).
-                    # If so, keep accumulating into the same statement.
-                    j = i + 1
-                    while j < n and code[j] in (' ', '\t', '\n', '\r'):
-                        j += 1
-                    if _lookahead_is_continuation(j):
-                        # Absorb whitespace and continue
+                    k = j + 1
+                    while k < n and code[k] in (' ', '\t', '\n', '\r'):
+                        k += 1
+                    if cont.match(code, k):
                         i += 1
                         continue
-                    # `}` closes an expression, not a statement, in
-                    # `$f = function () {...};`, `new class {...};`,
-                    # `y::{expr};` — the `;` that follows belongs to this
-                    # unit. Left behind, it became a unit of its own, and
-                    # once statements are wrapped individually that
-                    # orphan `;` lands in a different block from its
-                    # statement.
-                    if j < n and code[j] == ';':
-                        current.append(code[i + 1:j + 1])
-                        i = j
-                    stmt = ''.join(current).strip()
-                    if stmt:
-                        statements.append(stmt)
+                    if k < n and code[k] == ';':
+                        current.append(code[j + 1:k + 1])
+                        i = k
+                    _emit()
                     current = []
                     i += 1
                     continue
             elif ch == ';' and brace_depth <= 0 and paren_depth <= 0:
-                stmt = ''.join(current).strip()
-                if stmt:
-                    statements.append(stmt)
+                _emit()
                 current = []
                 i += 1
                 continue
-
             i += 1
 
         leftover = ''.join(current).strip()
@@ -3702,23 +3701,33 @@ class SwiftFusionStrategy(FusionStrategy):
         """Drop names that only occur as members (`p.x`), argument labels
         (`f(x: 1)`) or after `@`/`#`: renaming those is "value of type has
         no member" (23% of swift's dataflow failures)."""
+        # Swift types and protocols are UpperCamelCase: a rename of
+        # `init(x: T)` / `struct S: P` is "cannot find type in scope"
+        # (13 of 45 renames drawn from the bare scan of B).
+        cands = [n for n in names if not n[:1].isupper()]
+        if not cands:
+            return []
+        # One pass over the file for every candidate at once, grouped by
+        # name, instead of a full scan per name: this function was 13 ms
+        # of swift's 20 ms fusion cost per iteration. Same answers — the
+        # per-name test only looks at that name's own matches.
+        alt = '|'.join(re.escape(n) for n in sorted(set(cands), key=len, reverse=True))
+        occ_by_name = {}
+        for m in re.finditer(r'(?<![\w])(' + alt + r')(?![\w])', code):
+            occ_by_name.setdefault(m.group(1), []).append(m)
         out = []
-        for n in names:
-            # Swift types and protocols are UpperCamelCase: a rename of
-            # `init(x: T)` / `struct S: P` is "cannot find type in scope"
-            # (13 of 45 renames drawn from the bare scan of B).
-            if n[:1].isupper():
-                continue
-            occ = list(re.finditer(r'(?<![\w])' + re.escape(n) + r'(?![\w])', code))
+        for n in cands:
+            occ = occ_by_name.get(n)
             if not occ:
                 continue
             if all((m.start() > 0 and code[m.start() - 1] in '.@#$')
-                   or re.match(r'\s*:', code[m.end():m.end() + 2]) for m in occ):
+                   or self._SWIFT_LABEL_TAIL_RE.match(code, m.end()) for m in occ):
                 continue
             out.append(n)
         return out
 
     _SWIFT_DECL_KW_RE = re.compile(r'\b(?:func|let|var|class|struct|enum|protocol|typealias|case|actor|extension|associatedtype|init|subscript|operator)\s+$')
+    _SWIFT_LABEL_TAIL_RE = re.compile(r'\s*:')       # `name:` argument label, matched at an offset
 
     def _dataflow_replace(self, code: str, old: str, new: str) -> str:
         """Rename value occurrences only: not `.old` member accesses, not
@@ -4996,18 +5005,40 @@ class MLIRFusionStrategy(FusionStrategy):
         r'|amdg\.\w|nvg\.\w'
     )
 
+    _MLIR_COMMENT_RE = re.compile(r'/\*.*?\*/|//[^\n]*', re.S)
+    _PLAUSIBLE_CACHE: dict = {}
+
     def _is_plausible_mlir(self, body: str) -> bool:
-        """Return False if body looks like LLM-generated pseudo-code rather than MLIR."""
+        """Return False if body looks like LLM-generated pseudo-code rather than MLIR.
+
+        One sub for both comment forms instead of two, and the verdict
+        cached per body: a seed's plausibility is
+        asked for on every fusion it takes part in (twice per pair in
+        fuse(), twice more in the state and declaration paths), and the
+        answer never changes. This was 1.1 s of a 200-iteration mlir
+        fusion profile."""
+        cls = type(self)
+        hit = cls._PLAUSIBLE_CACHE.get(body)
+        if hit is not None:
+            return hit
         # Comments are not evidence either way (`//===--- banner ---===//`
-        # matched the bare-`==` pattern).
-        body = re.sub(r'/\*.*?\*/', '', body, flags=re.S)
-        body = re.sub(r'//.*', '', body)
-        for pat in self._NON_MLIR_PATTERNS:
-            if pat.search(body):
-                return False
-        if not self._HAS_MLIR_STRUCTURE.search(body):
-            return False
-        return True
+        # matched the bare-`==` pattern); one sub for both comment forms.
+        # The 21 rejection patterns stay separate: a single alternation of
+        # them measured twice as slow per miss (every position tries every
+        # branch), whereas each pattern alone has a literal prefix the
+        # engine can skip on.
+        stripped = cls._MLIR_COMMENT_RE.sub('', body)
+        ok = True
+        for pat in cls._NON_MLIR_PATTERNS:
+            if pat.search(stripped):
+                ok = False
+                break
+        if ok and not cls._HAS_MLIR_STRUCTURE.search(stripped):
+            ok = False
+        if len(cls._PLAUSIBLE_CACHE) > 20000:
+            cls._PLAUSIBLE_CACHE.clear()
+        cls._PLAUSIBLE_CACHE[body] = ok
+        return ok
 
     def fuse(self, parent_a: Seed, parent_b: Seed) -> Seed:
         a_src = parent_a.content
@@ -8339,6 +8370,14 @@ class ClangFusionStrategy(GenericDataflowStrategy):
 
     # `name` in type position: `name x`, `name *p`, `name x(`.
     _C_TYPE_USE_TMPL = r'\b{}\s*\**\s*[A-Za-z_]\w*\s*[;,=)(\[]'
+    _C_TYPEDEF_NAME_RE = re.compile(r'\btypedef\b[^;]*?\b([A-Za-z_]\w*)\s*;')
+    _C_USING_ALIAS_RE = re.compile(r'\busing\s+([A-Za-z_]\w*)\s*=')
+    # `: 3` after a member name — a bit-field width. Matched at an offset
+    # with .match(text, pos), which is anchored at pos like the old
+    # re.match over the 4-character slice was.
+    _C_BITFIELD_TAIL_RE = re.compile(r'\s*:\s*\d')
+    _C_DECL_TAIL_RE = re.compile(r'([A-Za-z_]\w*)\s*[*&]*\s*$')
+    _C_CALL_TAIL_RE = re.compile(r'\s*\(')
 
     _C_MACRO_RE = re.compile(r'^\s*#\s*define\s+([A-Za-z_]\w*)(?!\()', re.M)
 
@@ -8442,21 +8481,32 @@ class ClangFusionStrategy(GenericDataflowStrategy):
         stripped = self._C_NORM_STR.sub('""', code)
         funcs = set(self._C_FUNC_DEF_RE.findall(stripped))
         types = set(self._C_TYPE_DEF_RE.findall(stripped))
-        types |= set(re.findall(r'\btypedef\b[^;]*?\b([A-Za-z_]\w*)\s*;', stripped))
-        types |= set(re.findall(r'\busing\s+([A-Za-z_]\w*)\s*=', stripped))
+        types |= set(self._C_TYPEDEF_NAME_RE.findall(stripped))
+        types |= set(self._C_USING_ALIAS_RE.findall(stripped))
+        # The two per-name scans of the whole file (a type-use search and
+        # an occurrence scan, each a fresh regex) are one pass each over an
+        # alternation of the candidates. Same answers: the type-use test
+        # only asked whether a match exists, and the occurrence test is a
+        # per-name predicate over that name's own matches.
+        cands = [n for n in names
+                 if not (n in self._C_KEYWORDS or n in funcs or n in types or n.endswith('_t'))
+                 and not (n.isupper() and len(n) > 1)]
+        if not cands:
+            return []
+        alt = '|'.join(re.escape(n) for n in sorted(set(cands), key=len, reverse=True))
+        type_used = set(re.findall(self._C_TYPE_USE_TMPL.format('(' + alt + ')'), stripped))
+        occ_by_name = {}
+        for m in re.finditer(r'(?<![\w])(' + alt + r')(?![\w])', stripped):
+            occ_by_name.setdefault(m.group(1), []).append(m)
         out = []
-        for n in names:
-            if n in self._C_KEYWORDS or n in funcs or n in types or n.endswith('_t'):
-                continue
-            if n.isupper() and len(n) > 1:
-                continue                     # macro / enumerator naming
-            if re.search(self._C_TYPE_USE_TMPL.format(re.escape(n)), stripped):
+        for n in cands:
+            if n in type_used:
                 continue
             # Only ever a struct member (`p->ir`, `x.ll`) or a bit-field /
             # member declaration: not a value that can be rewired.
-            occ = list(re.finditer(r'(?<![\w])' + re.escape(n) + r'(?![\w])', stripped))
+            occ = occ_by_name.get(n, [])
             if occ and all(stripped[max(0, m.start() - 2):m.start()].endswith(('.', '->'))
-                           or re.match(r'\s*:\s*\d', stripped[m.end():m.end() + 4]) for m in occ):
+                           or self._C_BITFIELD_TAIL_RE.match(stripped, m.end()) for m in occ):
                 continue
             out.append(n)
         return out
@@ -8469,20 +8519,33 @@ class ClangFusionStrategy(GenericDataflowStrategy):
         """Rename value occurrences only: not member accesses (`.old`,
         `->old`), not bit-fields, not declarations."""
         def _is_use(m):
-            before = code[:m.start()].rstrip()
+            # Everything this test looks at is the previous token: walk
+            # back over whitespace, then over `*`/`&`, then over the
+            # identifier, and take only that window. The old code copied
+            # the whole file prefix and ran a `$`-anchored search over it
+            # for every occurrence — quadratic in the file, under the GIL.
+            j = m.start()
+            while j > 0 and code[j - 1] in ' \t\r\n':
+                j -= 1
+            k = j
+            while k > 0 and code[k - 1] in '*& \t\r\n':
+                k -= 1
+            while k > 0 and (code[k - 1].isalnum() or code[k - 1] == '_'):
+                k -= 1
+            before = code[max(0, k - 2):j]            # 2 extra chars for `->`
             line_before = code[code.rfind('\n', 0, m.start()) + 1:m.start()]
             if '//' in line_before or line_before.lstrip().startswith(('*', '/*')):
                 return False                                  # comment (`// CHECK: old`)
             if before.endswith(('.', '->')):
                 return False
-            if re.match(r'\s*:\s*\d', code[m.end():m.end() + 4]):
+            if self._C_BITFIELD_TAIL_RE.match(code, m.end()):
                 return False                                  # bit-field
-            if re.match(r'\s*\(', code[m.end():m.end() + 3]):
+            if self._C_CALL_TAIL_RE.match(code, m.end()):
                 return False                                  # callee position: a value cannot replace it ("implicit declaration of function", "called object is not a function")
             # `int old`, `char *old`, `struct S old`: a declaration, whose
             # rename strands every other use ("use of undeclared
             # identifier", 11% of C dataflow failures).
-            mm = re.search(r'([A-Za-z_]\w*)\s*[*&]*\s*$', before)
+            mm = self._C_DECL_TAIL_RE.search(before)
             if mm and mm.group(1) not in self._C_USE_KEYWORDS:
                 return False
             return True
@@ -8563,110 +8626,124 @@ class ClangFusionStrategy(GenericDataflowStrategy):
 
     _CONTINUATION_RE = re.compile(r'^\s*(?:else\b|while\s*\(|catch\s*\()')
 
+    # Characters at which the statement splitter's state can change.
+    # Everything between two of them is copied verbatim.
+    _C_SPLIT_INTERESTING_RE = re.compile(r'[\\\'"#/(){};]')
+    # _CONTINUATION_RE without its `^`: Pattern.match(code, k) still
+    # anchors `^` to the real start of the string, not to k.
+    _C_CONTINUATION_AT_RE = re.compile(r'\s*(?:else\b|while\s*\(|catch\s*\()')
+
     @classmethod
     def _split_statements(cls, code: str) -> List[str]:
         """Split C/C++ code into top-level statement units, respecting
         brace/paren depth, string/char literals, comments, and preprocessor
         directives (kept as a single atomic line, honouring `\\`-continuation).
         Compound blocks (functions, structs, control structures, including
-        do/while and if/else chains) are kept as single units."""
+        do/while and if/else chains) are kept as single units.
+
+        The scanner jumps between the characters that can change its state
+        (quotes, backslash, `#`, `/`, brackets, `;`) and copies the text in
+        between as one slice; the previous version appended every
+        character of the file to a list one at a time, under the GIL, and
+        was the largest remaining item in the C-family fusion profile
+        after the lexical-mask rewrite. Output is identical."""
         statements: List[str] = []
         current: List[str] = []
         brace_depth = 0
         paren_depth = 0
-        in_sq = False
-        in_dq = False
-        escaped = False
-        i = 0
         n = len(code)
+        find = cls._C_SPLIT_INTERESTING_RE.search
+        cont = cls._C_CONTINUATION_AT_RE
 
         def _is_blank(buf: List[str]) -> bool:
             return not ''.join(buf).strip()
 
-        def _lookahead_is_continuation(pos: int) -> bool:
-            rest = code[pos:]
-            return bool(cls._CONTINUATION_RE.match(rest))
+        def _emit():
+            stmt = ''.join(current).strip()
+            if stmt:
+                statements.append(stmt)
 
+        i = 0
         while i < n:
-            ch = code[i]
-            nch = code[i + 1] if i + 1 < n else ''
+            m = find(code, i)
+            if m is None:
+                current.append(code[i:])
+                break
+            j = m.start()
+            if j > i:
+                current.append(code[i:j])
+            ch = code[j]
+            nch = code[j + 1] if j + 1 < n else ''
+            i = j
 
-            if escaped:
+            if ch == '\\':
+                # Outside a literal a backslash is an ordinary character
+                # (the old scanner only treated it as an escape inside
+                # quotes, and those are consumed whole below).
                 current.append(ch)
-                escaped = False
-                i += 1
-                continue
-            if ch == '\\' and (in_sq or in_dq):
-                current.append(ch)
-                escaped = True
-                i += 1
-                continue
-            if in_sq:
-                current.append(ch)
-                if ch == "'":
-                    in_sq = False
-                i += 1
-                continue
-            if in_dq:
-                current.append(ch)
-                if ch == '"':
-                    in_dq = False
                 i += 1
                 continue
 
-            # ── preprocessor directive: consume the whole (possibly
-            #    continued) line as one atomic statement ──
+            if ch == "'" or ch == '"':
+                # Consume the whole literal, honouring backslash escapes;
+                # an unterminated literal runs to end of file, as before.
+                q = ch
+                k = j + 1
+                while k < n:
+                    c = code[k]
+                    if c == '\\':
+                        k += 2
+                        continue
+                    if c == q:
+                        k += 1
+                        break
+                    k += 1
+                else:
+                    k = n
+                k = min(k, n)
+                current.append(code[j:k])
+                i = k
+                continue
+
             if (ch == '#' and brace_depth == 0 and paren_depth == 0
                     and _is_blank(current)):
+                # A preprocessor line is its own unit, with `\`-continuation.
                 current = []
-                while i < n:
-                    c = code[i]
-                    current.append(c)
-                    if c == '\\' and i + 1 < n and code[i + 1] == '\n':
-                        current.append(code[i + 1])
-                        i += 2
-                        continue
-                    if c == '\n':
-                        i += 1
+                k = j
+                while k < n:
+                    nl = code.find('\n', k)
+                    if nl == -1:
+                        k = n
                         break
-                    i += 1
-                stmt = ''.join(current).strip()
-                if stmt:
-                    statements.append(stmt)
+                    if nl > 0 and code[nl - 1] == '\\':
+                        k = nl + 1
+                        continue
+                    k = nl + 1
+                    break
+                current.append(code[j:k])
+                _emit()
                 current = []
+                i = k
                 continue
 
-            # ── comments ──
             if ch == '/' and nch == '/':
-                while i < n and code[i] != '\n':
-                    current.append(code[i])
-                    i += 1
+                nl = code.find('\n', j)
+                k = n if nl == -1 else nl           # the newline itself is not consumed
+                current.append(code[j:k])
+                i = k
                 continue
             if ch == '/' and nch == '*':
-                current.append(ch)
-                i += 1
-                while i < n:
-                    current.append(code[i])
-                    if code[i] == '*' and i + 1 < n and code[i + 1] == '/':
-                        current.append('/')
-                        i += 2
-                        break
-                    i += 1
+                e = code.find('*/', j + 2)
+                k = n if e == -1 else e + 2
+                current.append(code[j:k])
+                i = k
                 continue
-
-            if ch == "'":
-                in_sq = True
-                current.append(ch)
-                i += 1
-                continue
-            if ch == '"':
-                in_dq = True
+            if ch == '/' or ch == '#':
                 current.append(ch)
                 i += 1
                 continue
 
             current.append(ch)
-
             if ch == '(':
                 paren_depth += 1
             elif ch == ')':
@@ -8677,26 +8754,21 @@ class ClangFusionStrategy(GenericDataflowStrategy):
                 brace_depth -= 1
                 if brace_depth <= 0 and paren_depth <= 0:
                     brace_depth = 0
-                    j = i + 1
-                    while j < n and code[j] in (' ', '\t', '\n', '\r'):
-                        j += 1
-                    if _lookahead_is_continuation(j):
+                    k = j + 1
+                    while k < n and code[k] in (' ', '\t', '\n', '\r'):
+                        k += 1
+                    if cont.match(code, k):
                         i += 1
                         continue
-                    stmt = ''.join(current).strip()
-                    if stmt:
-                        statements.append(stmt)
+                    _emit()
                     current = []
                     i += 1
                     continue
             elif ch == ';' and brace_depth <= 0 and paren_depth <= 0:
-                stmt = ''.join(current).strip()
-                if stmt:
-                    statements.append(stmt)
+                _emit()
                 current = []
                 i += 1
                 continue
-
             i += 1
 
         leftover = ''.join(current).strip()
@@ -8971,7 +9043,12 @@ class ClangFusionStrategy(GenericDataflowStrategy):
         spans, depth, cur_start, pos = [], 0, 0, 0
         in_block_comment = False
         for line in code.splitlines(keepends=True):
-            code_part = self._C_NORM_CHAR.sub("' '", self._C_NORM_STR.sub('""', line.split('//')[0]))
+            code_part = line.split('//')[0]
+            # The two normalisers only rewrite quoted spans; most lines
+            # have none, and the pair of subs per line was a third of
+            # this function's time.
+            if '"' in code_part or "'" in code_part:
+                code_part = self._C_NORM_CHAR.sub("' '", self._C_NORM_STR.sub('""', code_part))
             # Braces inside /* ... */ comments do not count either.
             if in_block_comment:
                 if '*/' in code_part:
@@ -8982,8 +9059,8 @@ class ClangFusionStrategy(GenericDataflowStrategy):
             if '/*' in code_part and '*/' not in code_part.split('/*', 1)[1]:
                 code_part = code_part.split('/*', 1)[0]
                 in_block_comment = True
-            else:
-                code_part = re.sub(r'/\*.*?\*/', '', code_part)
+            elif '/*' in code_part:
+                code_part = self._C_INLINE_BLOCK_COMMENT_RE.sub('', code_part)
             depth += code_part.count('{') - code_part.count('}')
             pos += len(line)
             stripped = line.strip()
@@ -8999,7 +9076,7 @@ class ClangFusionStrategy(GenericDataflowStrategy):
             # Objective-C `@interface/@implementation/@protocol ... @end` is
             # one item: dropping its head as a duplicate left an orphan
             # `@end` ("'@end' must appear in an Objective-C context").
-            if re.match(r'@(?:interface|implementation|protocol)\b', stripped):
+            if self._OBJC_CONTAINER_RE.match(stripped):
                 depth += 1
             elif stripped.startswith('@end'):
                 depth -= 1
@@ -9027,6 +9104,8 @@ class ClangFusionStrategy(GenericDataflowStrategy):
         return spans
 
     _C_MACRO_CALL_RE = re.compile(r'^[A-Za-z_]\w*\s*\((?:[^()]|\([^()]*\))*\)\s*$')
+    _C_INLINE_BLOCK_COMMENT_RE = re.compile(r'/\*.*?\*/')
+    _OBJC_CONTAINER_RE = re.compile(r'@(?:interface|implementation|protocol)\b')
 
     _FUSION_TAG_RE = re.compile(r'\s*(?://|/\*)\s*\w+ fusion\s*(?:\*/)?\s*$', re.M)
 

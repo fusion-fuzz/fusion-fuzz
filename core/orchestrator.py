@@ -12,7 +12,7 @@ import sys
 import datetime
 import stat
 import gc
-from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED
+from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor, wait, FIRST_COMPLETED
 from typing import List, Tuple, Optional
 from .driver import get_driver, DockerDriver, cleanup_stale_processes
 from .fusion import Seed
@@ -54,6 +54,60 @@ def _extract_display_code(content: str, ext: str) -> tuple[str, str]:
         extracted = "".join(lines).strip()
         return (extracted if extracted else content), "php"
     return content, ext.lstrip(".")
+
+# --process-pool: fusion + execution in forked worker processes. Fusion is
+# pure Python and holds the GIL; with 16-44 worker *threads* it serialises
+# (phasetime on clang, 2026-09-15: 161% of wall-clock summed over threads
+# inside fusion — most threads were queued on the GIL, not compiling).
+# The parent still selects pairs, tracks coverage, judges results and
+# saves bundles; each worker inherits the loop (corpus, strategies,
+# driver) through fork, so nothing is pickled but the pair indices going
+# out and the (child, result) pairs coming back.
+_WORKER_LOOP = None
+
+
+def _pool_init(seed_base: int, cwd: str):
+    # Die with the parent. A worker whose parent is SIGKILLed (a run
+    # `timeout`, the watchdog) is otherwise re-parented to init and sits
+    # idle holding a copy of the corpus: five such orphans from one gcc
+    # run were found 3.3 hours later on 2026-09-18. PR_SET_PDEATHSIG is
+    # Linux-only; anywhere else the explicit terminate in run() is all
+    # there is.
+    try:
+        import ctypes, signal as _signal
+        ctypes.CDLL("libc.so.6", use_errno=True).prctl(1, _signal.SIGKILL, 0, 0, 0)  # PR_SET_PDEATHSIG
+    except Exception:
+        pass
+    # Every fork starts with the parent's RNG state; without this each
+    # worker would draw the same strategy chains and splice points.
+    random.seed(seed_base ^ os.getpid())
+    # Drivers resolve project paths relative to the repo root (the thread
+    # workspace only symlinks `projects`/`output` into itself), and the
+    # parent's workspace directory is deleted on rotation.
+    try:
+        os.chdir(cwd)
+    except OSError:
+        pass
+
+
+def _pool_iteration(a_idx: int, b_idx: int):
+    loop = _WORKER_LOOP
+    a, b = loop.corpus[a_idx], loop.corpus[b_idx]
+    children, _chain, _parents = loop._fuse_pair_chain(a, b)
+    pairs = []
+    if not children:
+        pairs.append((None, None))
+    for child in children:
+        try:
+            result = loop.driver.execute(child)
+            pairs.append((child, result))
+        except Exception as e:
+            logger.error(f"Execution driver error: {e}")
+            pairs.append((None, None))
+    # The degradation log this worker wrote to is its own copy; ship the
+    # delta so the parent's end-of-run table stays complete.
+    return pairs, degradations.take()
+
 
 class FusionFuzzLoop:
     def __init__(self, config, strategies, initial_corpus, pre_analysis_enabled=True,
@@ -155,6 +209,20 @@ class FusionFuzzLoop:
         if loaded_count > 0:
             logger.info(f"Loaded {loaded_count} existing crash signatures from disk.")
 
+    _SIG_LINE_RE = re.compile(r"\*\*Signature:\*\*\s*`(.+?)`(?=\s*&nbsp;|\s*$)", re.M)
+
+    @classmethod
+    def _bundle_signature(cls, crash_dir):
+        """Signature stored in an existing bundle's README, or None if the
+        bundle does not exist. Same pattern as _load_existing_crashes."""
+        readme = os.path.join(crash_dir, "README.md")
+        try:
+            with open(readme, "r", encoding="utf-8", errors="ignore") as f:
+                m = cls._SIG_LINE_RE.search(f.read(1024))
+        except OSError:
+            return None
+        return m.group(1).strip() if m else ""
+
     @staticmethod
     def _format_duration(seconds) -> str:
         """`3600` -> `1:00:00`. Used in the --time log lines and status bar."""
@@ -214,7 +282,13 @@ class FusionFuzzLoop:
         supports that.
         """
         parent_a, parent_b = self.select_parents()
+        return self._fuse_pair_chain(parent_a, parent_b)
 
+    def _fuse_pair_chain(self, parent_a, parent_b) -> Tuple[List[Seed], List, Tuple[Optional[Seed], Optional[Seed]]]:
+        """The fusion half of _fuse_once for an already-selected pair:
+        viability, strategy chain, children. Split out so a worker
+        *process* (--process-pool) can run it on a pair the parent chose,
+        keeping pair coverage in one place."""
         if not parent_a or not parent_b:
             return [], [], (parent_a, parent_b)
 
@@ -641,15 +715,23 @@ class FusionFuzzLoop:
           parent_b.<ext> — parent B program (if available)
           README.md      — human-readable bug report
         """
-        # 1. Sanitize signature for folder name
+        # 1. Sanitize signature for folder name (stripped first: the dedupe
+        #    set and the README loader both work on the stripped key, and a
+        #    trailing space would otherwise yield a second "..._" directory)
+        signature = signature.strip()
         safe_sig = re.sub(r'[^a-zA-Z0-9_\-\.]', '_', signature)
-        if len(safe_sig) > 300:
+        # 200, not 300: NAME_MAX is 255 bytes on ext4/overlay, so a
+        # sanitised signature between 256 and 300 characters failed with
+        # "File name too long" and the finding was never saved — 76 run
+        # logs carried that error, four crash families re-hitting it on
+        # every run (clang's CGF.CurFuncDecl assertion 23 times).
+        if len(safe_sig) > 200:
             # Truncating alone can make two distinct signatures collide on the
             # same folder name (their differing suffix falls past the cut),
             # silently overwriting one crash's saved bundle with another's.
             # Append a short hash of the full signature to keep them distinct.
             sig_hash = hashlib.sha1(signature.encode("utf-8", errors="ignore")).hexdigest()[:8]
-            safe_sig = f"{safe_sig[:291]}_{sig_hash}"
+            safe_sig = f"{safe_sig[:191]}_{sig_hash}"
 
         # Use the sanitized signature as the folder name — no seed-ID suffix.
         # The signature is already unique per distinct crash; appending the ID
@@ -660,6 +742,23 @@ class FusionFuzzLoop:
         else:
             crash_dir = os.path.join(self.original_cwd, "output", "bugs", self.project_name, folder_name)
 
+        # Distinct signatures can sanitise to the same folder name — every
+        # character outside [A-Za-z0-9_.-] becomes "_", so lfortran's
+        # `scope.find(name) == scope.end()` and `... != scope.end()` map to
+        # one directory, and each hit rewrote the other's bundle (including
+        # a min.f90 reduced days earlier). Keep whatever is there: a bundle
+        # whose README carries a *different* signature gets this one saved
+        # beside it under a hash-suffixed name; one carrying the *same*
+        # signature is a re-hit that slipped past the in-memory set, and is
+        # left untouched rather than overwritten.
+        existing_sig = self._bundle_signature(crash_dir)
+        if existing_sig is not None and existing_sig != signature.strip():
+            sig_hash = hashlib.sha1(signature.encode("utf-8", errors="ignore")).hexdigest()[:8]
+            crash_dir = f"{crash_dir}_{sig_hash}"
+            existing_sig = self._bundle_signature(crash_dir)
+        if existing_sig is not None:
+            logger.info(f"Re-hit of saved bundle {os.path.basename(crash_dir)}; not overwriting")
+            return
         if not os.path.exists(crash_dir):
             os.makedirs(crash_dir, exist_ok=True)
 
@@ -1069,7 +1168,11 @@ class FusionFuzzLoop:
             signature = self._extract_crash_signature(result)
 
             if signature:
-                signature = signature.replace('`', "'")   # backticks break the README key format
+                # Backticks break the README key format; the loader strips
+                # the stored key, so strip here too — a signature ending in
+                # a space (rust's truncated MIR dumps) otherwise never
+                # matches its own README and re-bundles on every hit.
+                signature = signature.replace('`', "'").strip()
                 if signature not in self.unique_crashes:
                     self.unique_crashes.add(signature)
                     sys.stdout.write("\n")
@@ -1262,7 +1365,7 @@ class FusionFuzzLoop:
         )
         return new_crashes
 
-    def run(self, max_iterations, sample_log=None, max_seconds=None):
+    def run(self, max_iterations, sample_log=None, max_seconds=None, process_pool=False):
         logger.info(f"Starting FFL for {self.project_name} with parallel execution...")
         # --time: wall-clock budget. Enforced at task-submission time, so
         # iterations already in flight when the budget runs out are allowed
@@ -1289,9 +1392,13 @@ class FusionFuzzLoop:
         self.current_workspace = self._setup_workspace()
         os.chdir(self.current_workspace)
 
-        # 2. Setup ThreadPool
+        # 2. Setup the worker pool: threads by default, processes on request
         max_workers = self.config.get("execution", {}).get("concurrency", 4)
-        logger.info(f"ThreadPoolExecutor initialized with {max_workers} workers.")
+        if process_pool:
+            logger.info(f"ProcessPoolExecutor (fork) with {max_workers} worker processes: "
+                        "fusion runs outside the parent's GIL.")
+        else:
+            logger.info(f"ThreadPoolExecutor initialized with {max_workers} workers.")
         
         logger.info("Parent selection: random unfused pair (uniform among "
                     "pairs not yet covered)")
@@ -1310,7 +1417,18 @@ class FusionFuzzLoop:
         active_futures = set()
         rotate_pending = False
         
-        executor = ThreadPoolExecutor(max_workers=max_workers)
+        if process_pool:
+            global _WORKER_LOOP
+            _WORKER_LOOP = self                       # inherited by every fork
+            import multiprocessing
+            executor = ProcessPoolExecutor(
+                max_workers=max_workers,
+                mp_context=multiprocessing.get_context("fork"),
+                initializer=_pool_init,
+                initargs=(random.randrange(1 << 30), self.original_cwd))
+            seed_index = {seed.id: i for i, seed in enumerate(self.corpus)}
+        else:
+            executor = ThreadPoolExecutor(max_workers=max_workers)
 
         try:
             # Helper to check if we should continue submitting tasks
@@ -1328,7 +1446,13 @@ class FusionFuzzLoop:
                 # REPLENISH PHASE
                 # Submit tasks only if not rotating
                 while len(active_futures) < max_workers and should_submit() and not rotate_pending:
-                    f = executor.submit(self.process_iteration)
+                    if process_pool:
+                        a, b = self.select_parents()
+                        if not a or not b:
+                            break
+                        f = executor.submit(_pool_iteration, seed_index[a.id], seed_index[b.id])
+                    else:
+                        f = executor.submit(self.process_iteration)
                     active_futures.add(f)
                     submitted_count += 1
                 
@@ -1385,6 +1509,9 @@ class FusionFuzzLoop:
                                     gc.collect()
 
                                 pairs = future.result()
+                                if process_pool:
+                                    pairs, (d_counts, d_details) = pairs
+                                    degradations.merge(d_counts, d_details)
 
                                 for child, result in pairs:
                                     if not child or not result:
@@ -1436,7 +1563,20 @@ class FusionFuzzLoop:
             logger.info(f"Fuzzing interrupted by user. Stopping after {self.iterations} iterations.")
         finally:
             logger.info("Shutting down executor...")
-            executor.shutdown(wait=False)
+            if process_pool:
+                # shutdown() drops its process table, so take the workers
+                # first; it does not kill workers that are mid-subprocess,
+                # and nobody will read a compile that finishes after this.
+                workers = list((getattr(executor, "_processes", None) or {}).values())
+                executor.shutdown(wait=False, cancel_futures=True)
+                for proc in workers:
+                    try:
+                        proc.kill()
+                    except Exception:
+                        pass
+                self._cleanup_stale_processes()
+            else:
+                executor.shutdown(wait=False)
             if self._sample_log_file:
                 try:
                     self._sample_log_file.close()

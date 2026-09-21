@@ -13,6 +13,14 @@ import re
 
 logger = logging.getLogger("FFL.Driver")
 
+
+_SOURCE_ECHO_RE = re.compile(r"^[ \t]*\d+[ \t]*\|.*$", re.M)
+
+
+def _drop_source_echo(text):
+    """`text` without the "<line> | <source>" snippet lines diagnostics print."""
+    return _SOURCE_ECHO_RE.sub("", text or "")
+
 class ExecutionResult:
     def __init__(self, return_code, stdout, stderr, time, crashed, signature=None):
         self.return_code = return_code
@@ -128,8 +136,16 @@ class BaseDriver:
         if re.search(r"Sanitizer failed to allocate .*errno: 12", stderr or "") or \
            re.search(r"Sanitizer failed to allocate .*errno: 12", stdout or ""):
             return False
+        # A diagnostic's source snippet ("  686 | // CHECK: LLVM ERROR: ...")
+        # echoes the program, and a fused program can carry any crash
+        # pattern in a comment or string (lit CHECK lines do). Match on the
+        # compiler's own lines only: drop the gutter-prefixed echo lines
+        # first (clang, gcc, flang and rustc all print "<n> | <source>").
+        # One clang bundle was saved that way on 2026-09-19 (rc 1, no
+        # crash); no real crash line starts with a line-number gutter.
+        text = _drop_source_echo(stdout) + "\n" + _drop_source_echo(stderr)
         for pattern in self.config.get('analysis', {}).get('crash_patterns', []):
-            if pattern in stdout or pattern in stderr:
+            if pattern in text:
                 return True
         return False
 

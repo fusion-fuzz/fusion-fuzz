@@ -68,6 +68,32 @@ class DegradationLog:
             self._counts.clear()
             self._details.clear()
 
+    def take(self):
+        """(counts, details) recorded so far, and start again from zero.
+        A --process-pool worker calls this after each iteration and ships
+        the delta back with its results, because its copy of this log
+        lives in the forked process and the parent's report would
+        otherwise never see it."""
+        with self._lock:
+            counts = dict(self._counts)
+            details = {k: dict(v) for k, v in self._details.items()}
+            self._counts.clear()
+            self._details.clear()
+        return counts, details
+
+    def merge(self, counts, details) -> None:
+        """Fold a worker's delta (from take()) into this log."""
+        with self._lock:
+            for category, n in counts.items():
+                self._counts[category] += n
+            for category, dets in details.items():
+                bucket = self._details.setdefault(category, Counter())
+                for detail, dn in dets.items():
+                    if detail in bucket or len(bucket) < _MAX_DETAILS_PER_CATEGORY:
+                        bucket[detail] += dn
+                    else:
+                        bucket["(other)"] += dn
+
     def report(self, total_iterations: int = 0, log=logger) -> None:
         """Print what degraded, loudest first. Silent when nothing did."""
         with self._lock:

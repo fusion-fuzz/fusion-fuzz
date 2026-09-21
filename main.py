@@ -127,6 +127,12 @@ if __name__ == "__main__":
                              "measured payoff. Parent selection is now always a uniformly random "
                              "pair among those not yet fused.")
     parser.add_argument("--concurrency", type=int, default=None, help="Override the number of threads for execution (default is from config.yaml)")
+    parser.add_argument("--worker-model", choices=["threads", "processes"], default=None,
+                        help="Force the worker model for this run, overriding execution.worker_model "
+                             "in config.yaml (measurements need to compare the two on equal terms).")
+    parser.add_argument("--process-pool", action="store_true",
+                        help="Run fusion+execution in forked worker processes instead of threads, so "
+                             "fusion (pure Python) does not serialise on the parent's GIL. Experimental.")
     parser.add_argument("--reduce", type=str, default=None, metavar="BUG_DIR",
                         help="Minimize a crash reproducer (test.<ext>) to min.<ext> using delta "
                              "debugging, then update the bug report. "
@@ -746,7 +752,18 @@ if __name__ == "__main__":
             )
 
     sample_log = args.sample_log.replace("{project}", args.project) if args.sample_log else None
-    fuzzer.run(max_iterations=args.iterations, sample_log=sample_log, max_seconds=args.time)
+    # Worker model: --process-pool on the command line, or
+    # execution.worker_model: processes in the project's config.yaml, so a
+    # project measured to be GIL-bound can opt in without a flag.
+    worker_model = str(config.get("execution", {}).get("worker_model", "threads")).lower()
+    if args.worker_model:
+        worker_model = args.worker_model
+        logger.info(f"--worker-model {worker_model} overrides the config")
+    use_pool = args.process_pool or worker_model == "processes"
+    if use_pool and not args.process_pool:
+        logger.info("execution.worker_model: processes — fusion+execution in forked worker processes")
+    fuzzer.run(max_iterations=args.iterations, sample_log=sample_log, max_seconds=args.time,
+               process_pool=use_pool)
 
     # === GCOV COVERAGE COLLECTION ===
     if args.gcov:

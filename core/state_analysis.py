@@ -284,69 +284,137 @@ _LEXICON = {
 }
 
 
+_LEX_SCANNERS: Dict[str, tuple] = {}
+
+
+def _lex_scanner(language: str):
+    """(lexicon, compiled alternation of every token start) per language,
+    built once. Alternation order is the order the per-character loop
+    tested candidates at a position: block-comment starts, then
+    line-comment starts, then quotes longest-first."""
+    key = LANGUAGE_ALIASES.get(language, language)
+    hit = _LEX_SCANNERS.get(key)
+    if hit is None:
+        lex = _LEXICON.get(key, _LEXICON["clang"])
+        quotes = sorted(lex["quotes"], key=len, reverse=True)
+        starts = [b for b, _ in lex["block"]] + list(lex["line"]) + quotes
+        rx = re.compile("|".join(re.escape(t) for t in starts)) if starts else None
+        hit = _LEX_SCANNERS[key] = (lex, rx)
+    return hit
+
+
+def _masked_text(content: str, language: str) -> str:
+    """`content` with every character inside a string or comment replaced
+    by a space — exactly `c if mask[i] else " "` for the mask
+    _lexical_mask would return, built from the scanner's spans with slices
+    rather than one character at a time. Five call sites used to rebuild
+    this per line with a generator, which added a whole-file Python pass
+    to every segment-boundary computation."""
+    lex, rx = _lex_scanner(language)
+    n = len(content)
+    if rx is None:
+        return content
+    block_end = dict(lex["block"])
+    line_starts = lex["line"]
+    parts = []
+    keep_from = 0
+    pos = 0
+    while True:
+        m = rx.search(content, pos)
+        if m is None:
+            break
+        i = m.start()
+        tok = m.group(0)
+        end_tok = block_end.get(tok)
+        if end_tok is not None:
+            j = content.find(end_tok, i + len(tok))
+            j = n if j == -1 else j + len(end_tok)
+        elif tok in line_starts:
+            j = content.find("\n", i)
+            j = n if j == -1 else j
+        else:
+            j = i + len(tok)
+            while j < n:
+                if content[j] == "\\":
+                    j += 2
+                    continue
+                if content.startswith(tok, j):
+                    j += len(tok)
+                    break
+                j += 1
+            else:
+                j = n
+            j = min(j, n)
+        if j > i:
+            parts.append(content[keep_from:i])
+            parts.append(" " * (j - i))
+            keep_from = j
+        pos = j if j > i else i + 1
+    parts.append(content[keep_from:])
+    return "".join(parts)
+
+
 def _lexical_mask(content: str, language: str) -> List[bool]:
     """bool per character: True where content[i] is real code (outside
     strings/comments). Same purpose as the ad hoc `is_real` masks already
     used by individual fusion strategies (e.g. RustLexMixin), generalized
     across languages via a small per-language token table instead of a
-    bespoke scanner per strategy."""
-    lex = _LEXICON.get(LANGUAGE_ALIASES.get(language, language), _LEXICON["clang"])
+    bespoke scanner per strategy.
+
+    The scanner jumps from one candidate token start to the next with one
+    compiled regex and blanks each span with a slice assignment. The
+    previous version advanced one character at a time in Python, testing
+    every token with startswith at every position: 15 million startswith
+    calls per 300 clang fusions, the single largest item in the
+    fusion-side profile, and it runs under the GIL in every worker
+    thread. Output is identical (2,700 real seeds across 17 corpora)."""
+    lex, rx = _lex_scanner(language)
     n = len(content)
     mask = [True] * n
-    i = 0
-    quotes = sorted(lex["quotes"], key=len, reverse=True)
-    while i < n:
-        matched = False
-        for start_tok, end_tok in lex["block"]:
-            if content.startswith(start_tok, i):
-                j = content.find(end_tok, i + len(start_tok))
-                j = n if j == -1 else j + len(end_tok)
-                for k in range(i, j):
-                    mask[k] = False
-                i = j
-                matched = True
-                break
-        if matched:
-            continue
-        for tok in lex["line"]:
-            if content.startswith(tok, i):
-                j = content.find("\n", i)
-                j = n if j == -1 else j
-                for k in range(i, j):
-                    mask[k] = False
-                i = j
-                matched = True
-                break
-        if matched:
-            continue
-        for q in quotes:
-            if content.startswith(q, i):
-                j = i + len(q)
-                while j < n:
-                    if content[j] == "\\":
-                        j += 2
-                        continue
-                    if content.startswith(q, j):
-                        j += len(q)
-                        break
-                    j += 1
-                else:
-                    j = n
-                for k in range(i, min(j, n)):
-                    mask[k] = False
-                i = j
-                matched = True
-                break
-        if matched:
-            continue
-        i += 1
+    if rx is None:
+        return mask
+    block_end = dict(lex["block"])
+    line_starts = lex["line"]
+    pos = 0
+    while True:
+        m = rx.search(content, pos)
+        if m is None:
+            break
+        i = m.start()
+        tok = m.group(0)
+        end_tok = block_end.get(tok)
+        if end_tok is not None:
+            j = content.find(end_tok, i + len(tok))
+            j = n if j == -1 else j + len(end_tok)
+        elif tok in line_starts:
+            j = content.find("\n", i)
+            j = n if j == -1 else j
+        else:                                   # a quote
+            j = i + len(tok)
+            while j < n:
+                if content[j] == "\\":
+                    j += 2
+                    continue
+                if content.startswith(tok, j):
+                    j += len(tok)
+                    break
+                j += 1
+            else:
+                j = n
+            j = min(j, n)
+        if j > i:
+            mask[i:j] = [False] * (j - i)
+        pos = j if j > i else i + 1
     return mask
+
+
+_BRACKET_RE = re.compile(r"[()\[\]{}]")
+_BRACE_RE = re.compile(r"[{}]")
 
 
 def _paren_depth_prefix(content: str, mask: List[bool]) -> List[int]:
     """Running paren/bracket/brace depth after each prefix of `content` —
     prefix[i] is the depth after content[:i]. Built once in O(n).
-
     Both callers (find_state_points's _is_safe, and
     truncate_to_balanced) probe the depth at O(n) increasing offsets while
     walking a file line by line. The previous approach called a
@@ -356,22 +424,28 @@ def _paren_depth_prefix(content: str, mask: List[bool]) -> List[int]:
     seeds but a multi-minute stall (and, since this runs inside a
     ThreadPoolExecutor worker holding the GIL, a full stall of every
     worker thread) on the corpus's larger outliers. Precomputing the
-    prefix once turns every probe into an O(1) lookup."""
+    prefix once turns every probe into an O(1) lookup.
+
+    The depth only changes at a bracket, so the prefix is filled in runs
+    between the brackets a regex finds, rather than one character at a
+    time in Python (identical output on 1,200 real seeds)."""
     n = len(content)
     prefix = [0] * (n + 1)
     depth = 0
-    for i in range(n):
-        if mask[i] and content[i] in "([{":
-            depth += 1
-        elif mask[i] and content[i] in ")]}":
-            depth -= 1
+    last = 0
+    for m in _BRACKET_RE.finditer(content):
+        i = m.start()
+        if not mask[i]:
+            continue
+        if i > last:
+            prefix[last + 1:i + 1] = [depth] * (i - last)
+        depth += 1 if content[i] in "([{" else -1
         prefix[i + 1] = depth
+        last = i + 1
+    if n > last:
+        prefix[last + 1:n + 1] = [depth] * (n - last)
     return prefix
 
-
-# ---------------------------------------------------------------------------
-# State point discovery
-# ---------------------------------------------------------------------------
 
 _LIVE_CATEGORY_RE = re.compile(r"^live(\d+)$")
 
@@ -472,6 +546,7 @@ def _count_live_brace(lines: List[str], line_starts: List[int], mask: List[bool]
 
     stack: List[set] = [set()]
     counts = []
+    mask_len = len(mask)
     for idx, line in enumerate(lines):
         start = line_starts[idx]
 
@@ -489,12 +564,13 @@ def _count_live_brace(lines: List[str], line_starts: List[int], mask: List[bool]
 
         counts.append(sum(len(f) for f in stack))
 
-        for k, ch in enumerate(line):
-            abs_k = start + k
-            if abs_k < len(mask) and mask[abs_k]:
-                if ch == '{':
+        # Only the braces matter, so only the braces are visited.
+        for m in _BRACE_RE.finditer(line):
+            abs_k = start + m.start()
+            if abs_k < mask_len and mask[abs_k]:
+                if m.group(0) == '{':
                     stack.append(set())
-                elif ch == '}' and len(stack) > 1:
+                elif len(stack) > 1:
                     stack.pop()
 
     return counts
@@ -825,14 +901,15 @@ _JULIA_CONTINUATION_RE = re.compile(
     r'^\s*(?:else\b|elseif\b|catch\b|finally\b|end\b|\)|\]|\}|,|\.|\|>)')
 
 
-def _julia_line_state(lines, mask, offsets):
+def _julia_line_state(lines, mask, offsets, masked=None):
     """(depth_after_line, unsafe) per line for Julia's `end` blocks."""
     depths, unsafe = [], []
     depth = 0
     for i, line in enumerate(lines):
         off = offsets[i]
-        code = "".join(c if (off + k < len(mask) and mask[off + k]) else " "
-                       for k, c in enumerate(line))
+        code = (masked[off:off + len(line)] if masked is not None else
+                "".join(c if (off + k < len(mask) and mask[off + k]) else " "
+                        for k, c in enumerate(line)))
         if not _JULIA_ONELINE_RE.match(code):
             depth += len(_JULIA_OPENER_RE.findall(code))
             # A trailing `begin` always opens a block, whatever precedes
@@ -861,7 +938,7 @@ _RUBY_CONTINUATION_RE = re.compile(
     r'^\s*(?:\.|&\.|&&|\|\||\)|\]|\}|(?:elsif|else|when|in|rescue|ensure|end|then|and|or)\b)')
 
 
-def _ruby_line_state(lines, mask, offsets):
+def _ruby_line_state(lines, mask, offsets, masked=None):
     """(depth_after_line, unsafe) per line: keyword block depth after the
     line, and whether the line sits inside a heredoc body."""
     depths, unsafe = [], []
@@ -869,8 +946,9 @@ def _ruby_line_state(lines, mask, offsets):
     heredoc_end = None
     for i, line in enumerate(lines):
         off = offsets[i]
-        code = "".join(c if (off + k < len(mask) and mask[off + k]) else " "
-                       for k, c in enumerate(line))
+        code = (masked[off:off + len(line)] if masked is not None else
+                "".join(c if (off + k < len(mask) and mask[off + k]) else " "
+                        for k, c in enumerate(line)))
         if heredoc_end is not None:
             unsafe.append(True)
             depths.append(depth)
@@ -931,8 +1009,11 @@ def _compute_segment_boundaries(content: str, language: str) -> List[int]:
     # line separates a header from its body ("parse error on input '='"
     # was 17% of Haskell's state-fusion failures).
     indentation_scoped = lang in ("cpython", "haskell")
-    rb_depths, rb_unsafe = _ruby_line_state(lines, mask, offsets) if lang == "ruby" else (None, None)
-    jl_depths, _jl_unsafe = _julia_line_state(lines, mask, offsets) if lang == "julia" else (None, None)
+    # One masked copy of the file for the languages whose per-line rules
+    # look at code outside strings and comments; sliced per line below.
+    masked = _masked_text(content, language) if lang in ("ruby", "julia", "r") else None
+    rb_depths, rb_unsafe = _ruby_line_state(lines, mask, offsets, masked) if lang == "ruby" else (None, None)
+    jl_depths, _jl_unsafe = _julia_line_state(lines, mask, offsets, masked) if lang == "julia" else (None, None)
 
     def _next_nonblank(i):
         for j in range(i + 1, len(lines)):
@@ -1010,8 +1091,7 @@ def _compute_segment_boundaries(content: str, language: str) -> List[int]:
         # "unexpected 'else'". The generic continuation rule below
         # catches `else`; this catches the operator case.
         if lang == "r":
-            code_part = "".join(c if (offsets[i] + k < len(mask) and mask[offsets[i] + k]) else " "
-                                for k, c in enumerate(line))
+            code_part = masked[offsets[i]:offsets[i] + len(line)]
             if _R_TRAILING_CONT_RE.search(code_part):
                 continue
             if nxt is not None and _R_CONTINUATION_RE.match(nxt):
@@ -1022,8 +1102,7 @@ def _compute_segment_boundaries(content: str, language: str) -> List[int]:
         if lang == "julia":
             if jl_depths[i] != 0:
                 continue
-            code_part = "".join(c if (offsets[i] + k < len(mask) and mask[offsets[i] + k]) else " "
-                                for k, c in enumerate(line))
+            code_part = masked[offsets[i]:offsets[i] + len(line)]
             if _JULIA_TRAILING_CONT_RE.search(code_part):
                 continue
             if nxt is not None and _JULIA_CONTINUATION_RE.match(nxt):
@@ -1034,8 +1113,7 @@ def _compute_segment_boundaries(content: str, language: str) -> List[int]:
         if lang == "ruby":
             if rb_depths[i] != 0 or rb_unsafe[i]:
                 continue
-            code_part = "".join(c if (offsets[i] + k < len(mask) and mask[offsets[i] + k]) else " "
-                                for k, c in enumerate(line))
+            code_part = masked[offsets[i]:offsets[i] + len(line)]
             if _RUBY_TRAILING_CONT_RE.search(code_part):
                 continue
             if nxt is not None and _RUBY_CONTINUATION_RE.match(nxt):
