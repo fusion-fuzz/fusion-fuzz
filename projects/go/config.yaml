@@ -16,9 +16,15 @@ execution:
   # continuous run it reclaims nothing for the first five days while every
   # distinct fused program keeps adding entries. projects/go/driver.py
   # enforces this cap instead, evicting oldest-used-first the way cmd/go
-  # does. Set to 0 to disable. The floor is roughly 400 MB: the thirteen
-  # target standard libraries are ~30 MB each and are worth keeping resident.
-  cache_limit_mb: 3072
+  # does. Set to 0 to disable. The cap must hold the whole standard-library
+  # working set plus one run's churn: the set is thirteen targets times
+  # eight GOEXPERIMENT states at 15-50 MB each (2-4 GB, measured 2026-09-18),
+  # and a 15-minute run adds ~1 GB of per-program entries on top. At 3072
+  # the trim at every start evicted 0.8-1.7 GB — mostly stdlib, whose
+  # mtime cmd/go only refreshes hourly — and the run then rebuilt targets
+  # cold (12 s each vs 2-3 s warm) at 0-1 tests/s for its first minutes;
+  # finals fell to 1-8 tests/s from 14.
+  cache_limit_mb: 8192
   # Executions between cache size checks. Each check walks the cache's 256
   # shard directories, so it should be rare relative to execution but
   # frequent relative to how fast the cache grows by its headroom.

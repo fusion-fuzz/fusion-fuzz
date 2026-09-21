@@ -6,6 +6,12 @@ execution:
   command: "gcc -fsyntax-only {seed_path}"
   timeout: 20          # -O3/-fanalyzer on a fused TU is slower than clang
   concurrency: 16
+  # Worker model: fusion is pure Python and, with 16+ worker threads,
+  # serialises on the GIL (clang: 78-92 tests/s at any thread count with
+  # the box 15-18% busy). Forked worker processes measured 2.95x on an
+  # idle host and 3.3x (clang) and +23% (gcc) in the three-project rotation, at
+  # ~3.6 GB of extra memory. 2026-09-15.
+  worker_model: processes
   # Address-space cap per compile, enforced with `ulimit -v` in the driver.
   # A fused program can send GCC into runaway template instantiation; without
   # this the host OOM killer fires and can take the orchestrator with it.

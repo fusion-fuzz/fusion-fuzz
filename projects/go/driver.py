@@ -310,10 +310,18 @@ class GoDriver(BaseDriver):
         verdict = classify((stderr or "") + "\n" + (stdout or ""))
         res = ExecutionResult(rc, stdout, stderr, time.time() - start,
                               verdict["is_bug"], verdict["signature"])
-        res.command = cmd
-        # _save_crash_bundle rewrites this exact path to "$SCRIPT_DIR/test.go"
-        # when it writes test.sh; without it the fallback substitutes the
-        # bare seed id and the saved reproducer is unrunnable.
+        # The command builds package "." — the workdir, which held exactly
+        # go.mod and main.go. A bundle holds neither: it has test.go beside
+        # min.go and parent_*.go (one package, duplicate declarations) and
+        # no module, so `go build .` there reported "go.mod file not found"
+        # and no go bundle reproduced as saved (found 2026-09-19). Record a
+        # command that rebuilds the workdir: a scratch module with the seed
+        # copied in as main.go. _save_crash_bundle rewrites the seed path
+        # below to "$SCRIPT_DIR/test.go".
+        res.command = (
+            'W=$(mktemp -d) && printf \'module fflfuzz\\n\\ngo %s\\n\' > "$W/go.mod" && '
+            'cp "%s" "$W/main.go" && cd "$W" && %s; rc=$?; rm -rf "$W"; exit $rc'
+            % (self._go_lang, seed_file, cmd))
         res.seed_file = seed_file
         # Every distinct fused program leaves new entries in the shared build
         # cache. Nothing else ever removes them; see _trim_cache.

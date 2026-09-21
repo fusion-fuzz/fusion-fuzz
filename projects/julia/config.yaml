@@ -10,7 +10,12 @@ execution:
   # seconds in the compiler, so this is well above the other executing
   # targets' timeout.
   timeout: 60
-  concurrency: 8
+  # 12, not 8 or 16: on this 16-core host a Julia test is one CPU-bound
+  # process (1.0 s user per 1.2 s wall, 316 MB), so 8 left half the box
+  # idle; 16 gave +30% throughput but six points of validity to timeouts
+  # under contention. 12 measured +20% (2.0 -> 2.4 tests/s) with validity
+  # unchanged (74.3 -> 75.4%), 2026-09-15.
+  concurrency: 12
   mem_limit_mb: 4096
 
 analysis:

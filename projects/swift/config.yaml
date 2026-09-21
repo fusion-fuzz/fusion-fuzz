@@ -4,8 +4,11 @@ execution:
   # This is informational for the driver, SwiftDriver handles the actual docker exec
   command: "docker exec ffl-swift swift {seed_path}"
   timeout: 10
-  concurrency: 64
-
+  # 16, not 64: thread-count scan on an idle host, 60 s each, 2026-09-17 —
+  # 16: 74.4 tests/s (88% CPU), 24: 61.9, 32: 70.7, 64: 76.8 (96% CPU).
+  # Flat beyond 16; the extra 48 threads only oversubscribed the box for
+  # the two projects sharing it in the rotation.
+  concurrency: 16
 analysis:
   crash_patterns:
     - "Please submit a bug report"

@@ -54,7 +54,7 @@ import random
 import shutil
 import time
 
-from core.driver import BaseDriver, ExecutionResult
+from core.driver import _drop_source_echo, BaseDriver, ExecutionResult
 
 # core/driver.py's get_driver loads this file by path, so there is no
 # parent package for a relative import to resolve against.
@@ -314,7 +314,9 @@ class RustDriver(BaseDriver):
     # ── crash oracle ──────────────────────────────────────────────────
 
     def _check_crash(self, stdout, stderr, return_code):
-        return classify((stderr or "") + "\n" + (stdout or ""))["is_bug"]
+        # rustc echoes the program in "<n> | <source>" snippet lines; a fused
+        # program can carry any crash pattern in a comment (see core/driver).
+        return classify(_drop_source_echo((stderr or "") + "\n" + (stdout or "")))["is_bug"]
 
     def extract_crash_signature(self, stdout, stderr, return_code):
         sig = classify((stderr or "") + "\n" + (stdout or ""))["signature"]

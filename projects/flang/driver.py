@@ -492,11 +492,23 @@ class FlangDriver(BaseDriver):
     _ISEL_LOC_RE = re.compile(r",?\s*[\w./-]+\.[fF](?:90|95)?:\d+:\d+")
     _ISEL_METADATA_RE = re.compile(r",?\s*![\w.]+\s*!\d+")
 
+    #: "SemanticsContext::FindScope(): invalid source location for 'print
+    #: *, ctx%protocol_version'" — the quoted text is the statement whose
+    #: location was lost, verbatim from the test case, so every program
+    #: reaching this CHECK arrived under its own signature: 21 of flang's
+    #: 45 bundles on 2026-09-20 were this one message with 21 different
+    #: statements. The statement *kind* (print, open, nullify, inquire,
+    #: write) may still separate distinct paths into the CHECK; the rest
+    #: of the text does not.
+    _FINDSCOPE_STMT_RE = re.compile(
+        r"(invalid source location for ')([A-Za-z_]\w*)[^\n]*")
+
     @classmethod
     def _normalise_symbol(cls, detail: str) -> str:
         # Layout first: it sits between the name and the colon the name
         # match looks ahead for, so stripping it last leaves the name.
         detail = cls._SYMBOL_LAYOUT_RE.sub("", detail)
+        detail = cls._FINDSCOPE_STMT_RE.sub(r"\1\2 ...'", detail)
         return cls._SYMBOL_NAME_RE.sub(r"\1", detail)
 
     @classmethod

@@ -24,6 +24,20 @@ LFORTRAN_BIN = os.path.join(INSTALL_PREFIX, "bin", "lfortran")
 DEFAULT_SANITIZERS = "address,undefined"
 
 
+#: Link the executable at a fixed address. As a PIE, the Debug+ASan lfortran
+#: is a 2.1 GB binary with 782 MB of .data and 30.2 million R_X86_64_RELATIVE
+#: relocations (every instrumented global carries pointers into its redzone
+#: metadata), and ld.so applies all of them on every exec: the whole .data
+#: is copied per process (270k minor faults, 0.7 s of kernel time before the
+#: seed is even read, 1.7 GB private RSS, 16 workers = 12 GB). Linked
+#: -no-pie the relocations are resolved at link time, .data stays a shared
+#: file mapping, and the same seeds ran 2.5x faster (measured 2026-09-18:
+#: 150 seeds x 7 flag sets, 255 s -> 100 s, outputs identical). The
+#: compile flags are untouched, so the compiled code and the runtime
+#: library are the same; only the executable's link changes.
+NO_PIE = "-no-pie"
+
+
 def _can_sanitize(cc):
     """Whether this compiler can actually build sanitized code.
 
@@ -83,10 +97,10 @@ def _sanitizer_cmake_opts():
     if not (cc and cxx):
         print("  (no compiler here can build sanitized code: "
               "building without sanitizers)")
-        return []
+        return [f"-DCMAKE_EXE_LINKER_FLAGS={NO_PIE}"]
     return [f"-DCMAKE_C_FLAGS={flags}",
             f"-DCMAKE_CXX_FLAGS={flags}",
-            f"-DCMAKE_EXE_LINKER_FLAGS=-fsanitize={value}",
+            f"-DCMAKE_EXE_LINKER_FLAGS=-fsanitize={value} {NO_PIE}",
             f"-DCMAKE_C_COMPILER={cc}",
             f"-DCMAKE_CXX_COMPILER={cxx}"]
 

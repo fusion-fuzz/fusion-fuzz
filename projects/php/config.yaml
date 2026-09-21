@@ -5,8 +5,10 @@ execution:
   # The command run inside docker. {seed_path} is replaced by the driver.
   command: "php will use its driver. see projects/php/driver.py"
   timeout: 10
-  concurrency: 44
-
+  # 24, not 44: thread-count scan on an idle host, 60 s each, 2026-09-17 —
+  # 16: 51.9 tests/s, 24: 57.7 (81% CPU), 32: 53.8, 44: 54.1 (83% CPU).
+  # Flat beyond 24; the extra 20 threads only cost its batch partners.
+  concurrency: 24
 analysis:
   crash_patterns:
     - "SUMMARY: AddressSanitizer"

@@ -5,7 +5,8 @@ execution:
   # sanitizer options, the assertion shim); this is BaseDriver's fallback.
   command: "projects/ruby/install/bin/ruby -I projects/ruby -rffl_shim {seed_path}"
   timeout: 20
-  concurrency: 16
+  # 8, not 16: scan 2026-09-18: 8 → 27.0 tests/s (51% CPU), 12 → 25.5 (76%), 16 → 24.7 (88%); peaks at 8.
+  concurrency: 8
   # Applied through ASan's hard_rss_limit_mb: an ASan-instrumented process
   # reserves a huge virtual address space up front, so `ulimit -v` would
   # stop it starting at all.

@@ -4,7 +4,7 @@ import re
 import random
 import shutil
 import time
-from core.driver import BaseDriver, ExecutionResult
+from core.driver import _drop_source_echo, BaseDriver, ExecutionResult
 
 
 class ClangDriver(BaseDriver):
@@ -275,7 +275,7 @@ class ClangDriver(BaseDriver):
         return super()._check_crash(stdout, stderr, return_code)
 
     def extract_crash_signature(self, stdout, stderr, return_code):
-        combined = stderr + stdout
+        combined = _drop_source_echo(stderr + stdout)
 
         m = re.search(r"SUMMARY: AddressSanitizer:\s+([^\n]+)", combined)
         if m:

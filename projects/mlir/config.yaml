@@ -5,6 +5,12 @@ execution:
   command: "/workspace/install/bin/mlir-opt {seed_path}"
   timeout: 10
   concurrency: 16
+  # Worker model: fusion is pure Python and, with 16+ worker threads,
+  # serialises on the GIL (clang: 78-92 tests/s at any thread count with
+  # the box 15-18% busy). Forked worker processes measured 2.95x on an
+  # idle host and 3.1x (30.1 -> 94.4 tests/s) in the three-project rotation, at
+  # ~3.6 GB of extra memory. 2026-09-15.
+  worker_model: processes
 
 analysis:
   # 58% of the injected (LLM-translated) MLIR bug corpus and 11% of the

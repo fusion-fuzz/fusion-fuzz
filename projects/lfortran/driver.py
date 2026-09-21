@@ -4,7 +4,7 @@ import re
 import random
 import shutil
 import time
-from core.driver import BaseDriver, ExecutionResult
+from core.driver import _drop_source_echo, BaseDriver, ExecutionResult
 
 
 class LfortranDriver(BaseDriver):
@@ -189,7 +189,7 @@ class LfortranDriver(BaseDriver):
     _NOT_IMPLEMENTED_RE = re.compile(r"not implemented", re.IGNORECASE)
 
     def _check_crash(self, stdout, stderr, return_code):
-        combined = (stderr or "") + (stdout or "")
+        combined = _drop_source_echo((stderr or "") + (stdout or ""))
         # A sanitizer finding is a real finding even if the same run also
         # hit an unimplemented feature, so check for those first.
         if ("SUMMARY: AddressSanitizer" in combined
@@ -197,6 +197,14 @@ class LfortranDriver(BaseDriver):
             return True
         if ("Internal Compiler Error" in combined
                 and self._NOT_IMPLEMENTED_RE.search(combined)):
+            return False
+        # The parser's catch-all for input its grammar rejects without a
+        # specific message: "syntax error: Internal Compiler Error: parser
+        # returned unknown error", rc 2. An ordinary parse failure with a
+        # misleading label, not a compiler defect (2026-09-19; it was also
+        # saved with an empty "ICE" signature, see extract_crash_signature).
+        if "parser returned unknown error" in combined and \
+                "SUMMARY:" not in combined and "runtime error:" not in combined:
             return False
         return super()._check_crash(stdout, stderr, return_code)
 
@@ -226,6 +234,10 @@ class LfortranDriver(BaseDriver):
             tail = combined[combined.find("Internal Compiler Error"):]
             m = re.search(r'\n(\w[\w:]*): (.+)', tail)
             detail = f": {m.group(1)}: {m.group(2).strip()}" if m else ""
+            if not detail:
+                # Same-line form: "Internal Compiler Error: <message>".
+                m = re.match(r'Internal Compiler Error:\s*([^\n\x1b]+)', tail)
+                detail = f": {m.group(1).strip()}" if m and m.group(1).strip() else ""
             # A quoted string or a number in the assertion text is the
             # input's symbol/size (`.find("deferred")`, `i32[3]`), not the
             # site: two bundles for one `cdf_new_dt_name` assertion.

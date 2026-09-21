@@ -6,7 +6,8 @@ execution:
   # BaseDriver's fallback.
   command: "projects/typescript/tsc-bin --noEmit {seed_path}"
   timeout: 20
-  concurrency: 16
+  # 8, not 16: scan 2026-09-18: 8 → 24.6 tests/s (66% CPU), 16 → 28.7 (85%): +17% for twice the threads; in the shared rotation 8.
+  concurrency: 8
   mem_limit_mb: 4096
 
 analysis:
