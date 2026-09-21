@@ -32,6 +32,7 @@ import argparse
 import os
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -64,8 +65,26 @@ def _too_generic(part):
     if any(g in low for g in _GENERIC):
         return True
     # A path from the run that produced the bundle: the temp directory is
-    # gone and the reduced file lives somewhere else.
-    return bool(re.search(r'/tmp/|\.fused/|/home/', part))
+    # gone and the reduced file lives somewhere else. A path into the
+    # target's own source tree (an ASan SUMMARY frame, a Rust panic site)
+    # is stable and is the best signal there is — see _trim_path.
+    return bool(re.search(r'/tmp/|\.fused/', part))
+
+
+_PATH_RE = re.compile(r'/(?:[\w.+-]+/)*[\w.+-]+')
+
+
+def _trim_path(part):
+    """Cut a stable absolute path down to its last three components so
+    the signal no longer depends on where the tree is mounted, while
+    staying a verbatim substring of the output (the cut starts at a
+    component boundary and keeps everything after it)."""
+    m = _PATH_RE.search(part)
+    if not m or not m.group(0).startswith("/home/"):
+        return part
+    comps = m.group(0).split("/")
+    tail = "/".join(comps[-3:])
+    return part[part.index(tail, m.start()):]
 
 
 def pick_signal(bundle):
@@ -82,6 +101,12 @@ def pick_signal(bundle):
     out_path = os.path.join(bundle, "test.out")
     saved = (open(out_path, encoding="utf-8", errors="replace").read()
              if os.path.exists(out_path) else "")
+    # A stack overflow's top frame is whatever function was executing
+    # when the stack ran out and differs from run to run (php: 0-2 of 3
+    # re-runs hit the saved frame while 3 of 3 overflow), so the report
+    # type is the signal, not the frame.
+    if "AddressSanitizer: stack-overflow" in saved:
+        return "AddressSanitizer: stack-overflow"
     readme = os.path.join(bundle, "README.md")
     if os.path.exists(readme):
         m = re.search(r'\*\*Signature:\*\*\s*`(.+?)`(?=\s*&nbsp;|\s*$)',
@@ -94,21 +119,44 @@ def pick_signal(bundle):
             # words, so they are cut off; a `>` separates the frames of a
             # stack-dump key, and any one frame identifies the site.
             sig = re.sub(r'^(?:ICE|Assertion|Stack dump|SUMMARY|UBSAN|internal):\s*', '', sig)
-            parts = re.split(r'<[^>]*>|\b0x\w*|\s{2,}|["`]|\s+>\s+', sig)
-            parts = sorted((p.strip(" :,()[]{}<>-\"'`") for p in parts),
-                           key=len, reverse=True)
-            for part in parts:
-                if len(part) < 12 or _too_generic(part):
-                    continue
-                if not saved or part in saved:
-                    return part
+            # Second pass only: "..." marks text the driver collapsed out
+            # of the key (flang's FindScope statement) and never occurs in
+            # the output, so a key that matched nothing whole is retried
+            # with "..." as a separator too. Not in the first pass — a
+            # swift key with a real "..." inside its assertion text would
+            # otherwise shed it and match the generic "in SIL function".
+            for seps, min_len in ((r'<[^>]*>|\b0x\w*|\s{2,}|["`]|\s+>\s+', 12),
+                                  (r'<[^>]*>|\b0x\w*|\s{2,}|["`]|\s+>\s+|\s*\.\.\.', 24)):
+                parts = re.split(seps, sig)
+                parts = sorted((p.strip(" :,()[]{}<>-\"'`") for p in parts),
+                               key=len, reverse=True)
+                for part in parts:
+                    if len(part) < min_len or _too_generic(part):
+                        continue
+                    part = _trim_path(part)
+                    if len(part) >= min_len and (not saved or part in saved):
+                        return part
+                if '...' not in sig:
+                    break
     for line in saved.splitlines():
         line = line.strip()
-        if re.search(r'Assertion|SUMMARY:|panic:|caught segfault|'
-                     r'internal compiler error|\[BUG\]|UNREACHABLE|Debug failure', line):
+        # UBSan without a SUMMARY line (halt_on_error=0 builds such as
+        # lfortran's): "path/file.cpp:LINE:COL: runtime error: msg". The
+        # directory differs between builds, the rest is the site.
+        m = re.search(r'([\w.-]+\.(?:cpp|cc|cxx|hpp|h|c)):(\d+):(\d+): runtime error: (.+)', line)
+        if m:
+            # Addresses in the message differ between runs; cut there.
+            msg = re.split(r'\s+0x[0-9a-fA-F]+', m.group(4))[0]
+            return f"{m.group(1)}:{m.group(2)}:{m.group(3)}: runtime error: {msg}"[:160]
+        if re.search(r'Assertion|SUMMARY:|panic:|panic!|panicked at|LLVM ERROR:|'
+                     r'caught segfault|internal compiler error|\[BUG\]|UNREACHABLE|'
+                     r'Debug failure|fatal internal error:', line):
             # Drop the leading path, which differs between runs.
-            cut = re.sub(r'^.*?(?=Assertion|SUMMARY:|panic:|caught|internal compiler|'
-                         r'\[BUG\]|UNREACHABLE|Debug failure)', '', line)[:160]
+            cut = re.sub(r'^.*?(?=Assertion|SUMMARY:|panic:|panic!|panicked at|LLVM ERROR:|'
+                         r'caught|internal compiler|\[BUG\]|UNREACHABLE|Debug failure|'
+                         r'fatal internal error:)',
+                         '', line)[:160]
+            cut = _trim_path(cut)
             if len(cut) >= 12 and not _too_generic(cut):
                 return cut
     return None
@@ -116,8 +164,23 @@ def pick_signal(bundle):
 
 def run_once(workdir, signal, timeout):
     try:
-        r = subprocess.run(["bash", "./test.sh"], cwd=workdir, capture_output=True,
-                           text=True, encoding="iso-8859-1", timeout=timeout)
+        # Own session so a timeout kills the compiler the script started,
+        # not just the script: subprocess.run's timeout kills bash alone and
+        # the cc1plus/php grandchild ran on at 100% for 40 minutes (seen
+        # 2026-09-19, three of them costing the rotation ~13%).
+        p = subprocess.Popen(["bash", "./test.sh"], cwd=workdir, stdout=subprocess.PIPE,
+                             stderr=subprocess.PIPE, text=True, encoding="iso-8859-1",
+                             start_new_session=True)
+        try:
+            out, err = p.communicate(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            try:
+                os.killpg(p.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            p.communicate()
+            raise
+        r = subprocess.CompletedProcess(p.args, p.returncode, out, err)
     except Exception:
         return False
     return signal in (r.stdout or "") or signal in (r.stderr or "")
