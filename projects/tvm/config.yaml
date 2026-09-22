@@ -1,0 +1,53 @@
+project_name: "tvm"
+
+execution:
+  # projects/tvm/driver.py runs projects/tvm/runner.py per seed with a
+  # drawn mode/target/opt level/pass list; this is only the fallback.
+  command: "python3 projects/tvm/runner.py {seed_path} --mode build"
+  # Importing tvm costs ~2 s per run; a pass sequence plus LLVM codegen on
+  # a large module a few tens of seconds. Long enough that a timeout is a
+  # hang (or unbounded loop unrolling, which is recorded as one).
+  timeout: 120
+  concurrency: 8
+  worker_model: processes
+  # Address-space cap (`ulimit -v`): LLVM and TVM's arena allocator under
+  # a runaway unroll must fail locally.
+  mem_limit_mb: 8192
+
+analysis:
+  # Seeds failing on their own are dropped after --pre-analysis: an
+  # extracted module can reference a name from its enclosing test (a
+  # `size` variable, a helper), or exercise a target this host lacks.
+  drop_seeds_failing_alone: true
+  crash_patterns:
+    - "FFL_INTERNAL_ERROR"
+    - "Check failed"
+    - "FFL_MISMATCH"
+    - "Assertion `"
+    - "UNREACHABLE executed"
+    - "LLVM ERROR"
+    - "Segmentation fault"
+    - "Aborted"
+    - "Illegal instruction"
+    - "Floating point exception"
+    - "AddressSanitizer"
+    - "runtime error:"
+  syntax_patterns:
+    - "FFL_REJECTED"
+    - "error: "
+
+paths:
+  seed_source: "projects/tvm/seeds"
+  seed_corpus: "projects/tvm/corpus.db"
+  seed_exclude_patterns:
+    - pattern: 'T\.launch_thread|threadIdx|blockIdx|"cuda"|"vulkan"|"metal"|"opencl"|"rocm"|"webgpu"|T\.env_thread'
+      reason: "GPU-only module"
+    - pattern: 'R\.call_dps_packed|call_packed|T\.call_extern|T\.call_packed|R\.ExternFunc|"vm\.builtin'
+      reason: "calls a packed/extern function the harness does not provide"
+    - pattern: 'I\.pyfunc|@I\.pyfunc'
+      reason: "embedded Python function"
+
+llm:
+  provider: "openai"
+  model: "gpt-4o-mini"
+  timeout: 30
