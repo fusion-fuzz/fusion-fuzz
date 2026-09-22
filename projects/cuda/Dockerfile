@@ -5,7 +5,7 @@
 # time. clang for the CUDA frontend comes from projects/clang's
 # from-source, assertions-on build when that tree is present (same
 # repository mount), with the distro clang as fallback (see setup.py).
-FROM nvidia/cuda:12.8.1-devel-ubuntu22.04
+FROM nvidia/cuda:13.4.1-devel-ubuntu22.04
 
 LABEL maintainer="yuancheng@comp.nus.edu.sg"
 

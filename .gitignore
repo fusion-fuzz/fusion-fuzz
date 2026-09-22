@@ -231,3 +231,4 @@ projects/mojo/toolchain.json
 # seeds extracted from its tests are produced by projects/tvm/setup.py.
 projects/tvm/tvm/
 projects/tvm/seeds/
+projects/cuda/cccl/

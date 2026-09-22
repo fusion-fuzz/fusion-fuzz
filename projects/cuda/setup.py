@@ -131,6 +131,37 @@ def _collect_samples(project_root, dst):
     return n, [os.path.join(samples, "Common"), inc]
 
 
+CCCL_REPO = "https://github.com/NVIDIA/cccl.git"
+
+
+def _collect_cccl(project_root, dst):
+    """NVIDIA/cccl (Thrust, CUB, libcu++): the most template-heavy CUDA
+    code there is. Thrust's tests compile against the in-repo
+    `unittest/unittest.h`; libcu++'s lit tests (.cu, and .cpp meant for
+    `-x cuda`) against `test/support`; CUB's need Catch2, which CMake
+    fetches, so they are not collected. The repo's own headers go first on
+    the include path so tests match the library they were written for."""
+    cccl = os.path.join(project_root, "cccl")
+    if not os.path.isdir(os.path.join(cccl, "thrust")):
+        print("Cloning NVIDIA/cccl...", flush=True)
+        shutil.rmtree(cccl, ignore_errors=True)
+        _run(f"git clone --depth=1 {CCCL_REPO} {cccl}")
+    n = 0
+    for base, tag in ((os.path.join(cccl, "thrust", "testing"), "thrust"),
+                      (os.path.join(cccl, "libcudacxx", "test", "libcudacxx"), "libcudacxx")):
+        for src in glob.glob(os.path.join(base, "**", "*.cu"), recursive=True) + \
+                   (glob.glob(os.path.join(base, "**", "*.pass.cpp"), recursive=True) if tag == "libcudacxx" else []):
+            if os.path.getsize(src) > MAX_SEED_BYTES or "/support/" in src:
+                continue
+            rel = tag + "__" + os.path.relpath(src, base).replace(os.sep, "__")
+            rel = rel[:-4] + ".cu" if rel.endswith(".cpp") else rel
+            shutil.copy2(src, os.path.join(dst, rel))
+            n += 1
+    incs = [os.path.join(cccl, d) for d in ("libcudacxx/include", "thrust", "cub", "thrust/testing",
+                                            "libcudacxx/test/support", "c2h/include")]
+    return n, [d for d in incs if os.path.isdir(d)]
+
+
 def setup(project_root):
     project_root = os.path.abspath(project_root)
     print(f"Setting up CUDA in: {project_root}", flush=True)
@@ -143,11 +174,13 @@ def setup(project_root):
         raise RuntimeError("neither a clang++ nor nvcc is available")
 
     seeds = os.path.join(project_root, "seeds")
-    for sub in ("clang", "samples"):
+    for sub in ("clang", "samples", "cccl"):
         os.makedirs(os.path.join(seeds, sub), exist_ok=True)
     n_clang = _collect_clang_tests(_clang_test_tree(project_root), os.path.join(seeds, "clang"))
     n_samples, inc_dirs = _collect_samples(project_root, os.path.join(seeds, "samples"))
-    print(f"  seeds: {n_clang} clang tests, {n_samples} cuda-samples")
+    n_cccl, cccl_incs = _collect_cccl(project_root, os.path.join(seeds, "cccl"))
+    inc_dirs = cccl_incs + inc_dirs
+    print(f"  seeds: {n_clang} clang tests, {n_samples} cuda-samples, {n_cccl} cccl tests")
 
     info = {
         "clang": clang, "clang_kind": clang_kind,

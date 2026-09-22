@@ -53,7 +53,9 @@ _UNSUPPORTED_RE = re.compile(
     re.I)
 
 _ASAN_RE = re.compile(r"SUMMARY: (\w+Sanitizer):\s*([^\n]+)")
-_ASSERT_RE = re.compile(r"([\w./\-]+):(\d+):\s.*?Assertion `(.+?)' failed", re.S)
+# the compiler's own source location (…/Lex/PPCaching.cpp:123), not the
+# seed path that may precede it on the same line
+_ASSERT_RE = re.compile(r"([\w./\-]+\.(?:cpp|cc|h|hpp|inc)):(\d+)(?::\d+)?:\s[^\n]*?Assertion `(.+?)' failed")
 _UNREACHABLE_RE = re.compile(r"UNREACHABLE executed(?: at ([\w./\-]+):(\d+))?")
 _LLVM_ERROR_RE = re.compile(r"LLVM ERROR:\s*([^\n]+)")
 _BACKEND_RE = re.compile(r"fatal error: error in backend:\s*([^\n]+)")
