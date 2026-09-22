@@ -1,0 +1,75 @@
+project_name: "xla"
+
+execution:
+  # projects/xla/driver.py builds the real command per seed (tool, passes,
+  # XLA_FLAGS); this is only BaseDriver's fallback.
+  command: "projects/xla/bin/run_hlo_module --platform=cpu --reference_platform=interpreter {seed_path}"
+  # run_hlo_module compiles with LLVM and then runs the module twice (CPU
+  # and the HLO evaluator); a fused module with big shapes can take a few
+  # seconds on the evaluator. Enough to be sure a timeout means a hang.
+  timeout: 40
+  concurrency: 12
+  # fusion is pure Python and serialises on the GIL with many worker
+  # threads; forked worker processes measured ~3x on clang/mlir.
+  worker_model: processes
+  # Address-space cap per execution (`ulimit -v` in the driver): a fused
+  # module can declare a f32[100000,100000] and the evaluator will happily
+  # try to materialise it. 8 GB, not 4: run_hlo_module's interpreter run
+  # aborts under a 4 GB address-space limit (thread pools and arenas
+  # reserve far more than they touch); 8 GB is the smallest cap that ran
+  # the smoke module, and resident use stays far below it.
+  mem_limit_mb: 8192
+
+analysis:
+  # Many of the inline test modules are deliberately malformed (parser and
+  # verifier negative tests) or fragments of a larger module, and a seed
+  # the CPU pipeline rejects on its own yields children rejected at the
+  # same line. Dropped after --pre-analysis records rc.
+  drop_seeds_failing_alone: true
+  # The coarse net; projects/xla/analyzer.py makes the actual decision and
+  # subtracts shapes that match here but say nothing about XLA (resource
+  # exhaustion, deliberate UNIMPLEMENTED statuses, our own RSS cap).
+  crash_patterns:
+    - "Check failed:"
+    - "RET_CHECK failure"
+    - "Assertion `"
+    - "UNREACHABLE executed"
+    - "LLVM ERROR:"
+    - "PLEASE submit a bug report"
+    - "Segmentation fault"
+    - "SIGSEGV"
+    - "SIGABRT"
+    - "SIGILL"
+    - "SIGFPE"
+    - "AddressSanitizer"
+    - "UndefinedBehaviorSanitizer"
+    - "runtime error:"
+    - "INTERNAL:"
+    - "first mismatch at array index"
+  # A fused HLO module is usually ill-typed — two modules' shapes rarely
+  # agree — so a parser or verifier diagnostic is the expected outcome.
+  syntax_patterns:
+    - "INVALID_ARGUMENT:"
+    - "error: "
+    - "expected "
+    - "Expected instruction"
+    - "was not found"
+    - "does not match"
+    - "UNIMPLEMENTED:"
+    - "NOT_FOUND:"
+    - "FAILED_PRECONDITION:"
+
+paths:
+  seed_source: "projects/xla/xla/xla"
+  seed_corpus: "projects/xla/corpus.db"
+  seed_exclude_patterns:
+    # Modules written for other backends' pass pipelines or runtime: the
+    # CPU backend has no GPU/TPU custom-call targets, and collectives
+    # need replica groups the single-host CPU runner cannot honour.
+    - pattern: 'custom_call_target="__cudnn|custom_call_target="__triton|custom_call_target="__gpu|backend_config=\{"fusion_backend_config"|__nv_'
+      reason: "GPU-only custom calls"
+
+llm:
+  provider: "openai"
+  model: "gpt-4o-mini"
+  timeout: 30

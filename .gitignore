@@ -201,3 +201,10 @@ projects/swift/seeds/
 # baseline column against (2.6 GB). Reproducible with
 # `git worktree add .baseline <commit>`.
 .baseline/
+
+# XLA project — the openxla/xla checkout, the Bazel-built tools (two 330 MB
+# binaries plus the GPU one with its 1.9 GB of hermetic CUDA libraries) and
+# the pass list are all produced by projects/xla/setup.py; only the adapter
+# sources are versioned.
+projects/xla/xla/
+projects/xla/bin/
