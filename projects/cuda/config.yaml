@@ -1,0 +1,68 @@
+project_name: "cuda"
+
+execution:
+  # projects/cuda/driver.py builds the real command per seed (clang CUDA
+  # frontend or nvcc, compile-only, random architecture/flags); this is
+  # only BaseDriver's fallback.
+  command: "clang++ -x cuda --cuda-device-only -fsyntax-only {seed_path}"
+  # nvcc runs cudafe++, cicc (an LLVM-based device compiler) and ptxas in
+  # sequence and a template-heavy seed (thrust/cub) can take tens of
+  # seconds legitimately; clang's device-side -O3 on the same code is
+  # similar. Long enough that a timeout means a hang.
+  timeout: 90
+  concurrency: 12
+  worker_model: processes
+  # Address-space cap per compiler invocation (`ulimit -v`), as in the
+  # clang adapter: runaway template instantiation or constexpr evaluation
+  # must fail locally instead of waking the system OOM killer.
+  mem_limit_mb: 8192
+
+analysis:
+  # Seeds that fail on their own (pre-analysis) are dropped, except lit
+  # `-verify` tests whose expected-error lines make the rejection the
+  # test: Sema's CUDA error-recovery paths are worth fuzzing.
+  drop_seeds_failing_alone: true
+  drop_seeds_failing_alone_except: 'expected-(?:error|warning)'
+  # The coarse net; projects/cuda/analyzer.py makes the decision and
+  # subtracts resource exhaustion and nvcc's own "unsupported" exits.
+  crash_patterns:
+    - "PLEASE submit a bug report"
+    - "Stack dump:"
+    - "Assertion `"
+    - "UNREACHABLE executed"
+    - "LLVM ERROR"
+    - "fatal error: error in backend"
+    - "Segmentation fault"
+    - "Aborted"
+    - "core dumped"
+    - "Illegal instruction"
+    - "Floating point exception"
+    - "died due to signal"
+    - "Internal Compiler Error"
+    - "internal error"
+    - "catastrophic error"
+    - "ptxas fatal"
+    - "SUMMARY: AddressSanitizer"
+    - "SUMMARY: UndefinedBehaviorSanitizer"
+  syntax_patterns:
+    - "error: "
+    - "fatal error: "
+    - "error   :"
+
+paths:
+  seed_source: "projects/cuda/seeds"
+  seed_corpus: "projects/cuda/corpus.db"
+  seed_exclude_patterns:
+    # lit tests that pull sibling files the corpus does not carry
+    - pattern: '#include\s+"Inputs/'
+      reason: "lit Inputs/ header the corpus does not carry"
+    - pattern: '// RUN:.*-split-input-file|#include\s+"[^"]*\.inc"'
+      reason: "split or generated sibling file"
+    # driver tests exercise clang's argument handling, not compilation
+    - pattern: '// RUN:.*-###'
+      reason: "driver-only lit test"
+
+llm:
+  provider: "openai"
+  model: "gpt-4o-mini"
+  timeout: 30
