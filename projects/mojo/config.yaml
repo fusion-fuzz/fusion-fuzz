@@ -1,0 +1,71 @@
+project_name: "mojo"
+
+execution:
+  # projects/mojo/driver.py builds the real command per seed (mojo build /
+  # mojo run with random optimisation, debug, assertion, sanitizer and
+  # target flags); this is only BaseDriver's fallback.
+  command: "mojo build --emit object -o /dev/null {seed_path}"
+  # A stdlib test with property-based checks takes ~30 s to compile and
+  # run under the released toolchain; the from-source build with
+  # assertions is slower still. Long enough that a timeout is a hang
+  # (or an unbounded parametric instantiation, which is recorded as one).
+  timeout: 150
+  concurrency: 12
+  worker_model: processes
+  # Address-space cap per compilation (`ulimit -v`): the compiler embeds
+  # LLVM and a runaway comptime evaluation must fail locally.
+  mem_limit_mb: 10240
+
+analysis:
+  # Seeds failing on their own are dropped after --pre-analysis, except the
+  # parser suite's negative tests (`# expected-error {{...}}`): their
+  # rejection is the test and the recovery paths are worth fuzzing.
+  drop_seeds_failing_alone: true
+  drop_seeds_failing_alone_except: 'expected-(?:error|warning|note)'
+  # The coarse net; projects/mojo/analyzer.py decides. The program's own
+  # `Assert Error` (runtime debug_assert under -D ASSERT=all) also prints
+  # a stack dump and is *not* a compiler crash — the analyzer separates
+  # the two by the driver's crash banner.
+  crash_patterns:
+    - "Please submit a bug report"
+    - "PLEASE submit a bug report"
+    - "Assertion `"
+    - "UNREACHABLE executed"
+    - "LLVM ERROR"
+    - "INTERNAL ERROR"
+    - "internal error"
+    - "Segmentation fault"
+    - "Illegal instruction"
+    - "Floating point exception"
+    - "Bus error"
+    - "AddressSanitizer"
+    - "ThreadSanitizer"
+    - "runtime error:"
+  syntax_patterns:
+    - "error: "
+    - "Assert Error"
+    - "Unhandled exception"
+
+paths:
+  seed_source: "projects/mojo/seeds"
+  seed_corpus: "projects/mojo/corpus.db"
+  seed_exclude_patterns:
+    # lit tests whose RUN line needs a sibling file, a package layout or a
+    # tool other than the compiler
+    - pattern: '# RUN:.*(%t\.dir|mkdir|split-file|%S/|%p/|-I %S)'
+      reason: "needs sibling files or a package directory"
+    - pattern: '# RUN:.*(kgen-doc|mojo doc|mojo format|mblack|mojo-lsp|lldb|%mojo-debug|mojo debug|mojo repl|jupyter)'
+      reason: "tool other than the compiler"
+    - pattern: '# (REQUIRES|UNSUPPORTED):.*(gpu|nvidia|amd|apple|darwin|macos|python)'
+      reason: "needs hardware or an environment this host lacks"
+    - pattern: 'from python import|from std.python import|PythonObject|Python\.'
+      reason: "needs an embedded CPython the runner does not provide"
+    - pattern: '^from max\b|^import max\b'
+      reason: "needs the MAX package, not part of the compiler build"
+    - pattern: '\bargv\(\)'
+      reason: "reads command-line arguments the runner never passes (out-of-bounds under -DASSERT=none)"
+
+llm:
+  provider: "openai"
+  model: "gpt-4o-mini"
+  timeout: 30
