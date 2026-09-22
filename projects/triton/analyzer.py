@@ -97,7 +97,27 @@ _INPUT_PRECONDITION_RE = re.compile(
     r"|module should contain"
     r"|requires .* attribute"
     r"|expected .* attribute on the module"
+    # explicit unsupported-feature exits in the lowerings (report_fatal_error
+    # on an op/layout/mode the conversion has no path for) and pass-order
+    # preconditions: the IR asked for something the pipeline declines
+    r"|Unsupported [\w ]+ found when converting"
+    r"|Unsupported (?:rounding mode|layout|type|op|dot|conversion)"
+    r"|Only supports? "
+    r"|not supported(?: yet)?"
+    r"|should run after"
+    # -allow-unregistered-dialect lets an op from an unregistered dialect
+    # through the parser; a pass that then needs its interface stops here
+    r"|failed due to the operation not being registered"
     r")", re.I)
+
+_ASSERT_PRECONDITION_RE = re.compile(
+    r"Expected a target attribute"
+    r"|targetName\.starts_with"
+    r"|seenKernel"
+    r"|hasAttr\(\"allocation\.offset\"\)"
+    r"|cannot get warp group ID"
+    r"|should run after"
+    r"|expected .* attribute on the module", re.I)
 
 # LLVM's crash handler. The first frame that is not the handler itself is
 # the useful grouping key.
@@ -203,6 +223,12 @@ def classify(output):
     # file:line groups better than the message, which often embeds a value.
     m = _ASSERT_RE.search(text)
     if m:
+        # Some passes assert, rather than diagnose, a precondition on the
+        # input: the module attribute naming the target, exactly one
+        # kernel per module, allocation offsets from an earlier pass. A
+        # fused module fails those the same way a hand-written one would.
+        if _ASSERT_PRECONDITION_RE.search(m.group(3)):
+            return {"kind": "diagnostic", "signature": None, "is_bug": False}
         where = f"{_short_path(m.group(1))}:{m.group(2)}"
         return hit("assert", f"ASSERT: {where} ({_normalize(m.group(3))[:70]})")
 

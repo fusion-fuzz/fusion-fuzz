@@ -150,12 +150,17 @@ def pick_signal(bundle):
             return f"{m.group(1)}:{m.group(2)}:{m.group(3)}: runtime error: {msg}"[:160]
         if re.search(r'Assertion|SUMMARY:|panic:|panic!|panicked at|LLVM ERROR:|'
                      r'caught segfault|internal compiler error|\[BUG\]|UNREACHABLE|'
-                     r'Debug failure|fatal internal error:', line):
+                     r'Debug failure|fatal internal error:|Check failed:|RET_CHECK failure|'
+                     r'^Segmentation fault|^Aborted|'
+                     r'^Illegal instruction|^Bus error|^Floating point exception', line):
             # Drop the leading path, which differs between runs.
             cut = re.sub(r'^.*?(?=Assertion|SUMMARY:|panic:|panic!|panicked at|LLVM ERROR:|'
                          r'caught|internal compiler|\[BUG\]|UNREACHABLE|Debug failure|'
-                         r'fatal internal error:)',
+                         r'fatal internal error:|Check failed:|RET_CHECK failure|Segmentation fault|Aborted|'
+                         r'Illegal instruction|Bus error|Floating point exception)',
                          '', line)[:160]
+            # The shell's signal line carries "(core dumped)" only sometimes.
+            cut = re.sub(r'\s*\(core dumped\)', '', cut)
             cut = _trim_path(cut)
             if len(cut) >= 12 and not _too_generic(cut):
                 return cut

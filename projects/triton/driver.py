@@ -424,4 +424,8 @@ class TritonDriver(BaseDriver):
             signature=verdict["signature"],
         )
         result.command = cmd
+        # The bundle saver rewrites this exact path to "$SCRIPT_DIR/test.mlir"
+        # in test.sh; without it the fallback replaces only the seed id and
+        # leaves the temp directory prefix in the script.
+        result.seed_file = module if 'module' in dir() else None
         return result

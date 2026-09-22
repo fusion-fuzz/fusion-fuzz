@@ -777,6 +777,13 @@ class FusionFuzzLoop:
         # the name everywhere would invalidate every existing bundle's
         # test.sh for no gain. `min.<ext>` keeps its name — "min" shadows
         # nothing.
+        # Prefer the extension of the file the driver actually executed:
+        # a fused child may carry no "extension" metadata (the Triton
+        # strategies set only "type"), and the fallback ".txt" leaves a
+        # test.sh that names test.mlir beside a test.txt.
+        actual = getattr(result, "seed_file", None)
+        if actual and os.path.splitext(actual)[1]:
+            ext = os.path.splitext(actual)[1]
         stem = "ffl_repro" if ext == ".py" else "test"
         test_filename = f"{stem}{ext}"
 

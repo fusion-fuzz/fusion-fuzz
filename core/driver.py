@@ -373,8 +373,12 @@ def cleanup_stale_processes(project_name: str, min_age: float = DEFAULT_STALE_AF
     # A driver may also run the frontend out of the project's own tree
     # rather than under a well-known binary name.
     tree_marker = f"projects/{project_name}"
+    # Build servers and debuggers run with the project tree on their
+    # command line for hours: Bazel's JVM (`--workspace_directory=.../
+    # projects/xla/xla`, comm "java"/"bazel(xla)") was SIGKILLed by this
+    # sweep two minutes into every XLA GPU build while a batch was running.
     safe_bins = ("vim", "nvim", "nano", "code", "git", "emacs", "less",
-                 "tail", "ps", "grep", "docker")
+                 "tail", "ps", "grep", "docker", "java", "bazel", "gdb")
     # The project's own tree also holds the tools that maintain it, and
     # those run under an interpreter — `python3 projects/flang/
     # prune_corpus.py` matches the by-tree sweep but is not a leaked
