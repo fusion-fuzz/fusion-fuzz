@@ -81,6 +81,10 @@ def classify(output, tool="build", return_code=None):
     m = _LLVM_ERROR_RE.search(out)
     if m:
         return hit("llvm_error", f"LLVM ERROR: {_normalize(m.group(1))[:80]}")
+    if "FFL_REJECTED" in out:
+        # the runner's verdict wins: a rejection message may quote an
+        # ICHECK text (a parser diagnostic, a pass precondition)
+        return {"kind": "rejected", "signature": None, "is_bug": False, "is_valid": False}
     if "FFL_INTERNAL_ERROR" in out or "Check failed" in out:
         m = _CHECK_LOC_RE.search(out)
         where = f"{_short(m.group(1))}:{m.group(2)} " if m else ""

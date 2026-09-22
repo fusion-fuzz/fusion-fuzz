@@ -221,11 +221,41 @@ def main():
     try:
         mod = _load_module(args.path)
     except tvm.error.InternalError as e:
-        if _PRECONDITION_RE.search(str(e)):
-            print(f"FFL_REJECTED parse: {str(e)[:200]}"); sys.exit(1)
-        print("FFL_INTERNAL_ERROR (during TVMScript parsing)"); traceback.print_exc(); sys.exit(3)
+        # The TVMScript parser reports several malformed-input conditions
+        # through ICHECK (duplicate function, too many indices, undefined
+        # symbol binding) — robustness issues, but the input is invalid, so
+        # the run is a rejection; the message is kept for the record.
+        print(f"FFL_REJECTED parse-icheck: {str(e)[:200]}"); sys.exit(1)
     except Exception as e:  # TVMScript diagnostics, seed-level Python errors
         print(f"FFL_REJECTED parse: {type(e).__name__}: {str(e)[:300]}"); sys.exit(1)
+
+    # TVM's own well-formedness verifiers: a module they reject is not a
+    # valid program, and an ICHECK a later pass raises on it is the pass
+    # assuming what the verifier guarantees, not a defect.
+    checks = []
+    for modname, fn in (("tirx.analysis", "verify_well_formed"), ("s_tir.analysis", "verify_well_formed"),
+                        ("relax.analysis", "well_formed")):
+        try:
+            obj = tvm
+            for part in modname.split("."):
+                obj = getattr(obj, part)
+            checks.append((modname, getattr(obj, fn)))
+        except AttributeError:
+            pass
+    for modname, fn in checks:
+        try:
+            ok = fn(mod)
+        except Exception as e:
+            msg = str(e)
+            # the tirx verifier declines s_tir blocks (and vice versa):
+            # not a verdict on the module
+            if "does not support" in msg:
+                continue
+            # the verifiers report through InternalError; that is their
+            # diagnostic, and the module is not well-formed
+            print(f"FFL_REJECTED not well-formed ({modname}): {type(e).__name__}: {msg[-200:]}"); sys.exit(1)
+        if ok is False:
+            print(f"FFL_REJECTED not well-formed ({modname})"); sys.exit(1)
 
     if args.mode == "parse":
         print("FFL_OK parse"); return
@@ -283,8 +313,12 @@ def main():
         inputs = _random_inputs(entry[2], nrng)
     except Exception as e:
         print(f"FFL_OK build (inputs: {e})"); return
+    # executed code gets TIR's bound checkers: an out-of-range access in a
+    # fused kernel then fails with an error instead of a silent segfault,
+    # so a signal that remains is the compiler's
+    run_cfg = {"tirx.instrument_bound_checkers": True}
     try:
-        with tvm.transform.PassContext(opt_level=args.opt_level):
+        with tvm.transform.PassContext(opt_level=args.opt_level, config=run_cfg):
             out = _run_once(mod, target, entry, inputs)
     except tvm.error.InternalError:
         print("FFL_INTERNAL_ERROR (run)"); traceback.print_exc(); sys.exit(3)
@@ -296,7 +330,7 @@ def main():
     # diff: baseline at -O0 on plain llvm with the same inputs
     try:
         base_inputs = _random_inputs(entry[2], np.random.default_rng(args.seed))
-        with tvm.transform.PassContext(opt_level=0):
+        with tvm.transform.PassContext(opt_level=0, config=run_cfg):
             base = _run_once(mod, "llvm", entry, base_inputs)
     except tvm.error.InternalError:
         print("FFL_INTERNAL_ERROR (baseline run)"); traceback.print_exc(); sys.exit(3)

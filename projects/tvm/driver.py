@@ -42,8 +42,8 @@ class TVMDriver(BaseDriver):
         ("llvm -mcpu=znver3", 1), ("llvm -mtriple=aarch64-linux-gnu -mcpu=cortex-a72", 2),
         ("llvm -mtriple=riscv64-linux-gnu -mcpu=generic-rv64 -mattr=+v", 1), ("c", 2),
     ]
-    RUN_TARGETS = [("llvm", 4), ("llvm -mcpu=core-avx2", 2), ("llvm -mcpu=native", 2),
-                   ("llvm -mcpu=skylake-avx512", 1)]
+    # executed on this host: only ISAs it has (AVX-512 code SIGILLs here)
+    RUN_TARGETS = [("llvm", 4), ("llvm -mcpu=core-avx2", 2), ("llvm -mcpu=native", 2)]
     OPT_LEVELS = [0, 1, 2, 3, 3]
     PASS_COUNTS = [0, 0, 1, 1, 2, 3, 4]
     PIPELINES = [("default", 3), ("tirx", 1)]
