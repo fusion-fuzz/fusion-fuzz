@@ -6,6 +6,8 @@ Fusion-fuzz is a scalable and effective fuzzer to discover bugs in various compi
 
 The core idea of fusion-fuzz is **program fusion**, which bridges the behavior of two (or more) independent seed programs so the fused program exercises interactions neither seed triggers alone.
 
+![Overview](overview.png)
+
 Program fusion now has three fusion strategies: **dataflow fusion**, **state fusion**, and **declaration fusion**.
 
 - **Dataflow fusion** - connect dataflow from parent seeds by interleaving variables.
