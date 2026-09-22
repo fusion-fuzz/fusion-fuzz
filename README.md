@@ -86,26 +86,54 @@ protocol ProtoRefinesClass where Self : Generic<Int>, Self : BaseProto {
 
 The scalability of fusion-fuzz is mostly from **seed migration**, which translates seed programs from one target into every other target. 
 
-Supported projects are:
+Supported projects fall into two families. The adapters share the same
+core (seed migration, the three fusion strategies, the bug oracle and the
+reducer); what differs per project is how a seed is parsed, how the target is
+built (from source, with assertions and sanitizers on wherever the build
+allows) and how a run is judged.
 
-| Project | Status | Dataflow fusion | State fusion | Declaration fusion |
-|---------|--------|:---:|:---:|:---:|
-| ![PHP](https://img.shields.io/badge/PHP-supported-brightgreen?logo=php&logoColor=white) | **Supported** | ✅ | ✅ | ✅ |
-| ![CPython](https://img.shields.io/badge/CPython-supported-brightgreen?logo=python&logoColor=white) | **Supported** | ✅ | ✅ | ✅ |
-| ![Swift](https://img.shields.io/badge/Swift-supported-brightgreen?logo=swift&logoColor=white) | **Supported** | ✅ | ✅ | ✅ |
-| ![Clang](https://img.shields.io/badge/Clang-supported-brightgreen?logo=llvm&logoColor=white) | **Supported** | ✅ | ✅ | ✅ |
-| ![MLIR](https://img.shields.io/badge/MLIR-supported-brightgreen?logo=llvm&logoColor=white) | **Supported** | ✅ | ✅ | ✅ |
-| ![Flang](https://img.shields.io/badge/Flang-supported-brightgreen?logo=llvm&logoColor=white) | **Supported** | ✅ | ✅ | ✅ |
-| ![LFortran](https://img.shields.io/badge/LFortran-supported-brightgreen?logo=fortran&logoColor=white) | **Supported** | ✅ | ✅ | ✅ |
-| ![Haskell](https://img.shields.io/badge/GHC-supported-brightgreen?logo=haskell&logoColor=white) | **Supported** | ✅ | ✅ | ✅ |
-| ![Rust](https://img.shields.io/badge/Rust-experimental-orange?logo=rust&logoColor=white) | **Experimental** | ✅ | ✅ | ✅ |
-| ![GCC](https://img.shields.io/badge/GCC-experimental-orange?logo=gnu&logoColor=white) | **Experimental** | ✅ | ✅ | ✅ |
-| ![Go](https://img.shields.io/badge/Go-experimental-orange?logo=go&logoColor=white) | **Experimental** | ✅ | ✅ | ✅ |
-| ![V8](https://img.shields.io/badge/V8-experimental-orange?logo=googlechrome&logoColor=white) | **Experimental** | ✅ | ✅ | ✅ |
-| ![SpiderMonkey](https://img.shields.io/badge/SpiderMonkey-experimental-orange?logo=firefoxbrowser&logoColor=white) | **Experimental** | ✅ | ✅ | ✅ |
-| ![Naga](https://img.shields.io/badge/Naga-experimental-orange?logo=webgpu&logoColor=white) | **Experimental** | ✅ | ✅ | ✅ |
-| ![Tint](https://img.shields.io/badge/Tint-experimental-orange?logo=webgpu&logoColor=white) | **Experimental** | ✅ | ✅ | ✅ |
-| ![Triton](https://img.shields.io/badge/Triton-experimental-orange?logo=nvidia&logoColor=white) | **Experimental** | ✅ | ✅ | ✅ |
+### Machine learning and accelerator language processors
+
+Compilers whose input is a tensor program or a GPU kernel: HLO, TVMScript,
+Triton IR, CUDA C++, Mojo, MLIR dialects and shading languages. They run
+without a GPU — the adapters compile to PTX, cubin, object code or IR, and
+XLA and TVM also execute on the CPU backend for differential checks.
+
+| Project | Input | Status | Dataflow fusion | State fusion | Declaration fusion |
+|---------|-------|--------|:---:|:---:|:---:|
+| ![XLA](https://img.shields.io/badge/XLA-supported-brightgreen?logo=google&logoColor=white) | HLO text (CPU backend, compile-only GPU backend) | **Supported** | ✅ | ✅ | ✅ |
+| ![TVM](https://img.shields.io/badge/TVM-experimental-orange?logo=apache&logoColor=white) | TVMScript modules (TIR and Relax) | **Experimental** | ✅ | ✅ | ✅ |
+| ![Triton](https://img.shields.io/badge/Triton-experimental-orange?logo=nvidia&logoColor=white) | Triton IR / TritonGPU IR (`triton-opt`) | **Experimental** | ✅ | ✅ | ✅ |
+| ![CUDA](https://img.shields.io/badge/CUDA-experimental-orange?logo=nvidia&logoColor=white) | CUDA C++ (clang CUDA frontend and nvcc) | **Experimental** | ✅ | ✅ | ✅ |
+| ![Mojo](https://img.shields.io/badge/Mojo-experimental-orange?logo=modular&logoColor=white) | Mojo (compiler built from source) | **Experimental** | ✅ | ✅ | ✅ |
+| ![MLIR](https://img.shields.io/badge/MLIR-supported-brightgreen?logo=llvm&logoColor=white) | MLIR dialects (`mlir-opt`) | **Supported** | ✅ | ✅ | ✅ |
+| ![Naga](https://img.shields.io/badge/Naga-experimental-orange?logo=webgpu&logoColor=white) | WGSL (shader compiler) | **Experimental** | ✅ | ✅ | ✅ |
+| ![Tint](https://img.shields.io/badge/Tint-experimental-orange?logo=webgpu&logoColor=white) | WGSL (shader compiler) | **Experimental** | ✅ | ✅ | ✅ |
+
+### General-purpose language processors
+
+Compilers and interpreters of general-purpose programming languages, from
+the C family and Fortran to scripting-language runtimes and JavaScript
+engines.
+
+| Project | Input | Status | Dataflow fusion | State fusion | Declaration fusion |
+|---------|-------|--------|:---:|:---:|:---:|
+| ![PHP](https://img.shields.io/badge/PHP-supported-brightgreen?logo=php&logoColor=white) | PHP | **Supported** | ✅ | ✅ | ✅ |
+| ![CPython](https://img.shields.io/badge/CPython-supported-brightgreen?logo=python&logoColor=white) | Python | **Supported** | ✅ | ✅ | ✅ |
+| ![Swift](https://img.shields.io/badge/Swift-supported-brightgreen?logo=swift&logoColor=white) | Swift | **Supported** | ✅ | ✅ | ✅ |
+| ![Clang](https://img.shields.io/badge/Clang-supported-brightgreen?logo=llvm&logoColor=white) | C, C++, Objective-C | **Supported** | ✅ | ✅ | ✅ |
+| ![Flang](https://img.shields.io/badge/Flang-supported-brightgreen?logo=llvm&logoColor=white) | Fortran | **Supported** | ✅ | ✅ | ✅ |
+| ![LFortran](https://img.shields.io/badge/LFortran-supported-brightgreen?logo=fortran&logoColor=white) | Fortran | **Supported** | ✅ | ✅ | ✅ |
+| ![Haskell](https://img.shields.io/badge/GHC-supported-brightgreen?logo=haskell&logoColor=white) | Haskell | **Supported** | ✅ | ✅ | ✅ |
+| ![Rust](https://img.shields.io/badge/Rust-experimental-orange?logo=rust&logoColor=white) | Rust | **Experimental** | ✅ | ✅ | ✅ |
+| ![GCC](https://img.shields.io/badge/GCC-experimental-orange?logo=gnu&logoColor=white) | C, C++ | **Experimental** | ✅ | ✅ | ✅ |
+| ![Go](https://img.shields.io/badge/Go-experimental-orange?logo=go&logoColor=white) | Go | **Experimental** | ✅ | ✅ | ✅ |
+| ![V8](https://img.shields.io/badge/V8-experimental-orange?logo=googlechrome&logoColor=white) | JavaScript | **Experimental** | ✅ | ✅ | ✅ |
+| ![SpiderMonkey](https://img.shields.io/badge/SpiderMonkey-experimental-orange?logo=firefoxbrowser&logoColor=white) | JavaScript | **Experimental** | ✅ | ✅ | ✅ |
+| ![TypeScript](https://img.shields.io/badge/TypeScript-experimental-orange?logo=typescript&logoColor=white) | TypeScript | **Experimental** | ✅ | ✅ | ✅ |
+| ![Ruby](https://img.shields.io/badge/Ruby-experimental-orange?logo=ruby&logoColor=white) | Ruby | **Experimental** | ✅ | ✅ | ✅ |
+| ![R](https://img.shields.io/badge/R-experimental-orange?logo=r&logoColor=white) | R | **Experimental** | ✅ | ✅ | ✅ |
+| ![Julia](https://img.shields.io/badge/Julia-experimental-orange?logo=julia&logoColor=white) | Julia | **Experimental** | ✅ | ✅ | ✅ |
 
 **Supported** means the adapter has been run at length, its valid-fusion rate
 measured, and real bugs reported from it. **Experimental** means all three
