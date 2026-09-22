@@ -33,7 +33,7 @@ class FusionStrategy(abc.ABC):
         "php": "//", "cpython": "#", "clang": "//", "flang": "!",
         "swift": "//", "mlir": "//", "rust": "//", "haskell": "--",
         "naga": "//", "wgsl": "//", "ruby": "#", "typescript": "//", "r": "#",
-        "julia": "#",
+        "julia": "#", "xla": "//",
     }
 
     def _tag(self, kind: str) -> str:
@@ -15011,6 +15011,416 @@ class JuliaDeclarationFusionStrategy(JuliaFusionStrategy):
                 self._build_declaration_fused(parent_b, parent_a, "ba")]
 
 
+# ---------------------------------------------------------------------------
+# XLA / HLO
+# ---------------------------------------------------------------------------
+#
+# HLO is XLA's IR: a module is a set of computations, one of them the
+# ENTRY, each a straight-line list of SSA instructions
+# `name = shape opcode(operands), attrs`. Every instruction carries its
+# result shape in the text, and the verifier checks operand shapes against
+# what the opcode expects, so a fusion that wires two modules together by
+# *shape* is accepted by the verifier and reaches the compiler, while one
+# that ignores shapes is rejected at the verifier — the deliberate
+# leave-it-to-chance minority.
+#
+# All three techniques share one operation, merging the donor's entry into
+# the host's entry (core/hlo_text.py does the reading and writing):
+#
+#   dataflow     the donor's entry instructions are appended after the
+#                host's, and one donor input — a parameter, or any
+#                operand — is rewired to a host value of the same shape:
+#                a value the host computed now feeds the donor's graph.
+#   state        the donor's entry instructions are spliced *into* the
+#                host's at a random point, and every donor parameter is
+#                rewired to a host value that is live there (defined
+#                before the splice point) with a matching shape. The
+#                donor's program continues from the host's state.
+#   declaration  a donor computation (a reducer, a while body, a fusion
+#                body) is imported and *called* from the host entry with
+#                host values whose shapes fit its parameters — or
+#                substituted for a host computation of the same
+#                signature in a `to_apply=` / `calls=` / `body=` slot.
+#
+# In every case the merged entry's ROOT becomes a tuple of the host's root
+# and the donor's, so both halves stay live through DCE and both are
+# compiled and (under run_hlo_module) executed; the header's
+# `entry_computation_layout` and `is_scheduled` are dropped because the
+# entry's parameters and result changed. Donor computation and instruction
+# names are made unique against the host's. HLO requires definition
+# before use in text order, which the placement rules above respect.
+
+from core import hlo_text as _hlo
+
+
+class XLAFusionStrategy(FusionStrategy):
+    LANGUAGE = "xla"
+
+    #: How a dataflow edge is chosen: a donor *parameter* rewired to a
+    #: same-shape host value (the typed link the verifier accepts), any
+    #: donor operand rewired by shape, or an untyped rewire left to chance.
+    _DATAFLOW_PARAM_SHARE = 0.6
+    _DATAFLOW_OPERAND_SHARE = 0.3
+    #: Merged entries beyond this many instructions are slow to compile
+    #: under the evaluator and rarely say anything a smaller one does not.
+    _MAX_ENTRY_INSTRS = 600
+
+    def __init__(self, project_root="projects/xla", lightweight: bool = False):
+        self.project_root = project_root
+        self.lightweight = lightweight
+
+    # ── seeds → modules ──────────────────────────────────────────────
+
+    def _module(self, seed: Seed):
+        try:
+            mod = _hlo.parse_module(seed.content or "")
+        except Exception:
+            return None
+        if not mod or not mod.computations:
+            return None
+        entry = mod.entry()
+        if entry is None or not entry.instrs:
+            return None
+        return mod
+
+    def is_viable_pair(self, parent_a: Seed, parent_b: Seed) -> bool:
+        ma, mb = self._module(parent_a), self._module(parent_b)
+        if ma is None or mb is None:
+            return False
+        return (len(ma.entry().instrs) + len(mb.entry().instrs)) <= self._MAX_ENTRY_INSTRS
+
+    # ── the merge ───────────────────────────────────────────────────
+
+    @staticmethod
+    def _shape_index(instrs):
+        """{type_shape: [instr names]} over instructions with a shape."""
+        idx = {}
+        for ins in instrs:
+            idx.setdefault(ins.type_shape(), []).append(ins.name)
+        return idx
+
+    def _import_donor(self, host, donor):
+        """Donor computations renamed to be unique in the host module, with
+        their references rewritten; returns (non_entry_comps, entry_instrs,
+        comp_map). The donor entry's instructions are renamed against the
+        host entry's names."""
+        taken = {c.name for c in host.computations}
+        cmap = {}
+        for c in donor.computations:
+            if c is donor.entry():
+                continue
+            new = _hlo.unique_name(c.name if c.name not in taken else c.name + ".d", taken)
+            taken.add(new)
+            cmap[c.name] = new
+        comps = []
+        for c in donor.non_entry():
+            instrs = [_hlo.rename_computation_refs(i, cmap) for i in c.instrs]
+            comps.append(_hlo.HloComputation(name=cmap[c.name], is_entry=False,
+                                             signature=c.signature, instrs=instrs))
+        host_names = set(host.entry().names())
+        dmap = {}
+        for ins in donor.entry().instrs:
+            new = _hlo.unique_name(ins.name if ins.name not in host_names else ins.name + ".d",
+                                   host_names)
+            host_names.add(new)
+            dmap[ins.name] = new
+        entry_instrs = [_hlo.rename_operands(_hlo.rename_computation_refs(i, cmap), dmap)
+                        for i in donor.entry().instrs]
+        for ins in entry_instrs:
+            ins.is_root = False
+        return comps, entry_instrs, dmap
+
+    def _header_attrs(self, host):
+        attrs = host.header_attrs
+        for key in ("entry_computation_layout", "is_scheduled"):
+            attrs = _hlo.strip_header_attr(attrs, key)
+        return attrs
+
+    def _rewire(self, instrs, old, new, tag=None):
+        """Replace every operand use of `old` with `new` in `instrs`
+        (in place); tag the first rewritten line."""
+        hit = False
+        for k, ins in enumerate(instrs):
+            if old in ins.operand_names():
+                instrs[k] = _hlo.rename_operands(ins, {old: new})
+                if tag and not hit:
+                    instrs[k].comment = tag
+                hit = True
+        return hit
+
+    def _renumber_params(self, host_instrs, donor_instrs, dropped):
+        """Give the donor's surviving parameters indices after the host's."""
+        host_params = [i for i in host_instrs if i.opcode == "parameter"]
+        next_idx = 1 + max([p.param_index() or 0 for p in host_params], default=-1)
+        out = []
+        for ins in donor_instrs:
+            if ins.opcode == "parameter":
+                if ins.name in dropped:
+                    continue
+                ins = _hlo.set_param_index(ins, next_idx)
+                next_idx += 1
+            out.append(ins)
+        return out
+
+    def _finish(self, host, comps, entry_instrs, host_root_name, donor_root_name,
+                tag_kind, mode, host_seed, donor_seed, description):
+        """Assemble the merged module text and the child seed."""
+        names = set(i.name for i in entry_instrs)
+        for ins in entry_instrs:
+            ins.is_root = False
+        root_name = _hlo.unique_name("ffl.root", names)
+        hr = next((i for i in entry_instrs if i.name == host_root_name), None)
+        dr = next((i for i in entry_instrs if i.name == donor_root_name), None)
+        if hr is None:
+            return None
+        if dr is None or dr is hr:
+            hr.is_root = True
+        else:
+            # Flatten: a host root that is itself one of our tuples (a
+            # chained fusion) contributes its elements rather than nesting.
+            # PJRT's stream-executor client declines nested tuple results
+            # outright (267 of the first batch's 431 bundles), so a flat
+            # tuple is what keeps a chained child executable.
+            operands, shapes = [], []
+            for src in (hr, dr):
+                if src.opcode == "tuple" and src.name.startswith("ffl.root"):
+                    operands.extend(src.operands)
+                    shapes.extend(_hlo.split_top_level(src.shape.strip()[1:-1]))
+                else:
+                    operands.append(f"%{src.name}")
+                    shapes.append(src.shape)
+            root = _hlo.HloInstr(name=root_name, shape="(" + ", ".join(shapes) + ")",
+                                 opcode="tuple", operands=operands,
+                                 attrs="", is_root=True, comment=self._tag(tag_kind))
+            entry_instrs.append(root)
+        entry = _hlo.HloComputation(name=host.entry().name, is_entry=True,
+                                    signature=None, instrs=entry_instrs)
+        merged = _hlo.HloModule(name=host.name, header_attrs=self._header_attrs(host),
+                                computations=host.non_entry() + comps + [entry],
+                                preamble=[])
+        text = merged.render()
+        return Seed(content=text, metadata={
+            "type": "hlo", "extension": ".hlo", "mode": mode,
+            "parents": [host_seed.id, donor_seed.id],
+            "description": description,
+        })
+
+    # ── dataflow ────────────────────────────────────────────────────
+
+    def _fuse_dataflow(self, host_seed: Seed, donor_seed: Seed, direction: str):
+        host, donor = self._module(host_seed), self._module(donor_seed)
+        if host is None or donor is None:
+            return None
+        comps, d_instrs, dmap = self._import_donor(host, donor)
+        h_instrs = [ _hlo.HloInstr(**vars(i)) for i in host.entry().instrs ]
+        host_root = host.entry().root().name
+        donor_root = dmap[donor.entry().root().name]
+        h_by_shape = self._shape_index(h_instrs)
+        tag = self._tag("dataflow")
+        dropped = set()
+        edge = "none"
+        r = random.random()
+        d_params = [i for i in d_instrs if i.opcode == "parameter"]
+        if r < self._DATAFLOW_PARAM_SHARE:
+            # A donor parameter fed by a same-shape host value: the host
+            # now supplies one of the donor's inputs.
+            cands = [(p, h_by_shape[p.type_shape()]) for p in d_params
+                     if p.type_shape() in h_by_shape]
+            if cands:
+                p, srcs = random.choice(cands)
+                src = random.choice(srcs)
+                self._rewire(d_instrs, p.name, src, tag)
+                dropped.add(p.name)
+                edge = f"param {p.name} <- {src}"
+        if edge == "none" and r < self._DATAFLOW_PARAM_SHARE + self._DATAFLOW_OPERAND_SHARE:
+            uses = [(ins, n) for ins in d_instrs for n in ins.operand_names()
+                    if n in dmap.values()]
+            random.shuffle(uses)
+            for ins, n in uses:
+                defn = next((i for i in d_instrs if i.name == n), None)
+                if defn is None:
+                    continue
+                srcs = h_by_shape.get(defn.type_shape())
+                if srcs:
+                    src = random.choice(srcs)
+                    k = d_instrs.index(ins)
+                    d_instrs[k] = _hlo.rename_operands(ins, {n: src})
+                    d_instrs[k].comment = tag
+                    edge = f"operand {n} of {ins.name} <- {src}"
+                    break
+        if edge == "none":
+            # Untyped: any donor operand to any host value. Usually rejected
+            # by the verifier; sometimes exactly the ill-formed input a
+            # pass mishandles.
+            uses = [(ins, n) for ins in d_instrs for n in ins.operand_names()]
+            if uses and h_instrs:
+                ins, n = random.choice(uses)
+                src = random.choice(h_instrs).name
+                k = d_instrs.index(ins)
+                d_instrs[k] = _hlo.rename_operands(ins, {n: src})
+                d_instrs[k].comment = tag
+                edge = f"untyped {n} of {ins.name} <- {src}"
+        d_instrs = self._renumber_params(h_instrs, d_instrs, dropped)
+        return self._finish(host, comps, h_instrs + d_instrs, host_root, donor_root,
+                            "dataflow", f"dataflow_{direction}", host_seed, donor_seed,
+                            f"Dataflow-fused {host_seed.id} <- {donor_seed.id} ({direction}; {edge})")
+
+    def fuse(self, parent_a: Seed, parent_b: Seed) -> Seed:
+        return self._fuse_dataflow(parent_a, parent_b, "ab")
+
+    def fuse_bidirectional(self, parent_a: Seed, parent_b: Seed) -> List[Seed]:
+        return [c for c in (self._fuse_dataflow(parent_a, parent_b, "ab"),
+                            self._fuse_dataflow(parent_b, parent_a, "ba")) if c]
+
+
+class XLAStateFusionStrategy(XLAFusionStrategy):
+    """State fusion for HLO: the donor's entry is spliced into the host's
+    at a random point, and the donor's parameters are fed from the host
+    values live at that point (defined before it, same shape). The donor's
+    graph then runs on intermediate results of the host's — values with
+    layouts, sharding and fusion decisions the donor's author never
+    wrote — which is what exercises the layout assignment, fusion and
+    scheduling passes on shapes they did not expect."""
+
+    def _fuse_state(self, host_seed: Seed, donor_seed: Seed, direction: str):
+        host, donor = self._module(host_seed), self._module(donor_seed)
+        if host is None or donor is None:
+            return None
+        comps, d_instrs, dmap = self._import_donor(host, donor)
+        h_instrs = [ _hlo.HloInstr(**vars(i)) for i in host.entry().instrs ]
+        host_root = host.entry().root().name
+        donor_root = dmap[donor.entry().root().name]
+        # Splice after the host's parameters at least, so there is state.
+        n_params = sum(1 for i in h_instrs if i.opcode == "parameter")
+        lo = min(n_params, len(h_instrs))
+        k = random.randint(lo, len(h_instrs))
+        live = self._shape_index(h_instrs[:k])
+        tag = self._tag("state")
+        dropped, wired = set(), 0
+        for p in [i for i in d_instrs if i.opcode == "parameter"]:
+            srcs = live.get(p.type_shape())
+            if srcs:
+                self._rewire(d_instrs, p.name, random.choice(srcs), tag if not wired else None)
+                dropped.add(p.name)
+                wired += 1
+        d_instrs = self._renumber_params(h_instrs, d_instrs, dropped)
+        if not wired and d_instrs:
+            d_instrs[0].comment = tag
+        merged = h_instrs[:k] + d_instrs + h_instrs[k:]
+        return self._finish(host, comps, merged, host_root, donor_root, "state",
+                            f"state_{direction}", host_seed, donor_seed,
+                            f"State-fused {host_seed.id} <- {donor_seed.id} ({direction}; "
+                            f"spliced at {k}/{len(h_instrs)}, {wired} inputs wired)")
+
+    def fuse(self, parent_a: Seed, parent_b: Seed) -> Seed:
+        return self._fuse_state(parent_a, parent_b, "ab")
+
+    def fuse_bidirectional(self, parent_a: Seed, parent_b: Seed) -> List[Seed]:
+        return [c for c in (self._fuse_state(parent_a, parent_b, "ab"),
+                            self._fuse_state(parent_b, parent_a, "ba")) if c]
+
+
+class XLADeclarationFusionStrategy(XLAFusionStrategy):
+    """Declaration fusion for HLO: the donor's non-entry computations —
+    reducers, while bodies and conditions, fusion bodies, conditional
+    branches — are what HLO has for declarations. One of them is imported
+    and either *called* from the host entry with host values that fit
+    its parameter shapes, or substituted for a host computation of the
+    same parameter shapes in an instruction's `to_apply=`/`calls=`/
+    `body=`/`condition=` slot, so a host reduce runs the donor's reducer,
+    a host while loop runs the donor's body."""
+
+    _SWAP_SHARE = 0.4
+
+    @staticmethod
+    def _param_shapes(comp):
+        return [p.type_shape() for p in comp.params()]
+
+    def _fuse_declaration(self, host_seed: Seed, donor_seed: Seed, direction: str):
+        host, donor = self._module(host_seed), self._module(donor_seed)
+        if host is None or donor is None or not donor.non_entry():
+            return None
+        comps, _d_instrs, _dmap = self._import_donor(host, donor)
+        h_instrs = [ _hlo.HloInstr(**vars(i)) for i in host.entry().instrs ]
+        host_root = host.entry().root().name
+        h_by_shape = self._shape_index(h_instrs)
+        tag = self._tag("declaration")
+        applied = None
+        # (a) substitute a same-signature donor computation into a host slot
+        if random.random() < self._SWAP_SHARE:
+            slots = []
+            for k, ins in enumerate(h_instrs):
+                for ref in ins.computation_refs():
+                    hc = host.get(ref)
+                    if hc is None:
+                        continue
+                    sig = self._param_shapes(hc)
+                    for dc in comps:
+                        if self._param_shapes(dc) == sig and dc.root() and hc.root() and \
+                                dc.root().type_shape() == hc.root().type_shape():
+                            slots.append((k, ref, dc.name))
+            if slots:
+                k, ref, new = random.choice(slots)
+                h_instrs[k] = _hlo.rename_computation_refs(h_instrs[k], {ref: new})
+                h_instrs[k].comment = tag
+                applied = f"swap {ref} -> {new} in {h_instrs[k].name}"
+        # (b) call a donor computation with host values of the right shapes
+        if applied is None:
+            cands = []
+            for dc in comps:
+                shapes = self._param_shapes(dc)
+                if not shapes or not dc.root():
+                    continue
+                if all(s in h_by_shape for s in shapes):
+                    cands.append(dc)
+            if cands:
+                dc = random.choice(cands)
+                args = [f"%{random.choice(h_by_shape[s])}" for s in self._param_shapes(dc)]
+                name = _hlo.unique_name("ffl.call", set(i.name for i in h_instrs))
+                call = _hlo.HloInstr(name=name, shape=dc.root().shape, opcode="call",
+                                     operands=args, attrs=f", to_apply=%{dc.name}",
+                                     comment=tag)
+                h_instrs.append(call)
+                applied = f"call {dc.name}"
+                return self._finish(host, comps, h_instrs, host_root, name, "declaration",
+                                    f"decl_{direction}", host_seed, donor_seed,
+                                    f"Declaration-fused {host_seed.id} <- {donor_seed.id} "
+                                    f"({direction}; {applied})")
+        if applied is None:
+            # Untyped call: the shapes do not fit, the verifier decides.
+            dc = random.choice(comps)
+            n = len(self._param_shapes(dc))
+            if dc.root() and h_instrs:
+                args = [f"%{random.choice(h_instrs).name}" for _ in range(n)]
+                name = _hlo.unique_name("ffl.call", set(i.name for i in h_instrs))
+                h_instrs.append(_hlo.HloInstr(name=name, shape=dc.root().shape, opcode="call",
+                                              operands=args, attrs=f", to_apply=%{dc.name}",
+                                              comment=tag))
+                applied = f"untyped call {dc.name}"
+                return self._finish(host, comps, h_instrs, host_root, name, "declaration",
+                                    f"decl_{direction}", host_seed, donor_seed,
+                                    f"Declaration-fused {host_seed.id} <- {donor_seed.id} "
+                                    f"({direction}; {applied})")
+            return None
+        return self._finish(host, comps, h_instrs, host_root, host_root, "declaration",
+                            f"decl_{direction}", host_seed, donor_seed,
+                            f"Declaration-fused {host_seed.id} <- {donor_seed.id} "
+                            f"({direction}; {applied})")
+
+    def is_viable_pair(self, parent_a: Seed, parent_b: Seed) -> bool:
+        if not super().is_viable_pair(parent_a, parent_b):
+            return False
+        ma, mb = self._module(parent_a), self._module(parent_b)
+        return bool(ma.non_entry() or mb.non_entry())
+
+    def fuse(self, parent_a: Seed, parent_b: Seed) -> Seed:
+        return self._fuse_declaration(parent_a, parent_b, "ab")
+
+    def fuse_bidirectional(self, parent_a: Seed, parent_b: Seed) -> List[Seed]:
+        return [c for c in (self._fuse_declaration(parent_a, parent_b, "ab"),
+                            self._fuse_declaration(parent_b, parent_a, "ba")) if c]
+
+
 STRATEGY_REGISTRY = {
     "haskell":  _StrategySet("projects/haskell",  HaskellFusionStrategy,
                              HaskellDeclarationFusionStrategy, HaskellStateFusionStrategy),
@@ -15081,6 +15491,9 @@ STRATEGY_REGISTRY = {
                                  V8StateFusionStrategy),
     "go":       _StrategySet("projects/go",       GoFusionStrategy,
                              GoDeclarationFusionStrategy, GoStateFusionStrategy),
+    # XLA consumes HLO text modules; core/hlo_text.py reads and writes them.
+    "xla":      _StrategySet("projects/xla",      XLAFusionStrategy,
+                             XLADeclarationFusionStrategy, XLAStateFusionStrategy),
 }
 
 

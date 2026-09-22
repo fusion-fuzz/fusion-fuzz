@@ -60,6 +60,7 @@ LANGUAGE_ALIASES: Dict[str, str] = {
     "flang": "flang", "fortran": "flang", "f90": "flang",
     "mlir": "mlir",
     "triton": "mlir",
+    "xla": "xla", "hlo": "xla",
     "naga": "naga", "wgsl": "naga",
     "tint": "naga",
     "ruby": "ruby", "rb": "ruby",
@@ -245,6 +246,12 @@ LIVE_VAR_CONFIGS: Dict[str, LiveVarConfig] = {
             r'\bfn\s+\w+\s*\([^)]*\b([A-Za-z_]\w*)\s*:',
         ],
     ),
+    # HLO is SSA like MLIR: `[ROOT] name = shape op(...)` defines a value
+    # scoped to its computation's braces; names may or may not carry `%`.
+    "xla": LiveVarConfig(
+        mode="brace",
+        declare=[r'^\s*(?:ROOT\s+)?%?([A-Za-z0-9_.\-]+)\s*='],
+    ),
 }
 
 # ---------------------------------------------------------------------------
@@ -281,6 +288,7 @@ _LEXICON = {
     "flang":   {"line": ["!"], "block": [], "quotes": ['"', "'"]},
     "mlir":    {"line": ["//"], "block": [], "quotes": ['"']},
     "naga":    {"line": ["//"], "block": [("/*", "*/")], "quotes": ['"']},
+    "xla":     {"line": ["//"], "block": [("/*", "*/")], "quotes": ['"']},
 }
 
 

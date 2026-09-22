@@ -479,6 +479,7 @@ if __name__ == "__main__":
         "naga": "wgsl", "tint": "wgsl", "wgslc": "wgsl", "sql": "sql",
         "flang": "fortran", "lfortran": "fortran", "ruby": "ruby",
         "typescript": "typescript", "r": "r", "julia": "julia",
+        "xla": "hlo",
     }
     _tgt_lang = _LANG_MAP.get(args.project.lower(), args.project.lower())
 

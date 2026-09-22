@@ -654,6 +654,30 @@ class MLIRMetadataCollector(BaseMetadataCollector):
 
 
 # ---------------------------------------------------------------------------
+# XLA / HLO
+# ---------------------------------------------------------------------------
+
+class HLOMetadataCollector(BaseMetadataCollector):
+    language = "hlo"
+
+    def static_collect(self, content: str, filename: str = "") -> dict:
+        from .hlo_text import parse_module
+        meta: dict = {"line_count": len(content.splitlines())}
+        try:
+            mod = parse_module(content)
+        except Exception:
+            mod = None
+        if mod:
+            meta["functions"] = [c.name for c in mod.computations]
+            entry = mod.entry()
+            if entry is not None:
+                meta["entry"] = entry.name
+                meta["param_shapes"] = [p.type_shape() for p in entry.params()]
+                meta["opcodes"] = sorted({i.opcode for c in mod.computations for i in c.instrs})
+        return meta
+
+
+# ---------------------------------------------------------------------------
 # WGSL / naga / wgslc
 # ---------------------------------------------------------------------------
 
@@ -778,6 +802,8 @@ _COLLECTORS: Dict[str, BaseMetadataCollector] = {
     "spidermonkey": JavaScriptMetadataCollector(),
     "mlir":    MLIRMetadataCollector(),
     "triton":  MLIRMetadataCollector(),
+    "hlo":     HLOMetadataCollector(),
+    "xla":     HLOMetadataCollector(),
     "wgsl":    WGSLMetadataCollector(),
     "naga":    WGSLMetadataCollector(),
     "wgslc":   WGSLMetadataCollector(),
