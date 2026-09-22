@@ -473,13 +473,13 @@ if __name__ == "__main__":
     # entry (both stored as "wgsl") — so `--bug-corpus` injected nothing
     # for four adapters while logging success.
     _LANG_MAP = {
-        "cpython": "python", "gcc": "c", "clang": "c",
+        "cpython": "python", "gcc": "c", "clang": "c", "cuda": "cpp",
         "go": "go", "rust": "rust", "php": "php",
         "swift": "swift", "lean": "lean", "mlir": "mlir",
         "naga": "wgsl", "tint": "wgsl", "wgslc": "wgsl", "sql": "sql",
         "flang": "fortran", "lfortran": "fortran", "ruby": "ruby",
         "typescript": "typescript", "r": "r", "julia": "julia",
-        "xla": "hlo",
+        "xla": "hlo", "mojo": "mojo", "tvm": "python",
     }
     _tgt_lang = _LANG_MAP.get(args.project.lower(), args.project.lower())
 

@@ -178,7 +178,10 @@ def setup(project_root):
         # 31251 seeds in the clang/test corpus, ~21% of all executions in a
         # measured run. Building these five covers the corpus's own
         # -triple distribution (ppc64le, riscv64, aarch64, i386, x86_64).
-        targets = os.environ.get("FFL_LLVM_TARGETS", "X86;AArch64;ARM;RISCV;PowerPC")
+        # NVPTX is for projects/cuda, which compiles CUDA device code with
+        # this same clang (the CUDA frontend needs the backend for PTX and
+        # object output; syntax-only and -emit-llvm work without it).
+        targets = os.environ.get("FFL_LLVM_TARGETS", "X86;AArch64;ARM;RISCV;PowerPC;NVPTX")
 
         build_script = f"""
 set -e

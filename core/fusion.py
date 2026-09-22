@@ -6,6 +6,7 @@ import random
 import sqlite3
 import os
 import re
+import textwrap
 import io
 import logging
 import tokenize
@@ -33,6 +34,7 @@ class FusionStrategy(abc.ABC):
         "php": "//", "cpython": "#", "clang": "//", "flang": "!",
         "swift": "//", "mlir": "//", "rust": "//", "haskell": "--",
         "naga": "//", "wgsl": "//", "ruby": "#", "typescript": "//", "r": "#",
+        "mojo": "#", "tvm": "#",
         "julia": "#", "xla": "//",
     }
 
@@ -15421,6 +15423,885 @@ class XLADeclarationFusionStrategy(XLAFusionStrategy):
                             self._fuse_declaration(parent_b, parent_a, "ba")) if c]
 
 
+# ---------------------------------------------------------------------------
+# Mojo
+# ---------------------------------------------------------------------------
+#
+# Mojo is Python-shaped: indentation-scoped blocks, `def`/`struct`/`trait`/
+# `alias`/`var` at column 0, `from x import y`, and a `def main()` entry
+# point (the stdlib tests' main is `TestSuite.discover_tests[
+# __functions_in_module()]().run()`, which runs every `test_*` function in
+# the module by reflection). Python's `ast` cannot parse it, so the text
+# model below is its own: a file is a list of column-0 chunks (leading
+# comments + decorators + header + indented body), and the donor's
+# module-level names get a `_d` suffix so two files can share a module.
+#
+#   dataflow     host chunks + renamed donor chunks; one main whose body is
+#                the host's followed by the donor's, with one donor local
+#                initialised from a host local of the same declared type.
+#   state        the donor main's body spliced into the host main at a
+#                statement boundary (indentation-aware), locals renamed.
+#   declaration  the donor's declarations imported and one of its
+#                functions (or a struct constructor) called from the host
+#                main with literal or host arguments.
+
+_MOJO_KW = frozenset("""
+def struct trait alias var comptime return if elif else for while in not and or
+is pass break continue raise raises try except finally with as import from
+True False None self Self ref mut out owned read var let fn async await yield
+lambda global nonlocal del assert class print len range Int String Bool Float64
+Float32 Int32 Int64 UInt8 UInt32 UInt64 List Dict Set Optional Tuple SIMD
+""".split())
+_MOJO_HEADER_RE = re.compile(r'^(?:(def|struct|trait|alias|var|comptime)\s+([A-Za-z_]\w*)|(from|import)\s)')
+_MOJO_MAIN_RE = re.compile(r'^def\s+main\s*\(([^)]*)\)\s*(->\s*[^:]+)?\s*(raises)?\s*:')
+_MOJO_VAR_RE = re.compile(r'^(\s*)var\s+([A-Za-z_]\w*)\s*(?::\s*([^=]+?))?\s*=\s*(.+)$')
+_MOJO_ASSIGN_RE = re.compile(r'^(\s*)([A-Za-z_]\w*)\s*=\s*[^=].*$')
+_MOJO_DEF_SIG_RE = re.compile(r'^def\s+([A-Za-z_]\w*)\s*(\[[^\]]*\])?\s*\(([^)]*)\)\s*(->\s*([^:]+?))?\s*(raises)?\s*:')
+_MOJO_LITERALS = {"Int": "7", "Int32": "Int32(7)", "Int64": "Int64(7)", "UInt8": "UInt8(7)",
+                  "UInt32": "UInt32(7)", "UInt64": "UInt64(7)", "Float64": "1.5", "Float32": "Float32(1.5)",
+                  "Bool": "True", "String": '"ffl"', "StringLiteral": '"ffl"', "StringSlice": '"ffl"'}
+
+
+class _MojoChunk:
+    __slots__ = ("kind", "name", "lines", "header_idx")
+
+    def __init__(self, kind, name, lines, header_idx):
+        self.kind, self.name, self.lines, self.header_idx = kind, name, lines, header_idx
+
+    def text(self):
+        return "\n".join(self.lines)
+
+
+def _mojo_chunks(code: str):
+    """Column-0 chunks of a module. Leading comment/blank lines and
+    decorators attach to the header that follows them; a chunk runs until
+    the next column-0 line that is not blank, not a comment and not
+    indented. kind: import | main | def | struct | trait | alias | var |
+    other."""
+    lines = code.splitlines()
+    chunks, cur, i = [], [], 0
+    pending = []          # leading comments / decorators waiting for a header
+
+    def close():
+        nonlocal cur
+        if cur:
+            chunks.append(cur)
+            cur = []
+
+    depth = 0             # bracket depth: a column-0 line inside (...) continues
+    while i < len(lines):
+        ln = lines[i]
+        col0 = ln and not ln[0].isspace()
+        if depth > 0 and ln.strip():
+            (cur if cur else pending).append(ln)
+            code = re.sub(r'#.*$', '', ln)
+            code = re.sub(r'"(?:[^"\\]|\\.)*"|\'(?:[^\'\\]|\\.)*\'', '', code)
+            depth = max(0, depth + code.count("(") + code.count("[") + code.count("{")
+                        - code.count(")") - code.count("]") - code.count("}"))
+            i += 1
+            continue
+        if not ln.strip():
+            (cur if cur else pending).append(ln)
+        elif col0 and ln.lstrip().startswith("#"):
+            # a comment at column 0: part of the current body only when an
+            # indented line follows it directly
+            j = i + 1
+            while j < len(lines) and not lines[j].strip():
+                j += 1
+            if cur and j < len(lines) and lines[j][0].isspace():
+                cur.append(ln)
+            else:
+                close(); pending.append(ln)
+        elif col0 and ln.startswith("@"):
+            close(); pending.append(ln)
+        elif col0:
+            close()
+            cur = pending + [ln]; pending = []
+        else:
+            (cur if cur else pending).append(ln)
+        if ln.strip() and not ln.lstrip().startswith("#"):
+            code = re.sub(r'#.*$', '', ln)
+            code = re.sub(r'"(?:[^"\\]|\\.)*"|\'(?:[^\'\\]|\\.)*\'', '', code)
+            depth = max(0, depth + code.count("(") + code.count("[") + code.count("{")
+                        - code.count(")") - code.count("]") - code.count("}"))
+        i += 1
+    close()
+    if pending:
+        chunks.append(pending)
+
+    out = []
+    for ls in chunks:
+        header_idx = next((k for k, l in enumerate(ls) if l and not l[0].isspace()
+                           and not l.lstrip().startswith("#") and not l.startswith("@")), None)
+        if header_idx is None:
+            out.append(_MojoChunk("other", None, ls, None)); continue
+        h = ls[header_idx]
+        if _MOJO_MAIN_RE.match(h):
+            out.append(_MojoChunk("main", "main", ls, header_idx)); continue
+        m = _MOJO_HEADER_RE.match(h)
+        if not m:
+            out.append(_MojoChunk("other", None, ls, header_idx)); continue
+        if m.group(3):
+            out.append(_MojoChunk("import", None, ls, header_idx))
+        else:
+            out.append(_MojoChunk(m.group(1), m.group(2), ls, header_idx))
+    return out
+
+
+def _mojo_rename(text: str, names, suffix="_d"):
+    if not names:
+        return text
+    rx = re.compile(r'\b(' + "|".join(re.escape(n) for n in sorted(names, key=len, reverse=True)) + r')\b')
+    return rx.sub(lambda m: m.group(1) + suffix, text)
+
+
+def _mojo_body(chunk):
+    """(header line, body lines) of a main chunk, body re-indented to 4."""
+    header = chunk.lines[chunk.header_idx]
+    body = chunk.lines[chunk.header_idx + 1:]
+    while body and not body[-1].strip():
+        body.pop()
+    indents = [len(l) - len(l.lstrip()) for l in body if l.strip()]
+    base = min(indents) if indents else 4
+    fixed = []
+    for l in body:
+        if not l.strip():
+            fixed.append("")
+        else:
+            fixed.append("    " + l[base:] if len(l) - len(l.lstrip()) >= base else "    " + l.lstrip())
+    return header, fixed
+
+
+def _mojo_locals(body_lines):
+    """[(name, type-or-None, line index)] of `var` declarations at the
+    body's top level (indent 4)."""
+    out = []
+    for i, l in enumerate(body_lines):
+        m = _MOJO_VAR_RE.match(l)
+        if m and len(m.group(1)) == 4:
+            out.append((m.group(2), (m.group(3) or "").strip() or None, i))
+    return out
+
+
+def _mojo_statement_starts(body_lines):
+    """Indices of body lines that begin a top-level statement of the body
+    (indent 4, not a continuation, not an else/elif/except/finally)."""
+    starts, depth = [], 0
+    for i, l in enumerate(body_lines):
+        s = l.strip()
+        if s and len(l) - len(l.lstrip()) == 4 and depth == 0 and \
+                not re.match(r'(else|elif|except|finally|case)\b', s) and not s.startswith("#"):
+            starts.append(i)
+        code = re.sub(r'#.*$', '', l)
+        code = re.sub(r'"(?:[^"\\]|\\.)*"|\'(?:[^\'\\]|\\.)*\'', '', code)
+        depth += code.count("(") + code.count("[") + code.count("{") \
+            - code.count(")") - code.count("]") - code.count("}")
+        depth = max(depth, 0)
+    return starts
+
+
+class MojoFusionStrategy(FusionStrategy):
+    LANGUAGE = "mojo"
+    _MAX_LINES = 1500
+    _SUFFIX = "_d"
+
+    def __init__(self, project_root="projects/mojo", lightweight: bool = False):
+        self.project_root = project_root
+        self.lightweight = lightweight
+
+    def is_viable_pair(self, parent_a: Seed, parent_b: Seed) -> bool:
+        if len(parent_a.content) + len(parent_b.content) > 400_000:
+            return False
+        return (parent_a.content.count("\n") + parent_b.content.count("\n")) <= self._MAX_LINES
+
+    # ── shared pieces ──────────────────────────────────────────────────
+
+    def _split(self, code):
+        chunks = _mojo_chunks(code)
+        imports = [c for c in chunks if c.kind == "import"]
+        mains = [c for c in chunks if c.kind == "main"]
+        decls = [c for c in chunks if c.kind not in ("import", "main")]
+        return imports, (mains[0] if mains else None), decls
+
+    def _donor_names(self, decls):
+        return {c.name for c in decls if c.name and c.name not in _MOJO_KW}
+
+    def _import_donor(self, donor_code):
+        """Donor split with its module-level names suffixed everywhere in
+        the donor text (declarations, references, its main)."""
+        imports, main, decls = self._split(donor_code)
+        names = self._donor_names(decls)
+        # names the donor imports keep their spelling: they are the same
+        # symbols in the host
+        imported = set()
+        for c in imports:
+            # whole chunk: `from m import (\n a,\n b as c,\n)` spans lines
+            body = re.sub(r'#.*', '', c.text()).split("import", 1)[-1]
+            for m in re.finditer(r'\b([A-Za-z_]\w*)\b', body):
+                imported.add(m.group(1))
+        names -= imported
+        renamed = _mojo_rename(donor_code, names, self._SUFFIX)
+        imports, main, decls = self._split(renamed)
+        return imports, main, decls, names
+
+    def _merge_imports(self, host_imports, donor_imports):
+        seen, out = set(), []
+        for c in host_imports + donor_imports:
+            key = "\n".join(l.strip() for l in c.lines if l.strip() and not l.strip().startswith("#"))
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append(c.text())
+        return out
+
+    def _rename_locals(self, body_lines, host_locals):
+        """Donor main-body locals get the suffix when they collide with a
+        host local (a second `var x` in the same scope is an error)."""
+        hosts = {n for n, _t, _i in host_locals}
+        collide = {n for n, _t, _i in _mojo_locals(body_lines) if n in hosts}
+        if not collide:
+            return body_lines
+        return _mojo_rename("\n".join(body_lines), collide, self._SUFFIX).split("\n")
+
+    def _bridge(self, host_locals, donor_body, before_idx=None):
+        """Initialise one donor local from a host local of the same declared
+        type (or, failing that, the same base name); returns the edited
+        body and the tag applied."""
+        cands = []
+        for dn, dt, di in _mojo_locals(donor_body):
+            for hn, ht, hi in host_locals:
+                if before_idx is not None and hi >= before_idx:
+                    continue
+                if hn == dn:
+                    continue
+                if dt and ht and dt == ht:
+                    cands.append((2, dn, di, hn))
+                elif dt is None and ht is None and dn.rstrip(self._SUFFIX) == hn:
+                    cands.append((1, dn, di, hn))
+        if not cands:
+            return donor_body, False
+        best = max(c[0] for c in cands)
+        _s, dn, di, hn = random.choice([c for c in cands if c[0] == best])
+        m = _MOJO_VAR_RE.match(donor_body[di])
+        typ = f": {m.group(3).strip()}" if m.group(3) else ""
+        donor_body = list(donor_body)
+        donor_body[di] = f"{m.group(1)}var {dn}{typ} = {hn}  {self._tag('dataflow')}"
+        return donor_body, True
+
+    def _main_header(self, host_main, donor_main):
+        hh = host_main.lines[host_main.header_idx] if host_main else "def main():"
+        needs_raises = "raises" in hh or (donor_main is not None and
+                                          "raises" in donor_main.lines[donor_main.header_idx])
+        hh = re.sub(r'\s*raises\s*:', ":", hh)
+        if needs_raises:
+            hh = hh[:-1].rstrip() + " raises:"
+        return hh
+
+    def _assemble(self, imports, host_decls, donor_decls, main_header, body):
+        parts = []
+        if imports:
+            parts.append("\n".join(imports))
+        for c in host_decls + donor_decls:
+            parts.append(c.text())
+        parts.append(main_header + "\n" + "\n".join(body if body else ["    pass"]))
+        return "\n\n".join(p for p in parts if p.strip()) + "\n"
+
+    def _child(self, code, host, donor, mode, description):
+        return Seed(content=code, metadata={
+            "parents": [host.id, donor.id], "type": "mojo", "extension": ".mojo",
+            "mode": mode, "description": description})
+
+    # ── dataflow ───────────────────────────────────────────────────────
+
+    def _fuse_dataflow(self, host: Seed, donor: Seed, direction: str):
+        h_imports, h_main, h_decls = self._split(host.content)
+        d_imports, d_main, d_decls, _names = self._import_donor(donor.content)
+        if h_main is None and d_main is None:
+            return None
+        imports = self._merge_imports(h_imports, d_imports)
+        header = self._main_header(h_main, d_main)
+        _hh, h_body = _mojo_body(h_main) if h_main else ("", [])
+        _dh, d_body = _mojo_body(d_main) if d_main else ("", [])
+        host_locals = _mojo_locals(h_body)
+        d_body = self._rename_locals(d_body, host_locals)
+        if d_body and h_body and "\n".join(d_body).strip() == "\n".join(h_body).strip():
+            d_body = []          # both mains are the TestSuite runner: once is enough
+        d_body, bridged = self._bridge(host_locals, d_body)
+        # a `return` at the host body's top level would skip the donor
+        h_body = [l for l in h_body if not re.match(r'\s{4}return\b', l)] if d_body else h_body
+        body = h_body + ([f"    {self._tag('dataflow')}"] + d_body if d_body else [])
+        code = self._assemble(imports, h_decls, d_decls, header, body)
+        return self._child(code, host, donor, f"df_{direction}",
+                           f"Mojo dataflow fusion {host.id} + {donor.id} ({direction}, bridge={bridged})")
+
+    def fuse(self, parent_a: Seed, parent_b: Seed) -> Seed:
+        return self._fuse_dataflow(parent_a, parent_b, "ab")
+
+    def fuse_bidirectional(self, parent_a: Seed, parent_b: Seed) -> List[Seed]:
+        return [c for c in (self._fuse_dataflow(parent_a, parent_b, "ab"),
+                            self._fuse_dataflow(parent_b, parent_a, "ba")) if c]
+
+
+class MojoStateFusionStrategy(MojoFusionStrategy):
+    """Donor main body spliced into the host main at a statement boundary."""
+
+    def _fuse_state(self, host: Seed, donor: Seed, direction: str):
+        h_imports, h_main, h_decls = self._split(host.content)
+        d_imports, d_main, d_decls, _names = self._import_donor(donor.content)
+        if h_main is None or d_main is None:
+            return None
+        _hh, h_body = _mojo_body(h_main)
+        _dh, d_body = _mojo_body(d_main)
+        if not d_body or "\n".join(d_body).strip() == "\n".join(h_body).strip():
+            return None
+        starts = _mojo_statement_starts(h_body)
+        cut = random.choice(starts + [len(h_body)]) if starts else len(h_body)
+        host_locals = _mojo_locals(h_body)
+        d_body = self._rename_locals(d_body, host_locals)
+        d_body, bridged = self._bridge(host_locals, d_body, before_idx=cut)
+        body = h_body[:cut] + [f"    {self._tag('state')}"] + d_body + h_body[cut:]
+        code = self._assemble(self._merge_imports(h_imports, d_imports), h_decls, d_decls,
+                              self._main_header(h_main, d_main), body)
+        return self._child(code, host, donor, f"state_{direction}",
+                           f"Mojo state fusion {host.id} + {donor.id} at line {cut} (bridge={bridged})")
+
+    def fuse(self, parent_a: Seed, parent_b: Seed) -> Seed:
+        return self._fuse_state(parent_a, parent_b, "ab")
+
+    def fuse_bidirectional(self, parent_a: Seed, parent_b: Seed) -> List[Seed]:
+        return [c for c in (self._fuse_state(parent_a, parent_b, "ab"),
+                            self._fuse_state(parent_b, parent_a, "ba")) if c]
+
+
+class MojoDeclarationFusionStrategy(MojoFusionStrategy):
+    """Donor declarations imported; one donor function (or struct
+    constructor) called from the host main with literal or host values."""
+
+    def _call_for(self, chunk, host_locals):
+        h = chunk.lines[chunk.header_idx]
+        if chunk.kind == "def":
+            m = _MOJO_DEF_SIG_RE.match(h)
+            if not m:
+                return None
+            name, params, ret, raises = m.group(1), m.group(3).strip(), m.group(5), m.group(6)
+            args = []
+            for p in [x.strip() for x in params.split(",") if x.strip()]:
+                p = re.sub(r'^(mut|read|owned|ref|out|var)\s+', '', p)
+                if "=" in p:
+                    continue                     # defaulted: leave it out
+                pname, _, ptype = p.partition(":")
+                ptype = ptype.strip().split("=")[0].strip()
+                same = [hn for hn, ht, _i in host_locals if ht == ptype]
+                if same:
+                    args.append(random.choice(same))
+                elif ptype in _MOJO_LITERALS:
+                    args.append(_MOJO_LITERALS[ptype])
+                else:
+                    return None
+            call = f"{name}({', '.join(args)})"
+            return (f"_ = {call}" if ret else call), bool(raises)
+        if chunk.kind == "struct" and "[" not in h and \
+                re.search(r'def __init__\(\s*out self\s*\)', chunk.text()):
+            return f"_ = {chunk.name}()", False
+        return None
+
+    def _fuse_decl(self, host: Seed, donor: Seed, direction: str):
+        h_imports, h_main, h_decls = self._split(host.content)
+        d_imports, d_main, d_decls, _names = self._import_donor(donor.content)
+        if h_main is None or not d_decls:
+            return None
+        _hh, h_body = _mojo_body(h_main)
+        host_locals = _mojo_locals(h_body)
+        calls = [cr for cr in (self._call_for(d, host_locals) for d in d_decls
+                               if d.kind in ("def", "struct")) if cr]
+        if not calls:
+            return None
+        call, raises = random.choice(calls)
+        starts = _mojo_statement_starts(h_body)
+        cut = random.choice(starts + [len(h_body)]) if starts else len(h_body)
+        body = h_body[:cut] + [f"    {call}  {self._tag('declaration')}"] + h_body[cut:]
+        header = self._main_header(h_main, d_main)
+        if raises and "raises" not in header:
+            header = header[:-1].rstrip() + " raises:"
+        code = self._assemble(self._merge_imports(h_imports, d_imports), h_decls, d_decls, header, body)
+        return self._child(code, host, donor, f"decl_{direction}",
+                           f"Mojo declaration fusion {host.id} + {donor.id}: {call[:40]}")
+
+    def fuse(self, parent_a: Seed, parent_b: Seed) -> Seed:
+        return self._fuse_decl(parent_a, parent_b, "ab")
+
+    def fuse_bidirectional(self, parent_a: Seed, parent_b: Seed) -> List[Seed]:
+        return [c for c in (self._fuse_decl(parent_a, parent_b, "ab"),
+                            self._fuse_decl(parent_b, parent_a, "ba")) if c]
+
+
+# ---------------------------------------------------------------------------
+# TVM (TVMScript)
+# ---------------------------------------------------------------------------
+#
+# A seed is a Python file: imports, then one `@I.ir_module class Module:`
+# whose body holds `@T.prim_func` (TIR) and `@R.function` (Relax)
+# functions. Python's `ast` parses it, but the units of fusion are the
+# functions inside the class and their typed parameters, so the text model
+# reuses the Mojo chunker on the dedented class body.
+#
+# Types are what make a bridge legal: a TIR parameter is
+# `A: T.Buffer((16, 16), "float32")` (or a `T.handle` bound by
+# `A = T.match_buffer(a, (16, 16), "float32")`), a Relax parameter is
+# `x: R.Tensor((2, 3), "float32")`. A donor buffer is mapped to a host
+# buffer of identical shape and dtype; unmatched donor parameters are
+# appended to the host signature so the result still verifies.
+#
+#   dataflow     merged module; the donor's main body appended to the
+#                host's with buffers mapped (TIR), or the donor Relax
+#                function called on matching host tensors (Relax).
+#   state        donor TIR body spliced at a statement boundary of the
+#                host body, buffers mapped, allocations and block names
+#                suffixed.
+#   declaration  merged module with the host calling a donor function:
+#                `Module.f_d(A, B)` from TIR, `R.call_tir` from Relax.
+
+_TVM_CLASS_RE = re.compile(r'^(@I\.ir_module[^\n]*\n(?:@[^\n]*\n)*)class\s+(\w+)\s*(?:\([^)]*\))?\s*:\s*\n', re.M)
+_TVM_PARAM_RE = re.compile(r'([A-Za-z_]\w*)\s*:\s*(T\.Buffer\(\s*(\([^)]*\)|\[[^\]]*\])\s*,\s*"([a-z0-9]+)"[^)]*\)|T\.handle|R\.Tensor\(\s*(\([^)]*\)|\[[^\]]*\])\s*,\s*"([a-z0-9]+)"\s*\)|[A-Za-z_][\w.]*(?:\([^)]*\))?)')
+_TVM_MATCH_BUF_RE = re.compile(r'^\s*([A-Za-z_]\w*)\s*=\s*T\.match_buffer\(\s*([A-Za-z_]\w*)\s*,\s*(\([^)]*\)|\[[^\]]*\])\s*,\s*"([a-z0-9]+)"')
+_TVM_DEF_RE = re.compile(r'^def\s+([A-Za-z_]\w*)\s*\((.*?)\)\s*(->\s*[^:]+)?\s*:\s*$', re.S)
+_TVM_ALLOC_RE = re.compile(r'^(\s*)([A-Za-z_]\w*)\s*=\s*T\.(?:alloc_buffer|decl_buffer|match_buffer|alloc_shared)\(')
+_TVM_BLOCK_RE = re.compile(r'T\.block\(\s*"([^"]*)"')
+
+
+def _tvm_norm_shape(s):
+    return re.sub(r'\s+', '', s).replace("[", "(").replace("]", ")")
+
+
+class _TVMFunc:
+    __slots__ = ("kind", "name", "chunk", "params", "body_lines", "header_idx", "body_indent")
+
+    def __init__(self, kind, name, chunk):
+        self.kind, self.name, self.chunk = kind, name, chunk
+        self.header_idx = chunk.header_idx
+        lines = chunk.lines
+        # join a multi-line signature
+        j = self.header_idx
+        sig = lines[j]
+        while j + 1 < len(lines) and not re.search(r'\)\s*(->\s*[^:]+)?\s*:\s*$', sig):
+            j += 1
+            sig += " " + lines[j].strip()
+        self.body_lines = lines[j + 1:]
+        m = _TVM_DEF_RE.match(sig.strip())
+        raw = m.group(2) if m else ""
+        self.params = []
+        for pm in _TVM_PARAM_RE.finditer(raw):
+            pname, ptype = pm.group(1), pm.group(2)
+            if pm.group(3):
+                self.params.append((pname, "buffer", _tvm_norm_shape(pm.group(3)), pm.group(4)))
+            elif ptype == "T.handle":
+                self.params.append((pname, "handle", None, None))
+            elif pm.group(5):
+                self.params.append((pname, "tensor", _tvm_norm_shape(pm.group(5)), pm.group(6)))
+            else:
+                self.params.append((pname, "other", None, ptype))
+        indents = [len(l) - len(l.lstrip()) for l in self.body_lines if l.strip()]
+        self.body_indent = min(indents) if indents else 8
+
+    def buffers(self):
+        """[(buffer name, shape, dtype, param name)] for TIR: Buffer params
+        plus handles bound by match_buffer."""
+        out = []
+        handles = {p[0] for p in self.params if p[1] == "handle"}
+        for p in self.params:
+            if p[1] == "buffer":
+                out.append((p[0], p[2], p[3], p[0]))
+        for l in self.body_lines:
+            m = _TVM_MATCH_BUF_RE.match(l)
+            if m and m.group(2) in handles:
+                out.append((m.group(1), _tvm_norm_shape(m.group(3)), m.group(4), m.group(2)))
+        return out
+
+    def statements(self):
+        """Indices of body lines starting a statement at the body's base
+        indent, skipping match_buffer/func_attr preludes and else-branches."""
+        starts, depth = [], 0
+        for i, l in enumerate(self.body_lines):
+            s = l.strip()
+            if s and (len(l) - len(l.lstrip())) == self.body_indent and depth == 0 and \
+                    not re.match(r'(else|elif|except|finally)\b', s) and not s.startswith("#") and \
+                    "T.match_buffer" not in s and "T.func_attr" not in s and "T.evaluate(0)" not in s:
+                starts.append(i)
+            code = re.sub(r'#.*$', '', l)
+            code = re.sub(r'"(?:[^"\\]|\\.)*"', '', code)
+            depth = max(0, depth + code.count("(") + code.count("[") + code.count("{")
+                        - code.count(")") - code.count("]") - code.count("}"))
+        return starts
+
+
+class _TVMModule:
+    def __init__(self, code):
+        m = _TVM_CLASS_RE.search(code)
+        if not m:
+            raise ValueError("no @I.ir_module class")
+        self.preamble = code[:m.start()]
+        self.decorators = m.group(1)
+        self.class_name = m.group(2)
+        body = code[m.end():]
+        ded = textwrap.dedent(body)
+        self.body_chunks = _mojo_chunks(ded)
+        self.funcs = []
+        for c in self.body_chunks:
+            if c.kind == "def":
+                text = c.text()
+                kind = "prim" if "@T.prim_func" in text else ("relax" if "@R.function" in text else "other")
+                self.funcs.append(_TVMFunc(kind, c.name, c))
+
+    def render(self, extra_chunks_text=None, replace=None):
+        parts = []
+        for c in self.body_chunks:
+            t = c.text()
+            if replace and c in replace:
+                t = replace[c]
+            parts.append(t)
+        if extra_chunks_text:
+            parts.extend(extra_chunks_text)
+        body = "\n\n".join(p for p in parts if p.strip())
+        return self.preamble + self.decorators + "class Module:\n" + textwrap.indent(body, "    ") + "\n"
+
+
+def _tvm_map_buffers(host_bufs, donor_bufs):
+    """donor buffer name -> host buffer name for identical (shape, dtype);
+    each host buffer used at most once."""
+    free = list(host_bufs)
+    mapping = {}
+    for dn, ds, dt, _dp in donor_bufs:
+        for hb in free:
+            if hb[1] == ds and hb[2] == dt:
+                mapping[dn] = hb[0]
+                free.remove(hb)
+                break
+    return mapping
+
+
+def _tvm_rename_words(text, mapping):
+    if not mapping:
+        return text
+    rx = re.compile(r'\b(' + "|".join(re.escape(k) for k in sorted(mapping, key=len, reverse=True)) + r')\b')
+    return rx.sub(lambda m: mapping[m.group(1)], text)
+
+
+class TVMFusionStrategy(FusionStrategy):
+    LANGUAGE = "tvm"
+    _SUFFIX = "_d"
+    _MAX_LINES = 900
+
+    def __init__(self, project_root="projects/tvm", lightweight: bool = False):
+        self.project_root = project_root
+        self.lightweight = lightweight
+
+    def is_viable_pair(self, parent_a: Seed, parent_b: Seed) -> bool:
+        if parent_a.content.count("\n") + parent_b.content.count("\n") > self._MAX_LINES:
+            return False
+        return "@I.ir_module" in parent_a.content and "@I.ir_module" in parent_b.content
+
+    # ── shared ─────────────────────────────────────────────────────────
+
+    def _load(self, host, donor):
+        try:
+            hm, dm = _TVMModule(host.content), _TVMModule(donor.content)
+        except ValueError:
+            return None, None
+        # donor function names get a suffix everywhere in the donor text;
+        # one that would still collide with a host name (a child of a
+        # child already carries `_d`) gets a numbered one
+        host_names = {f.name for f in hm.funcs}
+        ren = {}
+        for n in {f.name for f in dm.funcs}:
+            cand, k = n + self._SUFFIX, 2
+            while cand in host_names or cand in ren.values():
+                cand, k = f"{n}{self._SUFFIX}{k}", k + 1
+            ren[n] = cand
+        renamed = _tvm_rename_words(donor.content, ren)
+        renamed = renamed.replace(f"{dm.class_name}.", "Module.")
+        # a function's exported name lives in a string attribute too, and
+        # two functions with the same global_symbol are one ICHECK away
+        renamed = re.sub(r'("global_symbol"\s*:\s*")(\w+)(")',
+                         lambda m: m.group(1) + ren.get(m.group(2), m.group(2) + self._SUFFIX) + m.group(3),
+                         renamed)
+        try:
+            dm = _TVMModule(renamed)
+        except ValueError:
+            return None, None
+        return hm, dm
+
+    def _donor_body(self, df, mapping, host_locals):
+        """Donor body lines re-indented to `indent`, buffers mapped, local
+        allocations/blocks suffixed to avoid host collisions."""
+        lines = df.body_lines
+        # drop the match_buffer lines of mapped handles (the host buffer
+        # already exists) and rename the rest
+        keep = []
+        for l in lines:
+            m = _TVM_MATCH_BUF_RE.match(l)
+            if m and m.group(1) in mapping:
+                continue
+            if "T.func_attr" in l:
+                continue
+            keep.append(l)
+        text = "\n".join(keep)
+        locs = {m.group(2) for l in keep for m in [_TVM_ALLOC_RE.match(l)] if m}
+        ren = dict(mapping)
+        for n in locs:
+            if n not in ren:
+                ren[n] = n + self._SUFFIX
+        for hl in host_locals:
+            if hl not in ren and re.search(r'\b' + re.escape(hl) + r'\b', text):
+                ren.setdefault(hl, hl + self._SUFFIX)
+        text = _tvm_rename_words(text, ren)
+        text = _TVM_BLOCK_RE.sub(lambda m: f'T.block("{m.group(1)}{self._SUFFIX}"', text)
+        out = textwrap.dedent(text).split("\n")
+        return out
+
+    def _extend_signature(self, hf, df, mapping):
+        """Host header with the donor's unmapped buffer/handle params
+        appended; returns (new header line, extra match_buffer lines)."""
+        header = hf.chunk.lines[hf.header_idx]
+        # find the signature span across lines
+        j = hf.header_idx
+        sig_lines = [header]
+        while not re.search(r'\)\s*(->\s*[^:]+)?\s*:\s*$', " ".join(sig_lines)) and j + 1 < len(hf.chunk.lines):
+            j += 1
+            sig_lines.append(hf.chunk.lines[j])
+        sig = " ".join(s.strip() for s in sig_lines)
+        extra, extra_mb = [], []
+        donor_bufs = {b[0]: b for b in df.buffers()}
+        for pname, pkind, pshape, pdtype in df.params:
+            if pkind == "buffer" and pname not in mapping:
+                extra.append(f'{pname}: T.Buffer({pshape}, "{pdtype}")')
+            elif pkind == "handle":
+                bound = [b for b in df.buffers() if b[3] == pname]
+                if bound and bound[0][0] in mapping:
+                    continue
+                extra.append(f"{pname}: T.handle")
+                for b in bound:
+                    extra_mb.append(f'{b[0]} = T.match_buffer({pname}, {b[1]}, "{b[2]}")')
+            elif pkind in ("other", "tensor") and pname not in mapping:
+                extra.append(f"{pname}: {pdtype}" if pkind == "other" else f'{pname}: R.Tensor({pshape}, "{pdtype}")')
+        if extra:
+            sig = re.sub(r'\)\s*(->\s*[^:]+)?\s*:\s*$', lambda m: (", " if "()" not in sig else "") + ", ".join(extra) + ")" + (m.group(1) or "") + ":", sig, count=1) if not sig.rstrip().endswith("():") else sig.replace("()", "(" + ", ".join(extra) + ")", 1)
+        return sig, extra_mb, (hf.header_idx, j)
+
+    def _rebuild_func(self, hf, new_sig, span, new_body):
+        lines = hf.chunk.lines
+        head = lines[:span[0]] + [new_sig]
+        ind = " " * hf.body_indent
+        body = [ind + l if l.strip() else l for l in new_body]
+        return "\n".join(head + body)
+
+    def _child(self, code, host, donor, mode, desc):
+        return Seed(content=code, metadata={"parents": [host.id, donor.id], "type": "tvm",
+                                            "extension": ".py", "mode": mode, "description": desc})
+
+    def _merged_module(self, hm, dm, replace=None):
+        extra = [c.text() for c in dm.body_chunks if c.kind == "def" or "module_attrs" not in c.text()]
+        return hm.render(extra_chunks_text=extra, replace=replace)
+
+    # ── TIR body combination shared by dataflow and state ─────────────
+
+    def _combine_tir(self, hm, dm, hf, df, cut):
+        host_bufs = hf.buffers()
+        mapping = _tvm_map_buffers(host_bufs, df.buffers())
+        host_locals = {m.group(2) for l in hf.body_lines for m in [_TVM_ALLOC_RE.match(l)] if m}
+        d_body = self._donor_body(df, mapping, host_locals)
+        new_sig, extra_mb, span = self._extend_signature(hf, df, mapping)
+        h_body = [l[hf.body_indent:] if l.strip() else l for l in hf.body_lines]
+        stmts = hf.statements()
+        # keep match_buffer/func_attr prelude before any insertion point
+        prelude_end = 0
+        for i, l in enumerate(h_body):
+            if "T.match_buffer" in l or "T.func_attr" in l:
+                prelude_end = i + 1
+        if cut is None:
+            cut = len(h_body)
+        else:
+            cut = max(cut, prelude_end)
+        tag = self._tag("state" if cut < len(h_body) else "dataflow")
+        body = h_body[:prelude_end] + extra_mb + h_body[prelude_end:cut] + [tag] + d_body + h_body[cut:]
+        new_text = self._rebuild_func(hf, new_sig, span, body)
+        return new_text, mapping
+
+    # ── dataflow ───────────────────────────────────────────────────────
+
+    def _fuse_dataflow(self, host, donor, direction):
+        hm, dm = self._load(host, donor)
+        if hm is None:
+            return None
+        h_prims = [f for f in hm.funcs if f.kind == "prim"]
+        d_prims = [f for f in dm.funcs if f.kind == "prim"]
+        h_relax = [f for f in hm.funcs if f.kind == "relax"]
+        d_relax = [f for f in dm.funcs if f.kind == "relax"]
+        if h_prims and d_prims and (not h_relax or random.random() < 0.5):
+            hf, df = random.choice(h_prims), random.choice(d_prims)
+            new_text, mapping = self._combine_tir(hm, dm, hf, df, None)
+            extra = [c.text() for c in dm.body_chunks if c.kind == "def" and c is not df.chunk]
+            code = hm.render(extra_chunks_text=extra, replace={hf.chunk: new_text})
+            return self._child(code, host, donor, f"df_{direction}",
+                               f"TVM dataflow {host.id}+{donor.id}: {df.name} appended to {hf.name}, {len(mapping)} buffers shared")
+        if h_relax and d_relax:
+            hf = random.choice(h_relax)
+            df = random.choice(d_relax)
+            call = self._relax_call(hf, df)
+            code = self._merged_module(hm, dm, replace=({hf.chunk: call[0]} if call else None))
+            return self._child(code, host, donor, f"df_{direction}",
+                               f"TVM dataflow {host.id}+{donor.id}: relax {df.name} {'called from' if call else 'merged into'} {hf.name}")
+        code = self._merged_module(hm, dm)
+        return self._child(code, host, donor, f"df_{direction}", f"TVM module merge {host.id}+{donor.id}")
+
+    def _relax_call(self, hf, df):
+        """Host relax body with `lv = Module.df(args)` inserted, args being
+        host params of identical R.Tensor signature; None if not typable."""
+        host_params = [(n, s, d) for n, k, s, d in hf.params if k == "tensor"]
+        args = []
+        for n, k, s, d in df.params:
+            if k != "tensor":
+                return None
+            cands = [hp for hp in host_params if hp[1] == s and hp[2] == d]
+            if not cands:
+                return None
+            args.append(random.choice(cands)[0])
+        ind = " " * hf.body_indent
+        stmt = f"{ind}ffl_call{self._SUFFIX} = Module.{df.name}({', '.join(args)})  {self._tag('dataflow')}"
+        lines = hf.chunk.lines
+        # insert after the signature, before the body (dataflow blocks are
+        # fine to precede: the call is a plain binding)
+        j = hf.header_idx
+        while j + 1 < len(lines) and not re.search(r'\)\s*(->\s*[^:]+)?\s*:\s*$', " ".join(lines[hf.header_idx:j + 1])):
+            j += 1
+        new = lines[:j + 1] + [stmt] + lines[j + 1:]
+        return ("\n".join(new),)
+
+    def fuse(self, parent_a: Seed, parent_b: Seed) -> Seed:
+        return self._fuse_dataflow(parent_a, parent_b, "ab")
+
+    def fuse_bidirectional(self, parent_a: Seed, parent_b: Seed) -> List[Seed]:
+        return [c for c in (self._fuse_dataflow(parent_a, parent_b, "ab"),
+                            self._fuse_dataflow(parent_b, parent_a, "ba")) if c]
+
+
+class TVMStateFusionStrategy(TVMFusionStrategy):
+    def _fuse_state(self, host, donor, direction):
+        hm, dm = self._load(host, donor)
+        if hm is None:
+            return None
+        h_prims = [f for f in hm.funcs if f.kind == "prim"]
+        d_prims = [f for f in dm.funcs if f.kind == "prim"]
+        if not h_prims or not d_prims:
+            return None
+        hf, df = random.choice(h_prims), random.choice(d_prims)
+        stmts = hf.statements()
+        if not stmts:
+            return None
+        cut = random.choice(stmts)
+        new_text, mapping = self._combine_tir(hm, dm, hf, df, cut)
+        extra = [c.text() for c in dm.body_chunks if c.kind == "def" and c is not df.chunk]
+        code = hm.render(extra_chunks_text=extra, replace={hf.chunk: new_text})
+        return self._child(code, host, donor, f"state_{direction}",
+                           f"TVM state {host.id}+{donor.id}: {df.name} spliced into {hf.name} at {cut}, {len(mapping)} buffers shared")
+
+    def fuse(self, parent_a: Seed, parent_b: Seed) -> Seed:
+        return self._fuse_state(parent_a, parent_b, "ab")
+
+    def fuse_bidirectional(self, parent_a: Seed, parent_b: Seed) -> List[Seed]:
+        return [c for c in (self._fuse_state(parent_a, parent_b, "ab"),
+                            self._fuse_state(parent_b, parent_a, "ba")) if c]
+
+
+class TVMDeclarationFusionStrategy(TVMFusionStrategy):
+    def _fuse_decl(self, host, donor, direction):
+        hm, dm = self._load(host, donor)
+        if hm is None:
+            return None
+        d_prims = [f for f in dm.funcs if f.kind == "prim"]
+        h_prims = [f for f in hm.funcs if f.kind == "prim"]
+        h_relax = [f for f in hm.funcs if f.kind == "relax"]
+        if not d_prims:
+            return None
+        df = random.choice(d_prims)
+        dbufs = df.buffers()
+        if h_relax and random.random() < 0.6:
+            hf = random.choice(h_relax)
+            host_t = [(n, s, d) for n, k, s, d in hf.params if k == "tensor"]
+            if len(dbufs) < 2 or [p for p in df.params if p[1] not in ("buffer", "handle")]:
+                return None
+            ins, out = dbufs[:-1], dbufs[-1]
+            args = []
+            for _bn, s, d, _p in ins:
+                c = [hp for hp in host_t if hp[1] == s and hp[2] == d]
+                if not c:
+                    return None
+                args.append(random.choice(c)[0])
+            ind = " " * hf.body_indent
+            stmt = (f"{ind}ffl_tir{self._SUFFIX} = R.call_tir(Module.{df.name}, ({', '.join(args)},), "
+                    f'out_sinfo=R.Tensor({out[1]}, "{out[2]}"))  {self._tag("declaration")}')
+            lines = hf.chunk.lines
+            j = hf.header_idx
+            while j + 1 < len(lines) and not re.search(r'\)\s*(->\s*[^:]+)?\s*:\s*$', " ".join(lines[hf.header_idx:j + 1])):
+                j += 1
+            new = "\n".join(lines[:j + 1] + [stmt] + lines[j + 1:])
+            code = self._merged_module(hm, dm, replace={hf.chunk: new})
+            return self._child(code, host, donor, f"decl_{direction}",
+                               f"TVM declaration {host.id}+{donor.id}: R.call_tir(Module.{df.name})")
+        if not h_prims:
+            return None
+        hf = random.choice(h_prims)
+        mapping = _tvm_map_buffers(hf.buffers(), dbufs)
+        if [p for p in df.params if p[1] not in ("buffer", "handle")]:
+            return None
+        args = []
+        for pname, pkind, _s, _d in df.params:
+            bn = pname if pkind == "buffer" else next((b[0] for b in dbufs if b[3] == pname), None)
+            if bn is None or bn not in mapping:
+                return None
+            args.append(mapping[bn])
+        stmts = hf.statements()
+        h_body = [l[hf.body_indent:] if l.strip() else l for l in hf.body_lines]
+        cut = random.choice(stmts + [len(h_body)]) if stmts else len(h_body)
+        call = f"Module.{df.name}({', '.join(args)})  {self._tag('declaration')}"
+        body = h_body[:cut] + [call] + h_body[cut:]
+        header = hf.chunk.lines[hf.header_idx]
+        new_sig, _mb, span = self._extend_signature(hf, df, {b[0]: b[0] for b in dbufs})
+        new_text = self._rebuild_func(hf, header if span[1] == span[0] else " ".join(s.strip() for s in hf.chunk.lines[span[0]:span[1] + 1]), span, body)
+        extra = [c.text() for c in dm.body_chunks if c.kind == "def"]
+        code = hm.render(extra_chunks_text=extra, replace={hf.chunk: new_text})
+        return self._child(code, host, donor, f"decl_{direction}",
+                           f"TVM declaration {host.id}+{donor.id}: {call[:50]}")
+
+    def fuse(self, parent_a: Seed, parent_b: Seed) -> Seed:
+        return self._fuse_decl(parent_a, parent_b, "ab")
+
+    def fuse_bidirectional(self, parent_a: Seed, parent_b: Seed) -> List[Seed]:
+        return [c for c in (self._fuse_decl(parent_a, parent_b, "ab"),
+                            self._fuse_decl(parent_b, parent_a, "ba")) if c]
+
+
+class _CUDALangMixin:
+    """`.cu` in, `.cu` out: CUDA sources are C++ already, so the C-to-C++
+    spelling rewrite is a no-op and the child never becomes a .c file."""
+    def _result_lang(self, meta_a, meta_b, cxx_required=False):
+        return ".cu", "cuda"
+
+    def _cxx_compat(self, code, meta_a, meta_b, seed_type):
+        return code
+
+
+class CUDAFusionStrategy(_CUDALangMixin, ClangFusionStrategy):
+    LANGUAGE = "cuda"
+
+
+class CUDADeclarationFusionStrategy(_CUDALangMixin, ClangDeclarationFusionStrategy):
+    LANGUAGE = "cuda"
+
+
+class CUDAStateFusionStrategy(_CUDALangMixin, ClangStateFusionStrategy):
+    LANGUAGE = "cuda"
+
+
 STRATEGY_REGISTRY = {
     "haskell":  _StrategySet("projects/haskell",  HaskellFusionStrategy,
                              HaskellDeclarationFusionStrategy, HaskellStateFusionStrategy),
@@ -15435,6 +16316,11 @@ STRATEGY_REGISTRY = {
     # the crash oracle, which are per-project files already.
     "gcc":      _StrategySet("projects/gcc",      ClangFusionStrategy,
                              ClangDeclarationFusionStrategy, ClangStateFusionStrategy),
+    # CUDA is C++ with attributes; the clang strategies apply as they are,
+    # except that every child must stay a .cu file (the clang extension
+    # logic would file it as .c): CUDA* below pin the result language.
+    "cuda":     _StrategySet("projects/cuda",     CUDAFusionStrategy,
+                             CUDADeclarationFusionStrategy, CUDAStateFusionStrategy),
     "flang":    _StrategySet("projects/flang",    FlangFusionStrategy,
                              FlangDeclarationFusionStrategy, FlangStateFusionStrategy),
     "lfortran": _StrategySet("projects/lfortran", LFortranFusionStrategy,
@@ -15492,6 +16378,10 @@ STRATEGY_REGISTRY = {
     "go":       _StrategySet("projects/go",       GoFusionStrategy,
                              GoDeclarationFusionStrategy, GoStateFusionStrategy),
     # XLA consumes HLO text modules; core/hlo_text.py reads and writes them.
+    "tvm":      _StrategySet("projects/tvm",      TVMFusionStrategy,
+                             TVMDeclarationFusionStrategy, TVMStateFusionStrategy),
+    "mojo":     _StrategySet("projects/mojo",     MojoFusionStrategy,
+                             MojoDeclarationFusionStrategy, MojoStateFusionStrategy),
     "xla":      _StrategySet("projects/xla",      XLAFusionStrategy,
                              XLADeclarationFusionStrategy, XLAStateFusionStrategy),
 }

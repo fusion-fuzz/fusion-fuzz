@@ -55,12 +55,14 @@ LANGUAGE_ALIASES: Dict[str, str] = {
     "go": "go",
     "c": "clang", "cpp": "clang", "cxx": "clang", "clang": "clang",
     "objc": "clang", "objcpp": "clang", "m": "clang", "mm": "clang",
+    "cuda": "clang", "cu": "clang",
     "swift": "swift",
     "haskell": "haskell", "hs": "haskell", "ghc": "haskell",
     "flang": "flang", "fortran": "flang", "f90": "flang",
     "mlir": "mlir",
     "triton": "mlir",
     "xla": "xla", "hlo": "xla",
+    "mojo": "mojo", "tvm": "cpython", "tvmscript": "cpython",
     "naga": "naga", "wgsl": "naga",
     "tint": "naga",
     "ruby": "ruby", "rb": "ruby",
@@ -248,6 +250,14 @@ LIVE_VAR_CONFIGS: Dict[str, LiveVarConfig] = {
     ),
     # HLO is SSA like MLIR: `[ROOT] name = shape op(...)` defines a value
     # scoped to its computation's braces; names may or may not carry `%`.
+    # Mojo: Python-shaped; `var x = ...`, plain assignment, `for x in`.
+    "mojo": LiveVarConfig(
+        mode="flat",
+        declare=[r'^\s*(?:var\s+)?([A-Za-z_]\w*)\s*(?::[^=]+)?=(?!=)',
+                 r'\bfor\s+([A-Za-z_]\w*)\s+in\b'],
+        decrement=[],
+        reset=[r'^(?:def|struct|trait)\s+\w+'],
+    ),
     "xla": LiveVarConfig(
         mode="brace",
         declare=[r'^\s*(?:ROOT\s+)?%?([A-Za-z0-9_.\-]+)\s*='],
@@ -289,6 +299,7 @@ _LEXICON = {
     "mlir":    {"line": ["//"], "block": [], "quotes": ['"']},
     "naga":    {"line": ["//"], "block": [("/*", "*/")], "quotes": ['"']},
     "xla":     {"line": ["//"], "block": [("/*", "*/")], "quotes": ['"']},
+    "mojo":    {"line": ["#"], "block": [], "quotes": ['"""', '"', "'"]},
 }
 
 

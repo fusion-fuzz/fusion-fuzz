@@ -208,3 +208,26 @@ projects/swift/seeds/
 # sources are versioned.
 projects/xla/xla/
 projects/xla/bin/
+
+# CUDA project — the cuda-samples checkout, the optional llvm-project
+# sparse clone, the seed tree derived from both and the toolchain record
+# are all produced by projects/cuda/setup.py.
+projects/cuda/cuda-samples/
+projects/cuda/llvm-project/
+projects/cuda/seeds/
+projects/cuda/toolchain.json
+
+# Mojo project — the modular/modular checkout, the Bazel-built compiler,
+# the released-wheel venv, the seed tree and the toolchain record are all
+# produced by projects/mojo/setup.py.
+projects/mojo/modular/
+projects/mojo/bin/
+projects/mojo/venv/
+projects/mojo/wheels/
+projects/mojo/seeds/
+projects/mojo/toolchain.json
+
+# TVM project — the apache/tvm checkout (with its build/ tree) and the
+# seeds extracted from its tests are produced by projects/tvm/setup.py.
+projects/tvm/tvm/
+projects/tvm/seeds/
