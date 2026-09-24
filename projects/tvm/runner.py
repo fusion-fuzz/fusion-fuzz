@@ -76,7 +76,10 @@ _TARGET_PRECONDITION_RE = re.compile(
     # the module carries undefined variables (the well-formedness
     # complaint a later pass makes), or a Relax operator that a legalise
     # pass was supposed to lower first
-    r"undefined\.size\(\) == 0|cannot emit this Relax operator directly", re.I)
+    r"undefined\.size\(\) == 0|cannot emit this Relax operator directly|"
+    # a codegen stating a type or memory scope it does not implement
+    r"do not support|only supports? \w+|Cannot allocate global memory|"
+    r"Device kernel may only contain", re.I)
 
 _PRECONDITION_RE = re.compile(r"Require the|must be called|context required|Please set|"
                               r"should be run|expected to be run|only supports|not supported|"
@@ -454,13 +457,16 @@ def main():
         else str(_make_target(target).kind)
     if target_kind in GPU_KINDS:
         srcs = _device_sources(lib)
-        problem = _check_device_source(srcs, target_kind)
+        # Only meaningful when the module has kernels to emit: a module
+        # that is all host code (a Relax function calling nothing on the
+        # device) legitimately produces no device module.
+        problem = _check_device_source(srcs, target_kind) if _has_thread_binding(mod) else None
         if problem:
             # A GPU target that produced no device code at all: the kernel
             # was dropped somewhere in lowering. Reported as a finding, not
             # a rejection — the module compiled without an error.
             print(f"FFL_NO_DEVICE_CODE {target_kind}: {problem}"); sys.exit(5)
-        if args.nvcc_arch and target_kind == "cuda":
+        if args.nvcc_arch and target_kind == "cuda" and srcs:
             nvcc = shutil.which("nvcc")
             if nvcc:
                 rc, out = _cross_compile_cuda(srcs[0][1], args.nvcc_arch, nvcc)
