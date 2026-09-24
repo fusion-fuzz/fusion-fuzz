@@ -44,7 +44,22 @@ class CUDADriver(BaseDriver):
     CLANG_SHARE = 0.6
     ARCHS = ["sm_52", "sm_60", "sm_61", "sm_70", "sm_75", "sm_80", "sm_86", "sm_89", "sm_90", "sm_90a"]
     ARCH_WEIGHTS = [1, 1, 1, 2, 2, 4, 2, 2, 4, 1]
-    NVCC_EXTRA_ARCHS = ["sm_100", "sm_120", "compute_80", "compute_90"]
+    # nvcc 13 knows the Blackwell parts and the family/arch-specific
+    # variants; `all-major` compiles one SASS per major generation and is
+    # the heaviest single configuration, so it is drawn least.
+    NVCC_EXTRA_ARCHS = ["sm_100", "sm_100a", "sm_103", "sm_120", "sm_120a", "sm_121"]
+    NVCC_EXTRA_WEIGHTS = [2, 1, 1, 2, 1, 1]
+    #: Virtual (PTX-only) architectures. nvcc refuses `--cubin`/`-c`/
+    #: `--fatbin` for one of these ("not allowed when compiling for a
+    #: virtual compute architecture"), so they are only drawn for `--ptx`.
+    NVCC_VIRTUAL_ARCHS = ["compute_75", "compute_80", "compute_90", "compute_100", "compute_120"]
+    #: How often several device architectures are compiled at once, so the
+    #: fat-binary path and per-arch specialisation run. nvcc allows that
+    #: only for the modes that produce an object or a fatbin; `--ptx` and
+    #: `--cubin` are refused ("not allowed when compiling for multiple GPU
+    #: code instances"), so the draw is conditioned on the mode.
+    MULTI_ARCH_SHARE = 0.25
+    NVCC_MULTI_ARCH_MODES = ("-c", "--fatbin", "-dc")
     STD = ["c++14", "c++17", "c++17", "c++20", "c++20", "c++23"]
     OPT = ["-O0", "-O1", "-O2", "-O2", "-O3", "-O3", "-Os"]
     # (flags, tool tag) — side + depth for clang
@@ -65,6 +80,13 @@ class CUDADriver(BaseDriver):
         "-fno-strict-aliasing", "-fno-exceptions", "-fno-rtti", "-fcuda-is-device",
         "-Xclang -fcuda-allow-variadic-functions", "-fgpu-approx-transcendentals",
         "-mllvm -nvptx-sched4reg", "-fno-gpu-rdc", "-fstrict-enums", "-fvectorize",
+        # ptxas / device-side back-end knobs (device-only and full compiles)
+        "-Xcuda-ptxas -O0", "-Xcuda-ptxas -O3", "-Xcuda-ptxas --allow-expensive-optimizations=true",
+        "-Xcuda-ptxas --maxrregcount=32", "--cuda-noopt-device-debug", "-fno-cuda-flush-denormals-to-zero",
+        "-mllvm -nvptx-prec-divf32=0", "-mllvm -nvptx-prec-sqrtf32=0", "-mllvm -nvptx-fma-level=0",
+        "-fno-vectorize", "-fno-unroll-loops", "-fdenormal-fp-math=preserve-sign",
+        "-Xclang -disable-llvm-passes", "-Xclang -disable-llvm-optzns", "-fno-gpu-defer-diag",
+        "-fcuda-short-ptr -fgpu-rdc",
     ]
     NVCC_MODES = [
         ("--ptx -o /dev/null", 30),
@@ -79,6 +101,13 @@ class CUDADriver(BaseDriver):
         "--fmad=false", "--ftz=true", "--prec-div=false", "--prec-sqrt=false",
         "-G", "-rdc=true", "-Xcicc -O0", "--restrict", "-std=c++17", "-Wno-deprecated-gpu-targets",
         "--device-debug", "-maxrregcount=32", "--extra-device-vectorization",
+        # ptxas and cicc knobs, device-link optimisation, threading
+        "-Xptxas -O1", "-Xptxas -O2", "-Xptxas --allow-expensive-optimizations=true",
+        "-Xptxas --def-load-cache=cg", "-Xptxas --warn-on-spills", "-Xptxas --disable-optimizer-constants",
+        "-Xcicc -O3", "-dopt on", "--split-compile=2", "--generate-line-info",
+        "-default-stream per-thread", "--display-error-number", "-Xcompiler -fno-strict-aliasing",
+        "--no-host-device-initializer-list", "--no-host-device-move-forward",
+        "-Xptxas --fmad=false", "-Xnvlink -O0",
     ]
 
     def __init__(self, config):
@@ -106,12 +135,23 @@ class CUDADriver(BaseDriver):
 
     def _clang_command(self, seed_file, dryrun):
         arch = random.choices(self.ARCHS, weights=self.ARCH_WEIGHTS, k=1)[0]
-        base = (f"{self.clang} -x cuda --cuda-path={self.cuda_path} --cuda-gpu-arch={arch} "
+        archs = f"--cuda-gpu-arch={arch}"
+        multi = not dryrun and random.random() < self.MULTI_ARCH_SHARE
+        if multi:
+            second = random.choice([a for a in self.ARCHS if a != arch])
+            archs += f" --cuda-gpu-arch={second}"
+        base = (f"{self.clang} -x cuda --cuda-path={self.cuda_path} {archs} "
                 f"-Wno-unknown-cuda-version -Wno-everything -ferror-limit=5 {self._includes()}")
         if dryrun:
             return f"{base} --cuda-device-only -fsyntax-only {seed_file}"
         modes, weights = zip(*self.CLANG_MODES)
         mode = random.choices(modes, weights=weights, k=1)[0]
+        if multi:
+            # clang writes one file per device arch and refuses `-o` then
+            # ("cannot specify -o when generating multiple output files");
+            # -fsyntax-only has no output, the others write next to $PWD
+            # (the per-run work directory, removed afterwards)
+            mode = mode.replace(" -o /dev/null", "")
         flags = [mode, random.choice(self.OPT), f"-std={random.choice(self.STD)}"]
         k = random.choice([0, 1, 1, 2, 3])
         flags += random.sample(self.CLANG_FLAGS, k)
@@ -121,13 +161,28 @@ class CUDADriver(BaseDriver):
         return f"{base} {' '.join(flags)} {seed_file}"
 
     def _nvcc_command(self, seed_file, dryrun):
-        arch = random.choices(self.ARCHS + self.NVCC_EXTRA_ARCHS,
-                              weights=self.ARCH_WEIGHTS + [1, 1, 1, 1], k=1)[0]
-        base = f"{self.nvcc} -arch={arch} -w {self._includes()}"
+        real_archs = self.ARCHS + self.NVCC_EXTRA_ARCHS
+        real_weights = self.ARCH_WEIGHTS + self.NVCC_EXTRA_WEIGHTS
         if dryrun:
-            return f"{base} --ptx -o /dev/null {seed_file}"
+            arch = random.choices(real_archs, weights=real_weights, k=1)[0]
+            return (f"{self.nvcc} -arch={arch} -w {self._includes()} "
+                    f"--ptx -o /dev/null {seed_file}")
         modes, weights = zip(*self.NVCC_MODES)
         mode = random.choices(modes, weights=weights, k=1)[0]
+        head = mode.split()[0]
+        if head == "--ptx" and random.random() < 0.25:
+            # PTX for a virtual architecture: the cicc side only, no SASS
+            archs = f"-arch={random.choice(self.NVCC_VIRTUAL_ARCHS)}"
+        elif head in self.NVCC_MULTI_ARCH_MODES and random.random() < self.MULTI_ARCH_SHARE:
+            if random.random() < 0.3:
+                archs = "-arch=all-major"      # one SASS per major generation
+            else:
+                picks = random.sample([a for a in real_archs if a[-1].isdigit()], 2)
+                archs = " ".join(f"-gencode arch=compute_{a[3:]},code={a}" for a in picks)
+        else:
+            arch = random.choices(real_archs, weights=real_weights, k=1)[0]
+            archs = f"-arch={arch}"
+        base = f"{self.nvcc} {archs} -w {self._includes()}"
         flags = [mode, random.choice(self.OPT)]
         std = random.choice(self.STD)
         if std != "c++23":                      # nvcc 12.8 stops at c++20
@@ -135,7 +190,10 @@ class CUDADriver(BaseDriver):
         k = random.choice([0, 1, 1, 2, 3])
         flags += random.sample(self.NVCC_FLAGS, k)
         if "-G" in flags or "--device-debug" in flags:
-            flags = [f for f in flags if not f.startswith("-Xptxas") and f != "-lineinfo"]
+            flags = [f for f in flags if not f.startswith("-Xptxas") and f != "-lineinfo"
+                     and f not in ("--generate-line-info", "-dopt on", "--split-compile=2")]
+        if "-dopt on" in flags and mode.split()[0] not in ("-dc", "-c"):
+            flags.remove("-dopt on")          # device-link optimisation needs a link step
         if mode.startswith("-dc") and "-rdc=true" in flags:
             flags.remove("-rdc=true")
         return f"{base} {' '.join(flags)} {seed_file}"

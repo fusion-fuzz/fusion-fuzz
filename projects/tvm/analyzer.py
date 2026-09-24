@@ -46,6 +46,11 @@ _LLVM_ERROR_RE = re.compile(r"LLVM ERROR:\s*([^\n]+)")
 _SAN_RE = re.compile(r"SUMMARY: (\w+Sanitizer):\s*([^\n]+)")
 _SIGNAL_RE = re.compile(r"^(Segmentation fault|Aborted|Illegal instruction|Bus error|Floating point exception)", re.M)
 _MISMATCH_RE = re.compile(r"FFL_MISMATCH ([^\n]+)")
+#: `TVM_FFI_THROW(InternalError) << "msg"` and `ICHECK_EQ` render without
+#: the "Check failed:" prefix the pattern above needs; the Python side
+#: shows them as `tvm.error.InternalError: <msg>` (last line of the
+#: traceback). Without this the signature came out as bare "ICHECK".
+_TVM_ERROR_RE = re.compile(r"^tvm\.error\.(\w+): ([^\n]{1,160})", re.M)
 _STACK_TOP_RE = re.compile(r"^\s*\d+:\s+(?:0x[0-9a-f]+\s+)?(tvm::[\w:<>]+)", re.M)
 
 
@@ -90,6 +95,18 @@ def classify(output, tool="build", return_code=None):
         where = f"{_short(m.group(1))}:{m.group(2)} " if m else ""
         msg = m.group(3) if m else (re.search(r"Check failed:\s*([^\n]{0,80})", out).group(1)
                                     if re.search(r"Check failed:", out) else "")
+        if not msg:
+            # a TVM_FFI_THROW / ICHECK_EQ message: no "Check failed:" text,
+            # only the Python-side `tvm.error.InternalError: <msg>` line
+            e = _TVM_ERROR_RE.search(out)
+            if e:
+                msg = e.group(2)
+                if not where:
+                    # the deepest TVM source frame named in the traceback is
+                    # where it was thrown
+                    frames = re.findall(r'File "[^"]*?/tvm/src/([\w/.\-]+)", line (\d+)', out)
+                    if frames:
+                        where = f"{_short(frames[-1][0])}:{frames[-1][1]} "
         return hit("check", f"ICHECK {where}{_normalize(msg)[:70]}".strip())
     m = _MISMATCH_RE.search(out)
     if m:

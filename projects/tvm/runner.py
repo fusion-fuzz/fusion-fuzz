@@ -30,7 +30,9 @@ LLVM assertion) kill the process before any marker.
 """
 
 import argparse
+import os
 import random
+import shutil
 import sys
 import traceback
 
@@ -46,6 +48,36 @@ _PIPELINE_ONLY_RE = re.compile(r"Lower|MakePacked|SplitHost|Thread|Warp|Device|V
                                r"Combine|Merge|Legalize|Attach|Realize|Lift|Manifest|Convert|"
                                r"Extract|Default|Verify|Apply|Instrument|Profile|Debug|Random|"
                                r"Texture|Async|Pipeline|Ptx|Cuda|Vulkan|Metal|OpenCL|Hexagon|Fp8|Fp16")
+#: The target refusing the module, not an invariant of its own: a device
+#: capability the drawn target does not declare (Vulkan's Int8/Int64/
+#: Float16 capabilities, a shared-memory or thread limit), a toolchain the
+#: image does not have (ROCm device bitcode), or a codegen limit stated in
+#: the message. All of these are rejections of the input for that target.
+_TARGET_PRECONDITION_RE = re.compile(
+    r"does not support \w+ capability|please either add -support|"
+    r"could not find bitcode|Cannot find (?:CUDA|ROCm) path|"
+    r"cannot be larger than|exceeds? the (?:maximum|limit)|"
+    r"does not support (?:the )?(?:dtype|data type|type)|"
+    r"not supported (?:by|on|for) (?:this )?target|no longer supported|"
+    r"Unsupported (?:dtype|data type|type|target|device)|"
+    # structural: a GPU codegen needs kernels (thread bindings) and only
+    # allows shared/local allocations inside one. A module that has none
+    # is not a program for that target.
+    r"Can only allocate shared or local memory inside kernel|"
+    r"thread (?:extent|binding).*(?:not|missing)|"
+    r"must be called after|expects? to be run after|"
+    r"cannot be scheduled|no thread (?:axis|binding)|"
+    # the tirx pipeline saying it cannot lower this module for this target
+    # (it prints the whole program after the message)
+    r"Failed to lower the TIRx program|"
+    # the module itself is ill-formed for any backend: two exported
+    # PrimFuncs with the same global_symbol
+    r"Duplicate PrimFunc global_symbol|"
+    # the module carries undefined variables (the well-formedness
+    # complaint a later pass makes), or a Relax operator that a legalise
+    # pass was supposed to lower first
+    r"undefined\.size\(\) == 0|cannot emit this Relax operator directly", re.I)
+
 _PRECONDITION_RE = re.compile(r"Require the|must be called|context required|Please set|"
                               r"should be run|expected to be run|only supports|not supported|"
                               r"is not supported|already exists|Unknown device id|requires? .*pass",
@@ -104,6 +136,17 @@ def _is_static(shape):
     return all(isinstance(int(d) if hasattr(d, "value") or isinstance(d, int) else d, int) for d in shape) if shape else True
 
 
+def _has_thread_binding(mod):
+    """True when some function already binds a thread axis — printing the
+    module is enough to tell, and is version-independent."""
+    try:
+        text = mod.script()
+    except Exception:
+        return False
+    return ("thread_binding" in text or "launch_thread" in text
+            or "env_thread" in text or "threadIdx" in text)
+
+
 def _entry(mod):
     """(kind, name, params) of a runnable entry: a Relax `main` or a
     PrimFunc whose parameters are all static tensors/buffers. In this TVM
@@ -160,10 +203,39 @@ def _random_inputs(params, rng):
     return arrays
 
 
+#: Target kinds whose codegen emits device code. All of them are
+#: compile-only here: no GPU is present, and nothing is ever launched.
+#: `cuda`, `opencl`, `metal` and `webgpu` are source-level codegens (CUDA
+#: C++, OpenCL C, Metal, WGSL) and need no toolkit at all; `nvptx` and
+#: `rocm` go through LLVM's NVPTX/AMDGPU back ends and need libdevice /
+#: the ROCm device bitcode; `vulkan` needs a USE_VULKAN build (SPIR-V).
+GPU_KINDS = ("cuda", "nvptx", "rocm", "vulkan", "opencl", "metal", "webgpu")
+
+#: Integer target options that are device limits rather than ISA
+#: selection. Drawn by the driver as `-max_num_threads=...` etc.
+_INT_TARGET_OPTS = (
+    "max_num_threads", "max_threads_per_block", "max_shared_memory_per_block",
+    "thread_warp_size", "registers_per_block", "l2_cache_size_bytes",
+    "max_function_args", "max_block_size_x", "max_block_size_y", "max_block_size_z",
+    "max_push_constants_size", "max_uniform_buffer_range", "max_storage_buffer_range",
+    "max_per_stage_descriptor_storage_buffer", "supported_subgroup_operations",
+    "texture_spatial_limit", "texture_depth_limit", "image_base_address_alignment",
+    "vulkan_api_version", "max_spirv_version", "driver_version",
+)
+_BOOL_TARGET_OPTS = tuple(
+    ["supports_float16", "supports_float32", "supports_float64", "supports_int8",
+     "supports_int16", "supports_int32", "supports_int64", "supports_8bit_buffer",
+     "supports_16bit_buffer", "supports_storage_buffer_storage_class",
+     "supports_push_descriptor", "supports_dedicated_allocation",
+     "supports_integer_dot_product", "supports_cooperative_matrix",
+     "supports_subgroups"])
+
+
 def _make_target(spec):
-    """`llvm -mcpu=x -opt-level=N -mtriple=t -mattr=+a,+b` (the form the
-    driver draws, TVM's old CLI syntax) as a Target object; the CLI string
-    form is no longer accepted by tvm.target.Target."""
+    """`llvm -mcpu=x -opt-level=N -mtriple=t -mattr=+a,+b`, or a GPU kind
+    with its own options (`cuda -arch=sm_90 -max_num_threads=512`) — the
+    form the driver draws, TVM's old CLI syntax — as a Target object; the
+    CLI string form is no longer accepted by tvm.target.Target."""
     import tvm
     if not isinstance(spec, str):
         return spec
@@ -178,9 +250,62 @@ def _make_target(spec):
             continue          # not a target option in this TVM
         elif k == "mattr":
             d[k] = v.split(",")
+        elif k in _INT_TARGET_OPTS:
+            d[k] = int(v)
+        elif k in _BOOL_TARGET_OPTS:
+            d[k] = v.lower() in ("1", "true", "on")
         else:
             d[k] = v
     return tvm.target.Target(d)
+
+
+def _device_sources(lib):
+    """(kind, source) for each device module the codegen produced. On a
+    USE_CUDA=OFF/USE_VULKAN=OFF build these come back from the fallback
+    modules, which hold the generated source instead of a loaded binary —
+    exactly what a compile-only run wants."""
+    out = []
+    try:
+        mods = lib.mod.imports
+    except Exception:
+        return out
+    for m in mods:
+        try:
+            out.append((m.kind, m.inspect_source("")))
+        except Exception:
+            continue
+    return out
+
+
+_EMPTY_KERNEL_RE = re.compile(r"__global__|kernel void|\bvoid\s+\w+_kernel|OpEntryPoint|@compute")
+
+
+def _check_device_source(kinds_and_sources, target_kind):
+    """The device-codegen oracle: the target's codegen must have produced
+    device source, and it must not be empty or truncated. A module that
+    compiles to nothing for a GPU target has lost its kernel, which the
+    CPU path cannot show."""
+    if not kinds_and_sources:
+        return "no device module produced"
+    for kind, src in kinds_and_sources:
+        if not src or not src.strip():
+            return f"{kind} device module has empty source"
+    return None
+
+
+def _cross_compile_cuda(src, arch, tools):
+    """Compile generated CUDA C++ with nvcc (compile-only, --ptx). Returns
+    (rc, output). The toolkit is in the image; no GPU is involved."""
+    import subprocess
+    import tempfile
+    with tempfile.TemporaryDirectory() as d:
+        cu = os.path.join(d, "kernel.cu")
+        with open(cu, "w") as f:
+            f.write(src)
+        cmd = [tools, f"-arch={arch}", "--ptx", "-o", os.path.join(d, "kernel.ptx"),
+               "-w", "-Xcicc", "-O3", cu]
+        p = subprocess.run(cmd, capture_output=True, text=True, timeout=180)
+        return p.returncode, (p.stdout or "") + (p.stderr or "")
 
 
 def _run_once(mod, target, entry, inputs):
@@ -214,6 +339,8 @@ def main():
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--num-passes", type=int, default=0)
     ap.add_argument("--tir-pipeline", default="default")
+    ap.add_argument("--nvcc-arch", default="",
+                    help="compile the generated CUDA source with nvcc for this arch")
     args = ap.parse_args()
     rng = random.Random(args.seed)
 
@@ -273,14 +400,37 @@ def main():
                 # A pass run out of its pipeline order states its
                 # precondition ("Require the target attribute", "must be
                 # called after ...", "context required"): that is the pass
-                # refusing the input, not an invariant broken by it.
-                if _PRECONDITION_RE.search(str(e)):
+                # refusing the input, not an invariant broken by it. The
+                # same holds for a target or module the pass cannot lower.
+                if _PRECONDITION_RE.search(str(e)) or _TARGET_PRECONDITION_RE.search(str(e)):
                     print(f"FFL_REJECTED pass-precondition {name}: {str(e)[:200]}"); sys.exit(1)
                 print(f"FFL_INTERNAL_ERROR (pass {name})"); traceback.print_exc(); sys.exit(3)
             except Exception as e:
                 print(f"FFL_REJECTED pass {name}: {type(e).__name__}: {str(e)[:300]}"); sys.exit(1)
 
     target = args.target      # opt level goes through PassContext only
+    tgt_obj = _make_target(target)
+    tgt_kind = tgt_obj.kind.name if hasattr(tgt_obj.kind, "name") else str(tgt_obj.kind)
+    if tgt_kind in GPU_KINDS:
+        # A GPU codegen only accepts kernels: loops bound to thread axes,
+        # allocations inside one. Most of the corpus is written without
+        # bindings (it targets llvm), and compiling it for a GPU target
+        # would just be refused. TVM's own DefaultGPUSchedule binds the
+        # remaining loops, which is what its GPU tests do; a module that
+        # already has bindings passes through. Failures here are the pass
+        # declining the module, so the run is a rejection.
+        try:
+            sched = tvm.s_tir.transform.DefaultGPUSchedule()
+        except AttributeError:
+            sched = None
+        if sched is not None and not _has_thread_binding(mod):
+            try:
+                with tgt_obj:
+                    mod = sched(mod)
+            except tvm.error.InternalError as e:
+                print(f"FFL_REJECTED gpu-schedule: {str(e)[:200]}"); sys.exit(1)
+            except Exception as e:
+                print(f"FFL_REJECTED gpu-schedule: {type(e).__name__}: {str(e)[:200]}"); sys.exit(1)
     kw = {}
     if args.tir_pipeline != "default":
         kw["tir_pipeline"] = args.tir_pipeline
@@ -292,12 +442,42 @@ def main():
             # the random passes left the module in a state the pipeline
             # does not accept: the pipeline's precondition, not a defect
             print(f"FFL_REJECTED compile-precondition: {str(e)[:200]}"); sys.exit(1)
+        if _TARGET_PRECONDITION_RE.search(str(e)):
+            # the drawn target cannot express this module (a capability it
+            # does not declare, a device limit, a missing device library):
+            # the target refusing the input, not a codegen defect
+            print(f"FFL_REJECTED target-precondition: {str(e)[:200]}"); sys.exit(1)
         print("FFL_INTERNAL_ERROR (compile)"); traceback.print_exc(); sys.exit(3)
     except Exception as e:
         print(f"FFL_REJECTED compile: {type(e).__name__}: {str(e)[:300]}"); sys.exit(1)
+    target_kind = _make_target(target).kind.name if hasattr(_make_target(target).kind, "name") \
+        else str(_make_target(target).kind)
+    if target_kind in GPU_KINDS:
+        srcs = _device_sources(lib)
+        problem = _check_device_source(srcs, target_kind)
+        if problem:
+            # A GPU target that produced no device code at all: the kernel
+            # was dropped somewhere in lowering. Reported as a finding, not
+            # a rejection — the module compiled without an error.
+            print(f"FFL_NO_DEVICE_CODE {target_kind}: {problem}"); sys.exit(5)
+        if args.nvcc_arch and target_kind == "cuda":
+            nvcc = shutil.which("nvcc")
+            if nvcc:
+                rc, out = _cross_compile_cuda(srcs[0][1], args.nvcc_arch, nvcc)
+                if rc != 0:
+                    # nvcc rejecting TVM's own generated CUDA C++ is a
+                    # codegen defect: the source is not the fuzzer's, it is
+                    # what the compiler emitted.
+                    print(f"FFL_BAD_DEVICE_SOURCE nvcc rc={rc} arch={args.nvcc_arch}\n"
+                          + out[-1500:])
+                    sys.exit(6)
+                print(f"FFL_OK device-source nvcc {args.nvcc_arch}")
     if args.mode == "build":
         print("FFL_OK build"); return
 
+    if target_kind in GPU_KINDS:
+        # compile-only by design: no device is present
+        print(f"FFL_OK build ({target_kind} compile-only)"); return
     import platform
     triple = next((p[8:] for p in target.split() if p.startswith("-mtriple=")), "")
     if triple and not triple.startswith(platform.machine()):

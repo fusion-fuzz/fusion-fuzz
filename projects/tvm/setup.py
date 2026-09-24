@@ -3,6 +3,21 @@ projects/tvm/setup.py — build TVM from source and collect TVMScript seeds.
 
 Called by main.py as setup(project_root) inside ffe-tvm.
 
+GPU backends are the primary fuzz target and are exercised compile-only:
+no GPU is present and nothing is ever launched, so the device-side
+codegens are reached through the source/IR they emit.
+
+  * cuda / opencl / metal / webgpu: source-level codegens. They need no
+    toolkit; on a USE_CUDA=OFF build the generated source comes back
+    through the fallback module (`inspect_source`), and the driver hands
+    the CUDA source to the image's nvcc (`--ptx`) as a second stage.
+  * nvptx and rocm: LLVM's NVPTX and AMDGPU back ends. Both need device
+    bitcode, which the image provides (CUDA_PATH for libdevice, ROCM_PATH
+    for rocm-device-libs) — again no driver and no device.
+  * vulkan: USE_VULKAN=ON builds TVM's SPIR-V codegen against the Vulkan
+    headers and SPIRV-Tools in the image (the validator runs on the
+    generated module; the Vulkan loader is never asked for a device).
+
 Build: CMake + Ninja from a shallow apache/tvm checkout with its tvm-ffi
 submodule (dlpack, libbacktrace). Oracles kept live:
 
@@ -75,6 +90,13 @@ def setup(project_root):
 
     build = os.path.join(src, "build")
     lib = os.path.join(build, "lib", "libtvm_compiler.so")
+    # A build configured before the GPU codegens were wanted has to be
+    # reconfigured: the marker below is written with the config.
+    cfg = os.path.join(build, "config.cmake")
+    if os.path.exists(lib) and not (os.path.exists(cfg)
+                                    and "FFL_GPU_CODEGEN" in open(cfg).read()):
+        print("  reconfiguring for the GPU codegens (USE_VULKAN)", flush=True)
+        os.remove(lib)
     if not os.path.exists(lib):
         llvm, kind = _llvm_config(project_root)
         print(f"  llvm-config: {llvm} [{kind}]")
@@ -85,6 +107,16 @@ def setup(project_root):
         with open(os.path.join(build, "config.cmake"), "a") as f:
             f.write(f'\nset(USE_LLVM "{llvm} --link-static")\nset(USE_LIBBACKTRACE ON)\n'
                     'set(USE_RPC OFF)\nset(USE_RANDOM ON)\nset(USE_SORT ON)\n')
+            # FFL_GPU_CODEGEN: marker read above, and the GPU codegens.
+            # Vulkan is the one that needs a build option — the SPIR-V
+            # codegen is only compiled in with USE_VULKAN; cuda, nvptx,
+            # rocm, opencl, metal and webgpu are always built and are
+            # reached compile-only (see the module docstring).
+            gpu = "# FFL_GPU_CODEGEN\n"
+            if os.path.exists("/usr/include/vulkan/vulkan.h") and \
+                    glob.glob("/usr/lib/*/libSPIRV-Tools*"):
+                gpu += 'set(USE_VULKAN ON)\nset(USE_KHRONOS_SPIRV /usr)\n'
+            f.write(gpu)
         # TVM's sources need a C++17 compiler newer than clang 14 (Ubuntu
         # 22.04's): `reference to local binding declared in enclosing
         # function` in relax/ir/binding_rewrite.cc. GCC 11 compiles it, and
@@ -126,6 +158,15 @@ def setup(project_root):
                        capture_output=True, text=True, env=env, cwd=project_root)
     print(f"  smoke: rc={r.returncode} {(r.stdout + r.stderr).strip().splitlines()[-1][:120] if (r.stdout + r.stderr).strip() else ''}")
     os.remove(smoke)
+    probe = os.path.join(project_root, "gpu_probe.py")
+    with open(probe, "w") as f:
+        f.write("import tvm, tvm_ffi\n"
+                "for k in ('cuda','nvptx','rocm','vulkan','opencl','metal','webgpu'):\n"
+                "    f = tvm_ffi.get_global_func('target.build.' + k, allow_missing=True)\n"
+                "    print('  codegen', k, 'yes' if f is not None else 'no')\n")
+    r = subprocess.run([sys.executable, probe], capture_output=True, text=True, env=env, cwd=project_root)
+    print("\n".join(l for l in (r.stdout + r.stderr).splitlines() if "codegen" in l))
+    os.remove(probe)
     print("TVM setup complete.")
 
 

@@ -40,8 +40,12 @@ paths:
   seed_source: "projects/tvm/seeds"
   seed_corpus: "projects/tvm/corpus.db"
   seed_exclude_patterns:
-    - pattern: 'T\.launch_thread|threadIdx|blockIdx|"cuda"|"vulkan"|"metal"|"opencl"|"rocm"|"webgpu"|T\.env_thread'
-      reason: "GPU-only module"
+    # GPU modules are wanted now: the GPU backends are the primary target
+    # and are compiled (never launched), so a module with thread bindings
+    # is the most interesting input there is. Only the two constructs that
+    # need a *device* at compile time stay excluded.
+    - pattern: 'T\.attr\("[^"]*", "device_id"|tvm\.(?:cuda|rocm|metal|vulkan|opencl)\('
+      reason: "needs a live device at compile time"
     - pattern: 'R\.call_dps_packed|call_packed|T\.call_extern|T\.call_packed|R\.ExternFunc|"vm\.builtin'
       reason: "calls a packed/extern function the harness does not provide"
     - pattern: 'I\.pyfunc|@I\.pyfunc'

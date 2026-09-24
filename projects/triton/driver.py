@@ -40,6 +40,7 @@ unknown pass outright, so an invented name would fail every run drawing
 it.
 """
 
+import glob
 import os
 import random
 import re
@@ -90,6 +91,75 @@ _DEFAULT_MODULE_ATTRS = ('"ttg.num-warps" = 4 : i32, '
 _MODULE_LINE_RE = re.compile(r'^\s*module\b', re.M)
 _ALIAS_LINE_RE = re.compile(r'^\s*#[A-Za-z_][\w]*\s*=', re.M)
 
+# GPU targets, compile-only: no device is needed for any of this. The
+# module attribute is what every TritonGPU pass reads, so drawing it is
+# how the same IR is compiled for Turing through Blackwell and for CDNA
+# and RDNA parts. Blackwell (100/103/120) is where the newest lowering
+# code (TMEM, warp specialisation, 2-CTA MMA) is selected.
+CUDA_CCS = ["75", "80", "86", "89", "90", "100", "103", "120"]
+CUDA_CC_WEIGHTS = [1, 3, 1, 2, 5, 3, 1, 2]
+HIP_ARCHS = ["gfx90a", "gfx942", "gfx950", "gfx1100", "gfx1200", "gfx1250"]
+HIP_ARCH_WEIGHTS = [2, 4, 3, 1, 1, 2]
+NUM_WARPS = [1, 2, 4, 4, 4, 8, 16]
+#: PTX ISA versions the lowering may be asked for, by the lowest one a
+#: compute capability's instructions need.
+PTX_FOR_CC = {"75": [70, 80, 83, 85], "80": [70, 80, 83, 85, 86], "86": [80, 83, 85, 86],
+              "89": [80, 83, 85, 86, 87], "90": [80, 83, 85, 86, 87, 88],
+              "100": [86, 87, 88], "103": [88], "120": [87, 88]}
+
+_TARGET_RE = re.compile(r'ttg\.target\s*=\s*"(cuda|hip):([\w]+)"')
+_TPW_RE = re.compile(r'("ttg\.threads-per-warp"\s*=\s*)(\d+)(\s*:\s*i32)')
+_MODULE_ATTRS_RE = re.compile(r'module attributes \{([^}]*)\}')
+_UNREALIZED_RE = re.compile(r'unrealized_conversion_cast')
+
+
+def _threads_per_warp(vendor, arch):
+    """CDNA (gfx9xx) is wave64; RDNA (gfx1xxx) and every NVIDIA part wave32."""
+    if vendor == "hip" and arch.startswith("gfx9"):
+        return 64
+    return 32
+
+
+def _draw_target_attrs():
+    """Attributes for a module that carries none of its own."""
+    if random.random() < 0.8:
+        cc = random.choices(CUDA_CCS, weights=CUDA_CC_WEIGHTS, k=1)[0]
+        vendor, arch = "cuda", cc
+    else:
+        vendor = "hip"
+        arch = random.choices(HIP_ARCHS, weights=HIP_ARCH_WEIGHTS, k=1)[0]
+    warps = random.choice(NUM_WARPS)
+    ctas = 2 if vendor == "cuda" and arch in ("90", "100", "103") and random.random() < 0.2 else 1
+    return (f'"ttg.num-warps" = {warps} : i32, "ttg.num-ctas" = {ctas} : i32, '
+            f'"ttg.threads-per-warp" = {_threads_per_warp(vendor, arch)} : i32, '
+            f'ttg.target = "{vendor}:{arch}"')
+
+
+def _swap_target(text, rate):
+    """With probability `rate`, move the module to another part of the
+    same vendor: a `cuda:90` module to `cuda:100`, a `hip:gfx942` one to
+    `hip:gfx950`. Same-vendor only — CUDA IR under the AMD lowering says
+    nothing about Triton. threads-per-warp follows the part."""
+    m = _TARGET_RE.search(text)
+    if not m or random.random() >= rate:
+        return text
+    vendor, arch = m.group(1), m.group(2)
+    if vendor == "cuda":
+        choices = [c for c in CUDA_CCS if c != arch]
+        weights = [w for c, w in zip(CUDA_CCS, CUDA_CC_WEIGHTS) if c != arch]
+    else:
+        choices = [a for a in HIP_ARCHS if a != arch]
+        weights = [w for a, w in zip(HIP_ARCHS, HIP_ARCH_WEIGHTS) if a != arch]
+    new = random.choices(choices, weights=weights, k=1)[0]
+    text = text[:m.start()] + f'ttg.target = "{vendor}:{new}"' + text[m.end():]
+    tpw = _threads_per_warp(vendor, new)
+    return _TPW_RE.sub(lambda mm: f"{mm.group(1)}{tpw}{mm.group(3)}", text, count=1)
+
+
+def _module_attrs_of(text):
+    m = _MODULE_ATTRS_RE.search(text)
+    return m.group(1) if m else ""
+
 
 def _restore_module_attrs(content, facts):
     """Wrap a fused body in `module attributes {...}` when it has none.
@@ -109,10 +179,10 @@ def _restore_module_attrs(content, facts):
         # returned unchanged and every fused program reached triton-opt
         # without `ttg.num-warps`, failing with "'tt.func' op is not
         # contained within a context that has ttg.num-warps".
-        attrs = facts.get("module_attrs") or _DEFAULT_MODULE_ATTRS
+        attrs = facts.get("module_attrs") or _draw_target_attrs()
         return text[:m.end()].replace(
             "module", "module attributes {" + attrs + "}", 1) + text[m.end():]
-    attrs = facts.get("module_attrs") or _DEFAULT_MODULE_ATTRS
+    attrs = facts.get("module_attrs") or _draw_target_attrs()
     head, body = [], []
     for line in text.splitlines():
         (head if _ALIAS_LINE_RE.match(line) or line.lstrip().startswith("//")
@@ -197,9 +267,20 @@ class TritonDriver(BaseDriver):
     LOWERING_PASSES = [
         _PRELUDE + "--convert-triton-gpu-to-llvm",
         _PRELUDE + "--convert-triton-gpu-to-llvm --convert-builtin-func-to-llvm",
+        _PRELUDE + "--convert-triton-gpu-to-llvm --convert-nv-gpu-to-llvm",
         _PRELUDE + "--convert-triton-amdgpu-to-llvm=gfx-arch=gfx942",
         _PRELUDE + "--convert-triton-amdgpu-to-llvm=gfx-arch=gfx1250",
     ]
+
+    #: How often a module that declares a target is moved to another part
+    #: of the same vendor before compilation (see _swap_target).
+    TARGET_SWAP_RATE = 0.3
+    #: How often a pipeline that lowers to the LLVM dialect is continued
+    #: to machine code: mlir-translate to LLVM IR, then llc for the
+    #: module's part (NVPTX or AMDGPU back end). Compile-only; the PTX /
+    #: GCN goes to /dev/null. Crashes there are LLVM back-end findings on
+    #: Triton-produced IR and are tagged with the tool that died.
+    ASM_SHARE = 0.5
 
     # Always present. See the module docstring for why the first is not
     # optional.
@@ -240,6 +321,14 @@ class TritonDriver(BaseDriver):
         self.mem_limit_kb = int(mem_mb) * 1024
         self.triton_opt = os.path.join(
             self.ffl_root, "projects", "triton", "triton-build", "bin", "triton-opt")
+        # the LLVM Triton was built against (setup.py downloads it to
+        # deps/llvm-<hash>-<platform>); its llc has the NVPTX and AMDGPU
+        # back ends, so a lowered module can be taken to machine code
+        deps = glob.glob(os.path.join(self.ffl_root, "projects", "triton", "deps", "llvm-*", "bin"))
+        self.llc = next((os.path.join(d, "llc") for d in deps
+                         if os.access(os.path.join(d, "llc"), os.X_OK)), None)
+        self.mlir_translate = next((os.path.join(d, "mlir-translate") for d in deps
+                                    if os.access(os.path.join(d, "mlir-translate"), os.X_OK)), None)
 
     # -- pipeline selection ------------------------------------------------
 
@@ -331,17 +420,54 @@ class TritonDriver(BaseDriver):
     _CUDA_TARGET_RE = re.compile(r'ttg\.target\s*=\s*"cuda:(\d+)"')
 
     def _with_compute_capability(self, passes, attrs):
-        m = self._CUDA_TARGET_RE.search(attrs or _DEFAULT_MODULE_ATTRS)
-        if not m:
-            return list(passes)
-        cc = m.group(1)
+        """Point the lowering passes at the module's own part: the NVIDIA
+        lowering gets its compute capability (and, half the time, a PTX
+        ISA version that part supports); a drawn AMD lowering gets the
+        module's gfx arch instead of the table's fixed one."""
+        t = _TARGET_RE.search(attrs or "")
         out = []
         for p in passes:
-            if p == "--convert-triton-gpu-to-llvm":
-                out.append(f"--convert-triton-gpu-to-llvm{{compute-capability={cc}}}")
+            if p == "--convert-triton-gpu-to-llvm" and t and t.group(1) == "cuda":
+                cc = t.group(2)
+                opts = f"compute-capability={cc}"
+                if random.random() < 0.5 and cc in PTX_FOR_CC:
+                    opts += f" ptx-version={random.choice(PTX_FOR_CC[cc])}"
+                out.append(f"--convert-triton-gpu-to-llvm{{{opts}}}")
+            elif p.startswith("--convert-triton-amdgpu-to-llvm") and t and t.group(1) == "hip":
+                opts = f"gfx-arch={t.group(2)}"
+                if random.random() < 0.3:
+                    opts += " ftz=true"
+                out.append(f"--convert-triton-amdgpu-to-llvm{{{opts}}}")
             else:
                 out.append(p)
         return out
+
+    def _asm_stage(self, passes, attrs):
+        """The llc command that continues `passes` to machine code, or
+        None when the pipeline does not end in the LLVM dialect (or the
+        tools are missing, or the draw says no)."""
+        if not (self.llc and self.mlir_translate) or random.random() >= self.ASM_SHARE:
+            return None, passes
+        joined = " ".join(passes)
+        t = _TARGET_RE.search(attrs or "")
+        if not t:
+            return None, passes
+        opt = random.choice(["-O0", "-O1", "-O2", "-O3", "-O3"])
+        if "convert-triton-gpu-to-llvm" in joined and t.group(1) == "cuda":
+            cc = t.group(2)
+            extra = [p for p in ("--convert-nv-gpu-to-llvm", "--convert-builtin-func-to-llvm")
+                     if p not in joined]
+            mattr = ""
+            m = re.search(r"ptx-version=(\d+)", joined)
+            if m:
+                mattr = f" -mattr=+ptx{m.group(1)}"
+            llc = f"{self.llc} -march=nvptx64 -mcpu=sm_{cc}{mattr} {opt} -o /dev/null"
+            return llc, list(passes) + extra
+        if "convert-triton-amdgpu-to-llvm" in joined and t.group(1) == "hip":
+            extra = [p for p in ("--convert-builtin-func-to-llvm",) if p not in joined]
+            llc = f"{self.llc} -march=amdgcn -mtriple=amdgcn-amd-amdhsa -mcpu={t.group(2)} {opt} -o /dev/null"
+            return llc, list(passes) + extra
+        return None, passes
 
     def _drop_mismatched_backend(self, passes, attrs):
         """Remove backend lowering passes the module's target contradicts.
@@ -388,8 +514,14 @@ class TritonDriver(BaseDriver):
         passes = [p for p in passes
                   if not (facts.get("unregistered")
                           and p in self.SYMBOL_ANALYSIS_PASSES)]
+        llc, passes = self._asm_stage(passes, facts.get("module_attrs"))
         flags = " ".join(self.BASE_FLAGS + passes)
         cmd = f"{self.triton_opt} {module_path} {flags}"
+        if llc:
+            # triton-opt's output is the next tool's input; pipefail keeps
+            # a failure anywhere in the chain visible in the exit status
+            cmd = (f"set -o pipefail; {cmd} | {self.mlir_translate} --allow-unregistered-dialect "
+                   f"--mlir-to-llvmir | {llc}")
         if self.mem_limit_kb > 0:
             # ulimit -v is safe here: this triton-opt is not built with a
             # sanitiser, so nothing reserves a huge shadow mapping.
@@ -406,8 +538,11 @@ class TritonDriver(BaseDriver):
         try:
             facts = analyze_seed(seed.content)
             module = os.path.join(workdir, f"{seed.id}.mlir")
+            text = _swap_target(_restore_module_attrs(seed.content, facts), self.TARGET_SWAP_RATE)
+            # the pass selection reads the target the module now carries
+            facts = dict(facts, module_attrs=_module_attrs_of(text) or facts.get("module_attrs"))
             with open(module, "w", encoding="utf-8") as f:
-                f.write(_restore_module_attrs(seed.content, facts))
+                f.write(text)
             cmd = self._build_command(module, facts)
             rc, stdout, stderr = self._run_command(cmd, cwd=workdir)
         finally:
@@ -415,6 +550,14 @@ class TritonDriver(BaseDriver):
 
         output = f"{stdout}\n{stderr}"
         verdict = classify(output)
+        if verdict["is_bug"] and "|" in cmd:
+            # which tool of the chain died: the crash handler's stack
+            # frames name the binary
+            for tool in ("llc", "mlir-translate"):
+                if re.search(rf"^\s*#?\d+\s+(?:0x[0-9a-f]+\s+)?(?:\S*/)?{tool}\(", stderr or "", re.M) \
+                        or re.search(rf"\b{tool}: [^\n]*(?:error|fatal)", stderr or ""):
+                    verdict["signature"] = f"[{tool}] {verdict['signature']}"
+                    break
         result = ExecutionResult(
             return_code=rc,
             stdout=stdout,

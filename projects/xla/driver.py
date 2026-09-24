@@ -52,6 +52,7 @@ session so a timeout kills the whole process group.
 
 import os
 import random
+import re
 import shutil
 import subprocess
 import time
@@ -108,13 +109,37 @@ class XLADriver(BaseDriver):
         ("--xla_llvm_enable_invariant_load_metadata", ["false"]),
     ]
     #: GPU compile-only mode (bin/hlo-opt.gpu, see setup.py): the device
-    #: comes from a target-config text proto; NVIDIA specs only, the CUDA
-    #: build cannot target the AMD/Intel ones. Autotuning is off because
-    #: there is no device to time kernels on.
-    GPU_SPECS = ["a100_pcie_80", "a100_sxm_80", "h100_sxm", "h100_pcie", "v100",
-                 "p100", "a6000", "b200", "h200"]
-    GPU_STAGES = ["hlo", "hlo-backend", "llvm", "ptx", "buffer-assignment"]
-    GPU_SHARE = 0.35
+    #: comes from a target-config text proto, so no GPU is needed, and the
+    #: GPU backend is the primary target of this adapter (GPU_SHARE). NVIDIA
+    #: specs only: the CUDA build segfaults on the AMD/Intel ones (mi200,
+    #: mi350, gfx1250, pvc, bmg_g21), a mismatch between the build and the
+    #: spec rather than a finding. Autotuning is off because there is no
+    #: device to time kernels on.
+    #:
+    #: Every NVIDIA spec in xla/backends/gpu/target_config/specs is used;
+    #: the ones listed here are the known set, others found on disk are
+    #: added. Pre-Turing parts (p100 = CC 6.0, v100 = CC 7.0) can only run
+    #: the HLO pipeline: the hermetic CUDA 13 ptxas dropped CC < 7.5
+    #: ("ptxas too old. Falling back to the driver", and there is no
+    #: driver), which fails every stage past `hlo`.
+    GPU_SPECS = ["a100_pcie_80", "a100_sxm_40", "a100_sxm_80", "a6000", "b200", "b300",
+                 "gb200", "gb300", "h100_pcie", "h100_sxm", "h200", "p100", "rtx6000pro", "v100"]
+    GPU_SPEC_HLO_ONLY = {"p100", "v100"}
+    GPU_STAGES = ["hlo", "hlo-backend", "llvm", "llvm-before-optimizations",
+                  "llvm-after-optimizations", "ptx", "ptx", "buffer-assignment"]
+    GPU_SHARE = 0.70
+    #: Each base spec also gets variant device descriptions (written once
+    #: by _spec_variants into bin/gpu_specs): the same compute capability
+    #: with a smaller/larger core count, shared memory, register file and
+    #: L2, so the tiling, fusion and scheduling heuristics that read those
+    #: numbers see configurations no shipped part has. Drawn about a third
+    #: of the time.
+    GPU_VARIANT_SHARE = 0.35
+    #: All verified accepted by this build's hlo-opt.gpu (an unknown flag
+    #: makes it print its usage and exit 1, which would count every draw as
+    #: a rejection). Left out on purpose: xla_gpu_enable_libnvjitlink (no
+    #: nvJitLink in the hermetic SDK), xla_gpu_experimental_enable_conv_fusion
+    #: (needs cuDNN deviceless mode which needs a stream executor).
     GPU_FLAGS = [
         ("--xla_gpu_enable_triton_gemm", ["true", "false"]),
         ("--xla_gpu_triton_gemm_any", ["true"]),
@@ -130,6 +155,54 @@ class XLADriver(BaseDriver):
         ("--xla_gpu_enable_analytical_latency_estimator", ["true"]),
         ("--xla_gpu_enable_cub_radix_sort", ["false"]),
         ("--xla_backend_optimization_level", ["0", "1", "2", "3"]),
+        # fusion / emitter selection
+        ("--xla_gpu_experimental_all_fusions_with_triton", ["true"]),
+        ("--xla_gpu_experimental_gemm_fusion_v2", ["true"]),
+        ("--xla_gpu_experimental_enable_fusion_block_level_rewriter", ["true"]),
+        ("--xla_gpu_experimental_enable_triton_warp_specialization", ["true"]),
+        ("--xla_gpu_experimental_enable_tiling_propagation", ["true"]),
+        ("--xla_gpu_experimental_enable_same_shape_multi_output_fusion", ["true"]),
+        ("--xla_gpu_unsupported_enable_triton_multi_output_fusion", ["true"]),
+        ("--xla_gpu_experimental_use_ragged_dot_fusion", ["true"]),
+        ("--xla_gpu_experimental_scaled_dot_with_triton", ["true"]),
+        ("--xla_gpu_enable_triton_gemm_int4", ["true"]),
+        ("--xla_gpu_experimental_enable_subchannel_dequantisation_fusion", ["true"]),
+        ("--xla_gpu_use_runtime_fusion", ["true"]),
+        ("--xla_gpu_experimental_enable_fusion_autotuner", ["true"]),
+        ("--xla_gpu_experimental_enable_raft_for_stable_topk", ["true"]),
+        ("--xla_gpu_gemm_rewrite_size_threshold", ["0", "1"]),
+        ("--xla_gpu_dot_merger_threshold_mb", ["0", "1", "1024"]),
+        ("--xla_gpu_experimental_pack_dot_operands_along_k_dimension", ["false"]),
+        ("--xla_gpu_default_to_alg_dot_bf16_bf16_f32", ["true"]),
+        # cuDNN / cuBLAS paths (compile-time rewrites; no library call is made)
+        ("--xla_gpu_enable_cudnn_fmha", ["true"]),
+        ("--xla_gpu_enable_cudnn_layer_norm", ["true"]),
+        ("--xla_gpu_cudnn_gemm_fusion_level", ["1", "2", "3"]),
+        ("--xla_gpu_enable_cudnn_int8x32_convolution_reordering", ["false"]),
+        ("--xla_gpu_force_conv_nhwc", ["true"]),
+        ("--xla_gpu_force_conv_nchw", ["true"]),
+        # scheduling, streams, command buffers, memory
+        ("--xla_gpu_enable_command_buffer", ["", "FUSION", "FUSION,CUBLAS,CUDNN", "FUSION,CUBLAS,CUDNN,CUSTOM_CALL"]),
+        ("--xla_gpu_command_buffer_unroll_loops", ["true"]),
+        ("--xla_gpu_enable_pdl", ["true"]),
+        ("--xla_gpu_enable_host_memory_offloading", ["true"]),
+        ("--xla_gpu_enable_allocator_spatial_partitioning", ["true"]),
+        ("--xla_gpu_temp_buffer_use_separate_color", ["true"]),
+        ("--xla_gpu_redzone_padding_bytes", ["0"]),
+        ("--xla_gpu_enable_scatter_determinism_expander", ["false"]),
+        ("--xla_gpu_enable_dus_accumulator_zero_init_elimination", ["true"]),
+        ("--xla_gpu_experimental_enable_selective_memcpy_overlap", ["true"]),
+        ("--xla_gpu_multi_streamed_windowed_einsum", ["true"]),
+        ("--xla_gpu_experimental_enable_alltoall_windowed_einsum", ["true"]),
+        ("--xla_gpu_enable_reassociation_for_converted_ar", ["true"]),
+        ("--xla_gpu_analytical_latency_estimator_options", ["nccl_op_launch_us:100", "nic_speed_gbps:400"]),
+        # LLVM / PTX back end
+        ("--xla_gpu_experimental_max_unroll_factor", ["1", "2", "8"]),
+        ("--xla_gpu_native_emitter_tune_unroll_factor_for_loops", ["true"]),
+        ("--xla_gpu_llvm_verification_level", ["1"]),
+        ("--xla_gpu_disable_gpuasm_optimizations", ["true"]),
+        ("--xla_gpu_generate_line_info", ["true"]),
+        ("--xla_gpu_ptx_compiler_extra_flags", ["-O0", "-O1", "--maxrregcount=32", "--allow-expensive-optimizations=true"]),
     ]
 
     #: Only drawn when no interpreter comparison is made.
@@ -154,9 +227,70 @@ class XLADriver(BaseDriver):
                                 "backends", "gpu", "target_config", "specs")
         self.gpu_specs = [os.path.join(spec_dir, s + ".txtpb") for s in self.GPU_SPECS
                           if os.path.exists(os.path.join(spec_dir, s + ".txtpb"))]
+        self.gpu_variants = self._spec_variants(os.path.join(self.bin_dir, "gpu_specs"))
         self.mem_limit_mb = int(config.get("execution", {}).get("mem_limit_mb", 0) or 0)
         self.passes = self._load_passes()
         self.stages = self._load_stages()
+
+    # ── GPU device-description variants ───────────────────────────────
+
+    _SPEC_SCALE = {
+        # name: (field multipliers/overrides) — only fields every spec has
+        "small": {"core_count": 0.25, "shared_memory_per_block": 16384,
+                  "shared_memory_per_block_optin": 49152, "threads_per_block_limit": 512,
+                  "registers_per_block_limit": 32768, "l2_cache_size": 0.25,
+                  "device_memory_size": 0.25},
+        "big": {"core_count": 2.0, "l2_cache_size": 2.0, "device_memory_size": 2.0,
+                "memory_bandwidth": 2.0, "registers_per_core_limit": 2.0},
+        "narrow": {"core_count": 1, "threads_per_core_limit": 1024,
+                   "threads_per_block_limit": 256, "shared_memory_per_block": 8192,
+                   "block_dim_limit_y": 1, "block_dim_limit_z": 1},
+    }
+
+    def _spec_variants(self, out_dir):
+        """Write (once) a small/big/narrow variant of each NVIDIA spec and
+        return their paths. Same compute capability; core count, shared
+        memory, register file, thread limits and L2 scaled, so the
+        cost-model, tiling and scheduling heuristics see device shapes no
+        shipped part has. Skipped silently when bin/ is not writable."""
+        out = []
+        try:
+            os.makedirs(out_dir, exist_ok=True)
+        except OSError:
+            return out
+        for spec in self.gpu_specs:
+            base = os.path.splitext(os.path.basename(spec))[0]
+            try:
+                with open(spec) as f:
+                    text = f.read()
+            except OSError:
+                continue
+            for vname, rules in self._SPEC_SCALE.items():
+                path = os.path.join(out_dir, f"{base}__{vname}.txtpb")
+                if not os.path.exists(path):
+                    lines = []
+                    for line in text.splitlines():
+                        m = re.match(r"^(\s*)([a-z_0-9]+):\s*(-?\d+)\s*$", line)
+                        if m and m.group(2) in rules:
+                            rule = rules[m.group(2)]
+                            val = int(int(m.group(3)) * rule) if isinstance(rule, float) else int(rule)
+                            line = f"{m.group(1)}{m.group(2)}: {max(val, 1)}"
+                        lines.append(line)
+                    try:
+                        with open(path, "w") as f:
+                            f.write("\n".join(lines) + "\n")
+                    except OSError:
+                        continue
+                out.append(path)
+        return out
+
+    def _draw_gpu_spec(self):
+        """(spec path, base name)."""
+        if self.gpu_variants and random.random() < self.GPU_VARIANT_SHARE:
+            spec = random.choice(self.gpu_variants)
+            return spec, os.path.basename(spec).split("__")[0]
+        spec = random.choice(self.gpu_specs)
+        return spec, os.path.splitext(os.path.basename(spec))[0]
 
     # ── tool discovery ────────────────────────────────────────────────
 
@@ -254,10 +388,12 @@ class XLADriver(BaseDriver):
             return cmd, "run_hlo_module", compare
         # hlo-opt, GPU backend compile-only when that binary was built
         if os.path.exists(self.hlo_opt_gpu) and self.gpu_specs and random.random() < self.GPU_SHARE:
-            flags = ["--platform=gpu", f"--stage={random.choice(self.GPU_STAGES)}",
-                     f"--xla_gpu_target_config_filename={random.choice(self.gpu_specs)}",
+            spec, base = self._draw_gpu_spec()
+            stage = "hlo" if base in self.GPU_SPEC_HLO_ONLY else random.choice(self.GPU_STAGES)
+            flags = ["--platform=gpu", f"--stage={stage}",
+                     f"--xla_gpu_target_config_filename={spec}",
                      "--xla_gpu_autotune_level=0"]
-            k = random.choice([0, 1, 1, 2, 3])
+            k = random.choice([0, 1, 1, 2, 2, 3, 4])
             for name, values in random.sample(self.GPU_FLAGS, k):
                 flags.append(f"{name}={random.choice(values)}")
             # bin/gpu_lib holds the hermetic CUDA libraries the binary links
