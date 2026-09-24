@@ -83,6 +83,71 @@ def _collect_seeds(src, seeds_dir):
     return counts
 
 
+#: Mojo's Bazel build configures the pinned LLVM with three backends
+#: (bazel/public-patches/llvm_project.bzl: AArch64, RISCV, X86). Adding
+#: NVPTX and AMDGPU through the extension's tag works and was measured on
+#: 2026-09-24 (one hour of rebuild, the backends end up in the binary),
+#: but it is NOT enough to compile for a GPU, so it is opt-in
+#: (FFL_MOJO_GPU_BACKENDS=1) rather than the default:
+#:
+#:   * the open-source tree registers one target backend, HostBackend
+#:     (Mojo/lib/Compiler/ObjectCompiler/Target/Host). `TargetBackendRegistry
+#:     ::lookup` therefore fails for `nvptx64-nvidia-cuda` with "target ...
+#:     is not supported by this build" whichever LLVM backends are linked,
+#:     both through `--target-accelerator` and through the stdlib's
+#:     `compile_info[f, target=get_gpu_target["sm_90"]()]`.
+#:   * even with one registered, `requireMaxForAccelerator`
+#:     (Mojo/lib/Target/TargetTraits.cpp:26) refuses an accelerator target
+#:     unless MAX is installed: "please install MAX for accelerator support".
+#:
+#: The released wheel's compiler does have the GPU backends (it lists the
+#: NVIDIA and AMD architectures), but its stdlib ships only `std.mojoc`
+#: and the GPU API now lives in the `max` package, which is not
+#: distributed in a form this compiler can import ("many stdlib items
+#: recently moved to the `max` package"). So Mojo GPU code generation is
+#: not reachable with what Modular publishes today.
+_GPU_BACKENDS_TAG = 'llvm_configure.configure(extra_targets = ["NVPTX", "AMDGPU"])'
+
+
+def _enable_gpu_backends(src):
+    """Ask the Bazel LLVM configuration for the NVPTX and AMDGPU backends.
+    Idempotent: returns True when it changed MODULE.bazel, which means the
+    LLVM libraries have to be rebuilt."""
+    mod = os.path.join(src, "MODULE.bazel")
+    try:
+        with open(mod) as f:
+            text = f.read()
+    except OSError:
+        return False
+    if _GPU_BACKENDS_TAG in text:
+        return False
+    marker = 'use_repo(llvm_configure, "llvm-project")'
+    if marker not in text:
+        print("  MODULE.bazel does not configure llvm_configure; GPU backends not enabled")
+        return False
+    text = text.replace(marker, marker + "\n" + _GPU_BACKENDS_TAG, 1)
+    with open(mod, "w") as f:
+        f.write(text)
+    print("  MODULE.bazel: requested LLVM backends NVPTX and AMDGPU")
+    return True
+
+
+def _has_gpu_backends(mojo, home):
+    """Does this compiler binary have the NVPTX/AMDGPU LLVM backends? Asked
+    of the binary itself, so a tree that was built before the backends were
+    requested is rebuilt rather than silently kept."""
+    env = dict(os.environ, MODULAR_MOJO_MAX_PACKAGE_ROOT=home,
+               MODULAR_MOJO_MAX_IMPORT_PATH=os.path.join(home, "lib", "mojo"),
+               MODULAR_CRASH_REPORTING_ENABLED="false", MODULAR_TELEMETRY_ENABLED="false")
+    try:
+        out = subprocess.run([mojo, "build", "--print-supported-targets"],
+                             capture_output=True, text=True, env=env, timeout=120)
+    except Exception:
+        return False
+    text = out.stdout + out.stderr
+    return "nvptx64" in text and "amdgcn" in text
+
+
 def _from_source(project_root, src):
     """Build the compiler with Bazel and lay it out the way the released
     wheel is (bin/mojo, bin/kgen-translate, bin/lld, lib/*.so,
@@ -96,11 +161,23 @@ def _from_source(project_root, src):
     mojo = os.path.join(home, "bin", "mojo")
     bazel_bin = os.path.join(src, "bazel-bin")
     built = os.path.exists(os.path.join(bazel_bin, "Mojo", "tools", "mojo", "mojo"))
-    if not built and os.environ.get("FFL_MOJO_FROM_SOURCE") == "1":
+    # GPU code generation needs LLVM's NVPTX/AMDGPU backends, which the
+    # repo's Bazel configuration leaves out; asking for them changes
+    # MODULE.bazel and invalidates the LLVM libraries.
+    want_gpu = os.environ.get("FFL_MOJO_GPU_BACKENDS") == "1"
+    gpu_changed = _enable_gpu_backends(src) if want_gpu else False
+    stale_gpu = (want_gpu and not gpu_changed and os.path.exists(mojo)
+                 and not _has_gpu_backends(mojo, home))
+    if stale_gpu:
+        print("  compiler has no GPU backends; rebuilding", flush=True)
+    if (not built or gpu_changed or stale_gpu) and (
+            os.environ.get("FFL_MOJO_FROM_SOURCE") == "1" or gpu_changed or stale_gpu):
         jobs = os.environ.get("FFL_MOJO_JOBS", "12")
         _run(f"./bazelw build --config=build-mojo -c opt --copt=-UNDEBUG --host_copt=-UNDEBUG "
              f"--jobs={jobs} //Mojo/tools/mojo:mojo //Mojo/tools/kgen-translate //Mojo/stdlib/std:std", cwd=src)
         built = True
+        if os.path.exists(mojo):
+            os.remove(mojo)          # force the layout copy below to refresh
     if built and not os.path.exists(mojo):
         std = glob.glob(os.path.join(src, "bazel-out", "*", "bin", "Mojo", "stdlib", "std", "std.mojoc"))
         if not std:
@@ -109,13 +186,23 @@ def _from_source(project_root, src):
             std = glob.glob(os.path.join(src, "bazel-out", "*", "bin", "Mojo", "stdlib", "std", "std.mojoc"))
         os.makedirs(os.path.join(home, "bin"), exist_ok=True)
         os.makedirs(os.path.join(home, "lib", "mojo"), exist_ok=True)
+        def _install(src_path, dst_path):
+            # Bazel's outputs are read-only, and so is a copy of one: a
+            # rebuild has to replace the previous install, not write into
+            # it (PermissionError otherwise).
+            if os.path.exists(dst_path):
+                os.remove(dst_path)
+            shutil.copy2(src_path, dst_path)
+            os.chmod(dst_path, 0o755)
+
         for rel, name in (("Mojo/tools/mojo/mojo", "mojo"),
                           ("Mojo/tools/kgen-translate/kgen-translate", "kgen-translate")):
-            shutil.copy2(os.path.join(bazel_bin, rel), os.path.join(home, "bin", name))
-        shutil.copy2(os.path.join(bazel_bin, "Mojo", "libKGENCompilerRTShared.so"), os.path.join(home, "lib"))
+            _install(os.path.join(bazel_bin, rel), os.path.join(home, "bin", name))
+        _install(os.path.join(bazel_bin, "Mojo", "libKGENCompilerRTShared.so"),
+                 os.path.join(home, "lib", "libKGENCompilerRTShared.so"))
         for so in glob.glob(os.path.join(bazel_bin, "_solib_k8", "*", "*.so")):
-            shutil.copy2(so, os.path.join(home, "lib", os.path.basename(so)))
-        shutil.copy2(std[0], os.path.join(home, "lib", "mojo", "std.mojoc"))
+            _install(so, os.path.join(home, "lib", os.path.basename(so)))
+        _install(std[0], os.path.join(home, "lib", "mojo", "std.mojoc"))
         # the tree builds no linker; the released wheel's lld links the
         # executables (the linker is not what is under test)
         wheel_lld = glob.glob(os.path.join(project_root, "venv", "lib", "python3*", "site-packages",
