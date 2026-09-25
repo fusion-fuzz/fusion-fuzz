@@ -234,6 +234,39 @@ _BOOL_TARGET_OPTS = tuple(
      "supports_subgroups"])
 
 
+#: Below this magnitude a float is subnormal or as good as zero, and two
+#: back ends may legitimately disagree: -mcpu=native code can flush
+#: subnormals to zero where the -O0 baseline keeps them. Reporting those as
+#: miscompilations produced three "mismatches" in one batch whose values
+#: were 1.4e-45 and -0.0.
+_FLOAT_NOISE_FLOOR = 1e-30
+
+
+def _float_disagreement(a, b):
+    """(index, a_value, b_value) of the first element where two float
+    results really disagree, or None.
+
+    numpy's allclose gives one boolean for the whole array, and the index
+    of the largest absolute difference is not necessarily an element that
+    failed the test — with NaNs in the output it reported "nan vs nan",
+    which says nothing. This compares elementwise, treats two NaNs and two
+    infinities of the same sign as equal, ignores pairs that are both below
+    the noise floor, and names an element that actually differs.
+    """
+    af = a.astype("float64", copy=False)
+    bf = b.astype("float64", copy=False)
+    both_nan = np.isnan(af) & np.isnan(bf)
+    same_inf = np.isinf(af) & np.isinf(bf) & (np.sign(af) == np.sign(bf))
+    tiny = (np.abs(af) < _FLOAT_NOISE_FLOOR) & (np.abs(bf) < _FLOAT_NOISE_FLOOR)
+    with np.errstate(invalid="ignore"):
+        close = np.isclose(af, bf, rtol=1e-3, atol=1e-4, equal_nan=True)
+    bad = ~(close | both_nan | same_inf | tiny)
+    if not bad.any():
+        return None
+    idx = np.unravel_index(int(np.argmax(bad)), a.shape)
+    return idx, a[idx], b[idx]
+
+
 def _make_target(spec):
     """`llvm -mcpu=x -opt-level=N -mtriple=t -mattr=+a,+b`, or a GPU kind
     with its own options (`cuda -arch=sm_90 -max_num_threads=512`) — the
@@ -558,9 +591,10 @@ def main():
         if a.shape != b.shape:
             print(f"FFL_MISMATCH output {i}: shape {a.shape} vs {b.shape}"); sys.exit(4)
         if a.dtype.kind in "fc":
-            if not np.allclose(a, b, rtol=1e-3, atol=1e-4, equal_nan=True):
-                idx = np.unravel_index(np.argmax(np.abs(a.astype("float64") - b.astype("float64"))), a.shape)
-                print(f"FFL_MISMATCH output {i} at {idx}: {a[idx]} vs {b[idx]} (target {target!r} opt {args.opt_level} vs llvm opt 0)")
+            bad = _float_disagreement(a, b)
+            if bad is not None:
+                print(f"FFL_MISMATCH output {i} at {bad[0]}: {bad[1]} vs {bad[2]} "
+                      f"(target {target!r} opt {args.opt_level} vs llvm opt 0)")
                 sys.exit(4)
         elif not np.array_equal(a, b):
             idx = np.unravel_index(np.argmax(a != b), a.shape)
