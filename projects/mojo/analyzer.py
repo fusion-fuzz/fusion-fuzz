@@ -40,7 +40,14 @@ _RESOURCE_RE = re.compile(
     r"failed to allocate|stack overflow|Stack overflow|hard rss limit|"
     r"virtual memory exhausted|resource temporarily unavailable", re.I | re.M)
 _CRASH_BANNER_RE = re.compile(r"[Pp]lease submit a bug report", re.I)
-_ASSERT_RE = re.compile(r"([\w./\-]+):(\d+):\s.*?Assertion `(.+?)' failed", re.S)
+# One line, and the file has to look like a compiler source file. With
+# re.S and a dot-matches-newline `.*?` this used to start from a *source*
+# position printed earlier in the diagnostic — `foo.mojo:600:5: note:` —
+# and produce "Assertion 600:5 llvm::hasSingleElement(region)", a fresh
+# class per input line. One defect became 12 bundles in a 55-minute batch.
+_ASSERT_RE = re.compile(
+    r"^[^\n]*?([\w./\-]+\.(?:cpp|cc|cxx|h|hpp|inc)):(\d+):[^\n]*?Assertion `(.+?)' failed",
+    re.M)
 _UNREACHABLE_RE = re.compile(r"UNREACHABLE executed(?: at ([\w./\-]+):(\d+))?")
 _LLVM_ERROR_RE = re.compile(r"LLVM ERROR:\s*([^\n]+)")
 _INTERNAL_RE = re.compile(r"(?:INTERNAL ERROR|internal error):\s*([^\n]+)")
