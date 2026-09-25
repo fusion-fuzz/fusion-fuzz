@@ -145,8 +145,19 @@ def _swap_target(text, rate):
         return text
     vendor, arch = m.group(1), m.group(2)
     if vendor == "cuda":
-        choices = [c for c in CUDA_CCS if c != arch]
-        weights = [w for c, w in zip(CUDA_CCS, CUDA_CC_WEIGHTS) if c != arch]
+        # Only move to an equal-or-newer capability. Moving a module down
+        # (cuda:90 -> cuda:75) makes the lowering refuse features the older
+        # part lacks — "Conversion from/to f8e4m3nv is only supported on
+        # compute capability >= 89" — which is the target talking, not a
+        # bug, and it wasted a share of every batch.
+        try:
+            floor = CUDA_CCS.index(arch)
+        except ValueError:
+            floor = 0
+        choices = [c for c in CUDA_CCS[floor:] if c != arch]
+        weights = [w for c, w in zip(CUDA_CCS[floor:], CUDA_CC_WEIGHTS[floor:]) if c != arch]
+        if not choices:
+            return text
     else:
         choices = [a for a in HIP_ARCHS if a != arch]
         weights = [w for a, w in zip(HIP_ARCHS, HIP_ARCH_WEIGHTS) if a != arch]
@@ -161,6 +172,40 @@ def _module_attrs_of(text):
     return m.group(1) if m else ""
 
 
+_NUM_CTAS_RE = re.compile(r'("ttg\.num-ctas"\s*=\s*)(\d+)(\s*:\s*i32)')
+
+
+def _make_attrs_consistent(text):
+    """Repair attribute combinations no Triton module should carry.
+
+    `"ttng.two-ctas" = true` with `ttg.num-ctas = 1` is contradictory: the
+    two-CTA MMA lowering reads the module attribute and then asserts that
+    the op agrees (`MMAv5.cpp:738 twoCTAs == op.getTwoCtas()`). A fused
+    module inherits one parent's attribute list, so the combination is ours
+    to avoid, not a Triton defect. Also give a module that carries
+    attributes but no `ttg.target` one, otherwise the lowering silently
+    uses its default capability.
+    """
+    m = _MODULE_ATTRS_RE.search(text)
+    if not m:
+        return text
+    attrs = m.group(1)
+    fixed = attrs
+    if "ttng.two-ctas" in attrs and "true" in attrs:
+        if _NUM_CTAS_RE.search(fixed):
+            fixed = _NUM_CTAS_RE.sub(lambda mm: f"{mm.group(1)}2{mm.group(3)}", fixed, count=1)
+        else:
+            fixed += ', "ttg.num-ctas" = 2 : i32'
+    if "ttg.target" not in fixed:
+        vendor_arch = _draw_target_attrs()
+        target = re.search(r'ttg\.target = "[^"]+"', vendor_arch)
+        if target:
+            fixed += ", " + target.group(0)
+    if fixed == attrs:
+        return text
+    return text[:m.start(1)] + fixed + text[m.end(1):]
+
+
 def _restore_module_attrs(content, facts):
     """Wrap a fused body in `module attributes {...}` when it has none.
 
@@ -170,7 +215,7 @@ def _restore_module_attrs(content, facts):
     text = content or ""
     m = _MODULE_LINE_RE.search(text)
     if m and "module attributes" in text:
-        return text          # already carries its own attributes
+        return _make_attrs_consistent(text)   # already carries its own
     if m:
         # A bare `module { ... }` — which is what the MLIR strategy emits,
         # since it splices two bodies into a fresh wrapper. The passes need

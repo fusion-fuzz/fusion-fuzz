@@ -105,6 +105,13 @@ _INPUT_PRECONDITION_RE = re.compile(
     r"|Only supports? "
     r"|not supported(?: yet)?"
     r"|should run after"
+    # the target the module was given cannot express what the module uses:
+    # an f8 conversion below compute capability 89, a cross-CTA transfer on
+    # AMD. The driver draws the target (and moves a module to another part
+    # of the same vendor), so this is the target refusing the input.
+    r"|is only supported on compute capability"
+    r"|does not support cross-CTA"
+    r"|requires compute capability"
     # -allow-unregistered-dialect lets an op from an unregistered dialect
     # through the parser; a pass that then needs its interface stops here
     r"|failed due to the operation not being registered"
