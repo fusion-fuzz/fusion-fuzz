@@ -229,7 +229,15 @@ class TVMDriver(BaseDriver):
                f'--opt-level {opt} --num-passes {npass} --tir-pipeline {pipe} --seed {seed}')
         if nvcc_arch:
             cmd += f" --nvcc-arch {nvcc_arch}"
-        return cmd, (f"{mode}-{target.split()[0]}" if target.split()[0] != "llvm" else mode)
+        # The tag goes into the crash signature, so it has to say what kind
+        # of path this was, not which of the six GPU targets was drawn: one
+        # codegen ICHECK otherwise became a separate bundle per target
+        # (build-cuda, build-metal, build-opencl, ...). The exact target is
+        # in the bundle's own command.
+        kind = target.split()[0]
+        if kind in ("cuda", "nvptx", "rocm", "vulkan", "opencl", "metal", "webgpu"):
+            return cmd, f"{mode}-gpu"
+        return cmd, (f"{mode}-{kind}" if kind != "llvm" else mode)
 
     def execute(self, seed):
         start = time.time()

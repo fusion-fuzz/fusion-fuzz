@@ -311,6 +311,17 @@ def _cross_compile_cuda(src, arch, tools):
         return p.returncode, (p.stdout or "") + (p.stderr or "")
 
 
+def _compiles_without_passes(mod, target, args, kw):
+    """Does the module compile for the same target with no drawn passes?"""
+    import tvm
+    try:
+        with tvm.transform.PassContext(opt_level=args.opt_level):
+            tvm.compile(mod, target=_make_target(target), **kw)
+        return True
+    except Exception:
+        return False
+
+
 def _run_once(mod, target, entry, inputs):
     import tvm
     from tvm import relax
@@ -390,6 +401,7 @@ def main():
     if args.mode == "parse":
         print("FFL_OK parse"); return
 
+    mod_before_passes = mod
     if args.num_passes:
         pool = _pass_pool()
         chosen = rng.sample(pool, min(args.num_passes, len(pool)))
@@ -407,6 +419,15 @@ def main():
                 # same holds for a target or module the pass cannot lower.
                 if _PRECONDITION_RE.search(str(e)) or _TARGET_PRECONDITION_RE.search(str(e)):
                     print(f"FFL_REJECTED pass-precondition {name}: {str(e)[:200]}"); sys.exit(1)
+                if _compiles_without_passes(mod_before_passes, args.target, args,
+                                            {"tir_pipeline": args.tir_pipeline}
+                                            if args.tir_pipeline != "default" else {}):
+                    # the module compiles for this target with no drawn
+                    # passes, so the pass was applied outside its pipeline
+                    # position: its precondition, not an invariant it broke
+                    print(f"FFL_REJECTED pass-order {name} (compiles with --num-passes 0): "
+                          f"{str(e)[:160]}")
+                    sys.exit(1)
                 print(f"FFL_INTERNAL_ERROR (pass {name})"); traceback.print_exc(); sys.exit(3)
             except Exception as e:
                 print(f"FFL_REJECTED pass {name}: {type(e).__name__}: {str(e)[:300]}"); sys.exit(1)
@@ -445,6 +466,14 @@ def main():
             # the random passes left the module in a state the pipeline
             # does not accept: the pipeline's precondition, not a defect
             print(f"FFL_REJECTED compile-precondition: {str(e)[:200]}"); sys.exit(1)
+        if args.num_passes and _compiles_without_passes(mod_before_passes, target, args, kw):
+            # The module compiles when the drawn passes are left out, so
+            # what failed is a pass applied outside its pipeline position,
+            # not the compiler on this module. Triage used to establish
+            # this by re-running every bundle with --num-passes 0; doing it
+            # here keeps the class out of the findings altogether.
+            print(f"FFL_REJECTED pass-order (compiles with --num-passes 0): {str(e)[:160]}")
+            sys.exit(1)
         if _TARGET_PRECONDITION_RE.search(str(e)):
             # the drawn target cannot express this module (a capability it
             # does not declare, a device limit, a missing device library):
