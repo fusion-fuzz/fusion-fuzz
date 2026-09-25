@@ -128,6 +128,27 @@ _VOLATILE = [
     (re.compile(r"Instruction %?[\w.\-]+ must have"), "Instruction <name> must have"),
     (re.compile(r"HloInstruction '[^']*'"), "HloInstruction '<name>'"),
     (re.compile(r"evaluated value for: %[^\n]*"), "evaluated value for: <instr>"),
+    # Any message that quotes the offending HLO. The instruction name and
+    # its shape are properties of the fused module, not of the bug: one
+    # `spmd_partitioner.cc:7446 Side-effect HLO must have sharding` became
+    # 190 separate bundles in one 55-minute batch (%send_done.3, %start,
+    # %cp2s, ... each its own "class"), which buries the finding count and
+    # makes the same bug get reduced over and over. The bundle still holds
+    # the exact instruction; the signature only has to name the defect.
+    (re.compile(r"%[A-Za-z_][\w.\-]*"), "%INSTR"),
+    # the whole printed instruction ("%INSTR = token[] send-done(...), ...")
+    # is the module, not the defect
+    (re.compile(r"%INSTR\s*=[^\n]*"), "%INSTR"),
+    # shapes: `f32[5,1]{1,0}`, `(f32[3], s32[])` — the dimensions and the
+    # layout vary per module for one and the same codegen defect
+    (re.compile(r"\b([usbf]\d+|pred|token|f8e\d\w*|bf16)\[[^\]]*\](\{[^}]*\})?"), r"\1[...]"),
+    # a whole tuple shape: `(f32[...], s32[...], pred[...])`. The element
+    # list is the module's, not the defect's — `shape_util.h:132
+    # shape.IsArray()` fires on any tuple and produced a separate class per
+    # element list.
+    (re.compile(r"\((?:\s*(?:[usbf]\d+|pred|token|f8e\d\w*|bf16)\[\.\.\.\]\s*,?)+\)"), "(TUPLE)"),
+    (re.compile(r"\b\d+ vs\. \d+\b"), "N vs. N"),
+    (re.compile(r"\(\d+\)"), "(N)"),
 ]
 
 
