@@ -40,6 +40,14 @@ _RESOURCE_RE = re.compile(
     r"failed to allocate|stack overflow|Stack overflow|hard rss limit|"
     r"virtual memory exhausted|resource temporarily unavailable", re.I | re.M)
 _CRASH_BANNER_RE = re.compile(r"[Pp]lease submit a bug report", re.I)
+#: glibc's allocator refusing to continue. These are memory-safety
+#: findings of their own — a compiler that double-frees or writes past a
+#: chunk header is not merely crashing — and they carry no stack frames,
+#: so without this they were all filed as "compiler crash: no frames".
+_GLIBC_RE = re.compile(
+    r"^(double free or corruption[^\n]*|malloc\(\): [^\n]+|free\(\): [^\n]+|"
+    r"realloc\(\): [^\n]+|munmap_chunk\(\): [^\n]+|corrupted (?:size vs\. prev_size|"
+    r"double-linked list)[^\n]*|malloc_consolidate\(\)[^\n]*)", re.M)
 # One line, and the file has to look like a compiler source file. With
 # re.S and a dot-matches-newline `.*?` this used to start from a *source*
 # position printed earlier in the diagnostic — `foo.mojo:600:5: note:` —
@@ -123,6 +131,9 @@ def classify(output, tool="build", return_code=None, compiled_ok=None, program_m
     m = _INTERNAL_RE.search(out)
     if m:
         return hit("internal", f"internal error: {_normalize(m.group(1))[:80]}")
+    m = _GLIBC_RE.search(out)
+    if m:
+        return hit("memory", f"glibc: {_normalize(m.group(1))[:70]}")
     if _CRASH_BANNER_RE.search(out):
         return hit("crash", f"compiler crash: {_stack_fingerprint(out) or 'no frames'}")
 
