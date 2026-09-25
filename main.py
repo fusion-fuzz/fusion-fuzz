@@ -76,6 +76,22 @@ def filter_excluded_seeds(seeds, config):
     return kept
 
 
+
+def _drop_failing_alone(corpus, config):
+    """Drop the seeds a pre-analysis pass recorded as failing on their own.
+
+    `analysis.drop_seeds_failing_alone_except` keeps the ones whose text
+    matches it (a negative test whose non-zero exit is the point). Returns
+    (kept, dropped_count); a seed with no recorded rc is kept.
+    """
+    keep_rx = (config.get("analysis") or {}).get("drop_seeds_failing_alone_except")
+    keep_rx = re.compile(keep_rx) if keep_rx else None
+    kept = [s for s in corpus
+            if (s.metadata or {}).get("rc") in (None, 0)
+            or (keep_rx is not None and keep_rx.search(s.content or ""))]
+    return kept, len(corpus) - len(kept)
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Fusion Fuzz Loop (FFL)")
     parser.add_argument("--project", type=str, default=None, help="Project name (folder in projects/)")
@@ -679,17 +695,10 @@ if __name__ == "__main__":
         # pairs and 45-75% of the invalid children.
         _drop_failing = bool((config.get("analysis") or {}).get("drop_seeds_failing_alone"))
         if _drop_failing and not args.dry_run:
-            _before = len(_valid_corpus)
-            _keep_rx = (config.get("analysis") or {}).get("drop_seeds_failing_alone_except")
-            _keep_rx = re.compile(_keep_rx) if _keep_rx else None
-            _valid_corpus = [
-                s for s in _valid_corpus
-                if (s.metadata or {}).get("rc") in (None, 0)
-                or (_keep_rx is not None and _keep_rx.search(s.content or ""))
-            ]
-            if _before != len(_valid_corpus):
+            _valid_corpus, _dropped = _drop_failing_alone(_valid_corpus, config)
+            if _dropped:
                 logger.info(
-                    f"Dropped {_before - len(_valid_corpus)} seeds that fail on their own "
+                    f"Dropped {_dropped} seeds that fail on their own "
                     f"(analysis.drop_seeds_failing_alone in {args.project}'s config.yaml)."
                 )
         logger.info(
@@ -699,10 +708,29 @@ if __name__ == "__main__":
         )
     else:
         _valid_corpus = initial_corpus
-        logger.info(
-            f"Using all {len(_valid_corpus)} seeds for fuzzing "
-            "(pass --dry-run to filter, --pre-analysis to collect fusion metadata)."
-        )
+        # A previous --pre-analysis pass recorded each seed's standalone
+        # return code in the corpus database, and that verdict does not go
+        # stale while the seed and the compiler stay the same. Without this,
+        # a run with --pre-analysis left off pairs the known-bad seeds for
+        # its whole length: 1,530 of CUDA's 4,439 seeds and 1,858 of XLA's
+        # 10,697 fail alone, so a third of every pair drawn was known in
+        # advance to fail. The cache is only trusted when most of the
+        # corpus carries it, so a half-analysed corpus cannot silently
+        # shrink the run.
+        _drop_failing = bool((config.get("analysis") or {}).get("drop_seeds_failing_alone"))
+        _have_rc = sum(1 for s in _valid_corpus if (s.metadata or {}).get("rc") is not None)
+        if _drop_failing and _valid_corpus and _have_rc >= 0.5 * len(_valid_corpus):
+            _valid_corpus, _dropped = _drop_failing_alone(_valid_corpus, config)
+            logger.info(
+                f"Using {len(_valid_corpus)}/{len(initial_corpus)} seeds for fuzzing "
+                f"(dropped {_dropped} that a previous --pre-analysis pass recorded as "
+                "failing on their own; pass --pre-analysis to refresh)."
+            )
+        else:
+            logger.info(
+                f"Using all {len(_valid_corpus)} seeds for fuzzing "
+                "(pass --dry-run to filter, --pre-analysis to collect fusion metadata)."
+            )
 
     # 6. Initialize & Run Orchestrator
     _strategies = get_strategies(args.project,
