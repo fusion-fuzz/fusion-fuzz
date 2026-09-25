@@ -401,6 +401,33 @@ def main():
     if args.mode == "parse":
         print("FFL_OK parse"); return
 
+    target = args.target      # opt level goes through PassContext only
+    tgt_obj = _make_target(target)
+    tgt_kind = tgt_obj.kind.name if hasattr(tgt_obj.kind, "name") else str(tgt_obj.kind)
+    if tgt_kind in GPU_KINDS:
+        # A GPU codegen only accepts kernels: loops bound to thread axes,
+        # allocations inside one. Most of the corpus is written without
+        # bindings (it targets llvm), and compiling it for a GPU target
+        # would just be refused. TVM's own DefaultGPUSchedule binds the
+        # remaining loops, which is what its GPU tests do; a module that
+        # already has bindings passes through. Failures here are the pass
+        # declining the module, so the run is a rejection.
+        try:
+            sched = tvm.s_tir.transform.DefaultGPUSchedule()
+        except AttributeError:
+            sched = None
+        if sched is not None and not _has_thread_binding(mod):
+            try:
+                with tgt_obj:
+                    mod = sched(mod)
+            except tvm.error.InternalError as e:
+                print(f"FFL_REJECTED gpu-schedule: {str(e)[:200]}"); sys.exit(1)
+            except Exception as e:
+                print(f"FFL_REJECTED gpu-schedule: {type(e).__name__}: {str(e)[:200]}"); sys.exit(1)
+    # The pass draw and the "does it compile without the drawn passes"
+    # check both work on the scheduled module: with the scheduling done
+    # afterwards, that check compiled an unscheduled module for a GPU
+    # target, always failed, and never recognised a pass-order artifact.
     mod_before_passes = mod
     if args.num_passes:
         pool = _pass_pool()
@@ -432,29 +459,6 @@ def main():
             except Exception as e:
                 print(f"FFL_REJECTED pass {name}: {type(e).__name__}: {str(e)[:300]}"); sys.exit(1)
 
-    target = args.target      # opt level goes through PassContext only
-    tgt_obj = _make_target(target)
-    tgt_kind = tgt_obj.kind.name if hasattr(tgt_obj.kind, "name") else str(tgt_obj.kind)
-    if tgt_kind in GPU_KINDS:
-        # A GPU codegen only accepts kernels: loops bound to thread axes,
-        # allocations inside one. Most of the corpus is written without
-        # bindings (it targets llvm), and compiling it for a GPU target
-        # would just be refused. TVM's own DefaultGPUSchedule binds the
-        # remaining loops, which is what its GPU tests do; a module that
-        # already has bindings passes through. Failures here are the pass
-        # declining the module, so the run is a rejection.
-        try:
-            sched = tvm.s_tir.transform.DefaultGPUSchedule()
-        except AttributeError:
-            sched = None
-        if sched is not None and not _has_thread_binding(mod):
-            try:
-                with tgt_obj:
-                    mod = sched(mod)
-            except tvm.error.InternalError as e:
-                print(f"FFL_REJECTED gpu-schedule: {str(e)[:200]}"); sys.exit(1)
-            except Exception as e:
-                print(f"FFL_REJECTED gpu-schedule: {type(e).__name__}: {str(e)[:200]}"); sys.exit(1)
     kw = {}
     if args.tir_pipeline != "default":
         kw["tir_pipeline"] = args.tir_pipeline
@@ -482,8 +486,7 @@ def main():
         print("FFL_INTERNAL_ERROR (compile)"); traceback.print_exc(); sys.exit(3)
     except Exception as e:
         print(f"FFL_REJECTED compile: {type(e).__name__}: {str(e)[:300]}"); sys.exit(1)
-    target_kind = _make_target(target).kind.name if hasattr(_make_target(target).kind, "name") \
-        else str(_make_target(target).kind)
+    target_kind = tgt_kind      # computed once, before the pass draw
     if target_kind in GPU_KINDS:
         srcs = _device_sources(lib)
         # Only meaningful when the module has kernels to emit: a module
