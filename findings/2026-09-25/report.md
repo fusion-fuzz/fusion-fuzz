@@ -37,7 +37,7 @@ Every one was re-verified after cleaning, from a fresh process, with no fuzzer i
 | 03 | llvm/llvm-project | `Decl.cpp:2567 !Init->isValueDependent()` — `-fgpu-defer-diag` | 1 line CUDA |
 | 04 | llvm/llvm-project | `ToolChains/Clang.cpp:8334` — two `--cuda-gpu-arch` and a failing `ptxas` | empty file |
 | 05 | modular/modular | heap corruption: `double free or corruption`, SIGSEGV | 29 lines Mojo |
-| 06 | triton-lang/triton | `ArrayRef.h:247 Invalid index` under `-tritongpu-coalesce` | 41 lines MLIR |
+| 06 | triton-lang/triton | axis-info hint sized per element makes `-tritongpu-coalesce` index out of bounds | 12 lines MLIR, or one of Triton's own test files |
 | 07 | apache/tvm | NVPTX codegen emits `mul nsw i32 %0, i64 1024` — invalid LLVM IR | 20 lines Python |
 | 08 | apache/tvm | Vulkan codegen output rejected by its own validator: `Invalid SPIR-V header` | 25 lines Python |
 | 09 | apache/tvm | SPIR-V 1.4 emitted while the target declares SPIR-V 1.0 | 48 lines Python |
@@ -47,6 +47,15 @@ Ranked by what I would file first: **07** (invalid IR from a supported target, n
 scheduling involved), **05** (memory corruption in a compiler), **10** (crash where an
 error is expected), **01** and **04** (clean, tiny, obviously wrong), then the two SPIR-V
 issues, then the three error-recovery assertions.
+
+Issue 06 was re-investigated after the first draft: the original 41-line module was a
+symptom, not the cause. `AxisInfo::initDimVectorFromHint` expands every element of a
+`DenseElementsAttr` hint into the per-dimension vector, so a hint written as
+`dense<32> : tensor<128x64xi32>` produces 8192 entries and the coalesce pass indexes the
+shape with `order[0] = 8191`. It is **not** reachable from Python (the `tl.max_contiguous`
+family validates the length), but Triton's own `test/TritonGPU/loop-pipeline-blackwell.mlir`
+writes that form, so `triton-opt <that file> -tritongpu-coalesce` crashes with no fuzzer
+involved. With assertions disabled the same path is an out-of-bounds read.
 
 Not written up as issues, but recorded in the per-project reports: XLA's
 `block_scaling_rewriter.cc:105/489` RET_CHECKs (fusion-only, mxfp8 scaled-dot rewriter),
