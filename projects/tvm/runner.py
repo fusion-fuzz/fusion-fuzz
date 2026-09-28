@@ -189,6 +189,45 @@ def _entry(mod):
     return None
 
 
+_BUF_DECL_RE = re.compile(r"\b(\w+)\s*(?::\s*T\.Buffer\(\s*\(?([\d,\s]+?)\)?\s*,|=\s*T\.(?:match_buffer|alloc_buffer|sblock_alloc_buffer)\(\s*(?:\w+\s*,\s*)?[\[(]([\d,\s]+?)[\])])")
+_CONST_ACCESS_RE = re.compile(r"\b(\w+)\[([\d,\s]+)\]")
+
+
+def _constant_oob(script):
+    """A buffer access with all-constant indices outside a buffer with an
+    all-constant shape, e.g. `B[0, 0] = A[2, 2]` with `A: T.Buffer((2, 3))`.
+
+    TVM's `tirx.instrument_bound_checkers` is accepted but does nothing in
+    this checkout (InstrumentBoundCheckers only instruments accesses carrying
+    `buffer_bound` attributes, which no pass emits any more), so an
+    out-of-bounds read runs and returns whatever is next in memory. That
+    made `bad_load`-style seeds report "nan vs 0.0 (core-avx2 vs llvm)" as
+    a miscompile. Such a program is undefined, not a test of the compiler,
+    and is rejected before it is executed. Returns a message or None."""
+    shapes = {}
+    for m in _BUF_DECL_RE.finditer(script):
+        dims = m.group(2) or m.group(3)
+        try:
+            shapes[m.group(1)] = [int(d) for d in dims.replace(" ", "").split(",") if d]
+        except ValueError:
+            continue
+    for m in _CONST_ACCESS_RE.finditer(script):
+        name, idx = m.group(1), m.group(2)
+        if name not in shapes:
+            continue
+        try:
+            indices = [int(d) for d in idx.replace(" ", "").split(",") if d]
+        except ValueError:
+            continue
+        shape = shapes[name]
+        if len(indices) != len(shape):
+            continue
+        for i, (v, n) in enumerate(zip(indices, shape)):
+            if v < 0 or v >= n:
+                return f"{name}[{idx}] outside shape {shape}"
+    return None
+
+
 def _random_inputs(params, rng):
     import tvm
     arrays = []
@@ -564,6 +603,12 @@ def main():
     if triple and not triple.startswith(platform.machine()):
         print("FFL_OK build (cross target, not executed)"); return
     try:
+        oob = _constant_oob(mod.script())
+    except Exception:
+        oob = None
+    if oob:
+        print(f"FFL_REJECTED out-of-bounds access in the program: {oob}"); sys.exit(1)
+    try:
         entry = _entry(mod)
     except Exception as e:  # a shape of IR the detector does not know
         print(f"FFL_OK build (entry detection: {type(e).__name__}: {str(e)[:120]})"); return
@@ -597,6 +642,10 @@ def main():
         base_inputs = _random_inputs(entry[2], np.random.default_rng(args.seed))
         with tvm.transform.PassContext(opt_level=0, config=run_cfg):
             base = _run_once(mod, "llvm", entry, base_inputs)
+        # a fresh arena between the two runs, so a read past a buffer's end
+        # is more likely to see different bytes the second time
+        _junk = np.random.default_rng(args.seed + 1).standard_normal(
+            size=random.Random(args.seed).choice([4096, 65536, 1 << 20]))
         again_inputs = _random_inputs(entry[2], np.random.default_rng(args.seed))
         with tvm.transform.PassContext(opt_level=0, config=run_cfg):
             again = _run_once(mod, "llvm", entry, again_inputs)
