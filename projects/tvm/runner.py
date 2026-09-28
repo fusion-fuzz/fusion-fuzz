@@ -79,6 +79,8 @@ _TARGET_PRECONDITION_RE = re.compile(
     r"is not supported in \w+|"
     # "CodeGenWebGPU only allows constant thread group size"
     r"only allows |"
+    # a codegen declining a construct or a type it cannot express
+    r"not implemented|Cannot convert type|"
     # the module carries undefined variables (the well-formedness
     # complaint a later pass makes), or a Relax operator that a legalise
     # pass was supposed to lower first
