@@ -345,14 +345,24 @@ def _cross_compile_cuda(src, arch, tools):
 
 
 def _compiles_without_passes(mod, target, args, kw):
-    """Does the module compile for the same target with no drawn passes?"""
+    """Is an InternalError seen *with* the drawn passes attributable to
+    them rather than to the compiler on this module?
+
+    True when the module compiles for the same target with no drawn
+    passes, and also when it is *rejected* without them (a target
+    precondition, a diagnostic): in both cases the target never accepted
+    this module on its own terms, so what the passes did to it is not a
+    finding. False only when the compiler fails an internal check on the
+    unmodified module too — that is the genuine case."""
     import tvm
     try:
         with tvm.transform.PassContext(opt_level=args.opt_level):
             tvm.compile(mod, target=_make_target(target), **kw)
         return True
+    except tvm.error.InternalError as e:
+        return bool(_PRECONDITION_RE.search(str(e)) or _TARGET_PRECONDITION_RE.search(str(e)))
     except Exception:
-        return False
+        return True
 
 
 def _run_once(mod, target, entry, inputs):
@@ -578,15 +588,28 @@ def main():
     if args.mode == "run":
         print("FFL_OK run"); return
 
-    # diff: baseline at -O0 on plain llvm with the same inputs
+    # diff: baseline at -O0 on plain llvm with the same inputs, run twice.
+    # A program whose two baseline runs disagree reads memory it never
+    # wrote (a reduction without an init, an alloc consumed before it is
+    # produced), and no comparison against it means anything: one batch
+    # filed "2.85 vs 1.2e14 (llvm opt 0 vs llvm opt 0)" as a miscompile.
     try:
         base_inputs = _random_inputs(entry[2], np.random.default_rng(args.seed))
         with tvm.transform.PassContext(opt_level=0, config=run_cfg):
             base = _run_once(mod, "llvm", entry, base_inputs)
+        again_inputs = _random_inputs(entry[2], np.random.default_rng(args.seed))
+        with tvm.transform.PassContext(opt_level=0, config=run_cfg):
+            again = _run_once(mod, "llvm", entry, again_inputs)
     except tvm.error.InternalError:
         print("FFL_INTERNAL_ERROR (baseline run)"); traceback.print_exc(); sys.exit(3)
     except Exception as e:
         print(f"FFL_REJECTED baseline: {type(e).__name__}: {str(e)[:300]}"); sys.exit(1)
+    for i, (a, b) in enumerate(zip(base, again)):
+        differs = (_float_disagreement(a, b) is not None) if a.dtype.kind in "fc" \
+            else (a.shape != b.shape or not np.array_equal(a, b))
+        if differs:
+            print(f"FFL_REJECTED nondeterministic: output {i} differs between two identical "
+                  f"baseline runs (uninitialised read in the program)"); sys.exit(1)
     for i, (a, b) in enumerate(zip(out, base)):
         if a.shape != b.shape:
             print(f"FFL_MISMATCH output {i}: shape {a.shape} vs {b.shape}"); sys.exit(4)

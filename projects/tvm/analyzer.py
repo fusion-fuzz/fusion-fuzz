@@ -110,7 +110,14 @@ def classify(output, tool="build", return_code=None):
         return hit("check", f"ICHECK {where}{_normalize(msg)[:70]}".strip())
     m = _MISMATCH_RE.search(out)
     if m:
-        text = re.sub(r"at \([^)]*\)", "at (i)", m.group(1))
+        text = m.group(1)
+        # the compared values and the index are the run's, not the
+        # defect's: keep which output, the target and the opt levels
+        mm = re.match(r"output (\d+)(?: at .*?)?: .*? vs .*? \((target .*?)\)\s*$", text)
+        if mm:
+            text = f"output {mm.group(1)}: V vs V ({mm.group(2)})"
+        else:
+            text = re.sub(r"at \([^)]*\)", "at (i)", text)
         return hit("mismatch", f"Mismatch: {_normalize(text)[:90]}")
     m = _SIGNAL_RE.search(out)
     if m or (return_code is not None and (return_code < 0 or return_code >= 128)):
