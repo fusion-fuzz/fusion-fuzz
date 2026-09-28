@@ -73,6 +73,8 @@ _TARGET_PRECONDITION_RE = re.compile(
     # the module itself is ill-formed for any backend: two exported
     # PrimFuncs with the same global_symbol
     r"Duplicate PrimFunc global_symbol|"
+    # a backend stating a limit of its allocation model
+    r"requires a finite compile-time upper bound|WebGPU allocation|"
     # the module carries undefined variables (the well-formedness
     # complaint a later pass makes), or a Relax operator that a legalise
     # pass was supposed to lower first
@@ -225,6 +227,41 @@ def _constant_oob(script):
         for i, (v, n) in enumerate(zip(indices, shape)):
             if v < 0 or v >= n:
                 return f"{name}[{idx}] outside shape {shape}"
+    return None
+
+
+_ALLOC_RE = re.compile(r"^\s*(\w+)\s*=\s*T\.(?:alloc_buffer|sblock_alloc_buffer)\(", re.M)
+
+
+def _read_before_write(script):
+    """The first access to a buffer the function allocates itself is a read.
+
+    TIR executes in program order, so an internal buffer whose first
+    textual access is a read is read before anything wrote it: a reduction
+    without `T.init()`, or an opaque block that *declares* a write through
+    `access_ptr("w")` and performs none (`T.evaluate` of an address is not
+    a store). The value read is whatever the allocation held, which differs
+    between builds — "1.0 vs 3.0 (core-avx2 opt 2 vs llvm opt 0)" was
+    `garbage * 2 + 1` — so the program cannot be used as a differential
+    test. Returns the buffer name or None. Same-line `A[i] = A[i-1] + 1`
+    counts as a write, so the check is lenient inside loops."""
+    names = set(_ALLOC_RE.findall(script))
+    if not names:
+        return None
+    seen = set()
+    for line in script.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("#") or "T.reads(" in stripped or "T.writes(" in stripped:
+            continue
+        m = re.match(r"(\w+)\[[^\]]*\]\s*=(?!=)", stripped)
+        written = m.group(1) if m else None
+        for name in names:
+            if name in seen:
+                continue
+            if re.search(rf"\b{re.escape(name)}\[", stripped):
+                seen.add(name)
+                if written != name:
+                    return name
     return None
 
 
@@ -609,6 +646,12 @@ def main():
     if oob:
         print(f"FFL_REJECTED out-of-bounds access in the program: {oob}"); sys.exit(1)
     try:
+        rbw = _read_before_write(mod.script())
+    except Exception:
+        rbw = None
+    if rbw:
+        print(f"FFL_REJECTED read-before-write of internal buffer {rbw}"); sys.exit(1)
+    try:
         entry = _entry(mod)
     except Exception as e:  # a shape of IR the detector does not know
         print(f"FFL_OK build (entry detection: {type(e).__name__}: {str(e)[:120]})"); return
@@ -642,10 +685,18 @@ def main():
         base_inputs = _random_inputs(entry[2], np.random.default_rng(args.seed))
         with tvm.transform.PassContext(opt_level=0, config=run_cfg):
             base = _run_once(mod, "llvm", entry, base_inputs)
-        # a fresh arena between the two runs, so a read past a buffer's end
-        # is more likely to see different bytes the second time
+        # Between the two runs: a fresh arena, and one call with *different*
+        # inputs. A program that reads an internal buffer it never wrote (an
+        # opaque block that declares a write through access_ptr and performs
+        # none, a reduction without init) sees the previous call's residue,
+        # so the second baseline then disagrees with the first instead of
+        # matching it by luck — "1.0 vs 3.0 (core-avx2 opt 2 vs llvm opt 0)"
+        # was exactly that: garbage*2+1 with garbage 0 and then 1.
         _junk = np.random.default_rng(args.seed + 1).standard_normal(
             size=random.Random(args.seed).choice([4096, 65536, 1 << 20]))
+        with tvm.transform.PassContext(opt_level=0, config=run_cfg):
+            _run_once(mod, "llvm", entry,
+                      _random_inputs(entry[2], np.random.default_rng(args.seed + 7)))
         again_inputs = _random_inputs(entry[2], np.random.default_rng(args.seed))
         with tvm.transform.PassContext(opt_level=0, config=run_cfg):
             again = _run_once(mod, "llvm", entry, again_inputs)
