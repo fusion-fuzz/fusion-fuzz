@@ -201,6 +201,55 @@ _BUF_DECL_RE = re.compile(r"\b(\w+)\s*(?::\s*T\.Buffer\(\s*\(?([\d,\s]+?)\)?\s*,
 _CONST_ACCESS_RE = re.compile(r"\b(\w+)\[([\d,\s]+)\]")
 
 
+_GRID_RE = re.compile(r"for\s+([\w,\s]+?)\s+in\s+T\.grid\(([\d,\s]+)\)")
+_RANGE_RE = re.compile(r"for\s+(\w+)\s+in\s+(?:range|T\.serial|T\.parallel|T\.vectorized|T\.unroll)\((?:0\s*,\s*)?(\d+)\)")
+_REMAP_RE = re.compile(r"([\w,\s]+?)\s*=\s*T\.axis\.remap\(\s*\"[SR]+\"\s*,\s*\[([\w,\s]+)\]")
+_AXIS_RE = re.compile(r"(\w+)\s*=\s*T\.axis\.(?:S|R|spatial|reduce)\(\s*(\d+)\s*,\s*(\w+)")
+_VAR_ACCESS_RE = re.compile(r"\b(\w+)\[([^\]]+)\]")
+_INDEX_TERM_RE = re.compile(r"^\s*(\w+)\s*(?:([+-])\s*(\d+))?\s*$")
+
+
+def _loop_oob(script, shapes):
+    """`A[vi, vj + 2]` where `vj` spans the whole dimension: the last
+    iterations read past the buffer. Loop extents come from `T.grid` /
+    `range` / `T.serial`, axis extents from `T.axis.remap` (which inherits
+    the loop's) or `T.axis.S(N, i)`. Returns a message or None."""
+    extent = {}
+    for m in _GRID_RE.finditer(script):
+        names = [n.strip() for n in m.group(1).split(",") if n.strip()]
+        sizes = [int(x) for x in m.group(2).replace(" ", "").split(",") if x]
+        for n, sz in zip(names, sizes):
+            extent[n] = sz
+    for m in _RANGE_RE.finditer(script):
+        extent[m.group(1)] = int(m.group(2))
+    for m in _REMAP_RE.finditer(script):
+        outs = [n.strip() for n in m.group(1).split(",") if n.strip()]
+        ins = [n.strip() for n in m.group(2).split(",") if n.strip()]
+        for o, i in zip(outs, ins):
+            if i in extent:
+                extent[o] = extent[i]
+    for m in _AXIS_RE.finditer(script):
+        extent[m.group(1)] = int(m.group(2))
+    if not extent:
+        return None
+    for m in _VAR_ACCESS_RE.finditer(script):
+        name, idx = m.group(1), m.group(2)
+        if name not in shapes:
+            continue
+        terms = idx.split(",")
+        if len(terms) != len(shapes[name]):
+            continue
+        for term, dim in zip(terms, shapes[name]):
+            t = _INDEX_TERM_RE.match(term)
+            if not t or t.group(1) not in extent:
+                continue
+            off = int(t.group(3) or 0) * (1 if (t.group(2) or "+") == "+" else -1)
+            lo, hi = off, extent[t.group(1)] - 1 + off
+            if lo < 0 or hi >= dim:
+                return f"{name}[{idx.strip()}] with {t.group(1)} in [0, {extent[t.group(1)]}) outside dimension {dim}"
+    return None
+
+
 def _constant_oob(script):
     """A buffer access with all-constant indices outside a buffer with an
     all-constant shape, e.g. `B[0, 0] = A[2, 2]` with `A: T.Buffer((2, 3))`.
@@ -233,7 +282,7 @@ def _constant_oob(script):
         for i, (v, n) in enumerate(zip(indices, shape)):
             if v < 0 or v >= n:
                 return f"{name}[{idx}] outside shape {shape}"
-    return None
+    return _loop_oob(script, shapes)
 
 
 _ALLOC_RE = re.compile(r"^\s*(\w+)\s*=\s*T\.(?:alloc_buffer|sblock_alloc_buffer)\(", re.M)
