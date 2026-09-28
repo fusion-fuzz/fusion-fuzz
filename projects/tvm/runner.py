@@ -77,6 +77,8 @@ _TARGET_PRECONDITION_RE = re.compile(
     r"requires a finite compile-time upper bound|WebGPU allocation|"
     # "blockIdx.z is not supported in WebGPU": a backend limit
     r"is not supported in \w+|"
+    # "CodeGenWebGPU only allows constant thread group size"
+    r"only allows |"
     # the module carries undefined variables (the well-formedness
     # complaint a later pass makes), or a Relax operator that a legalise
     # pass was supposed to lower first
