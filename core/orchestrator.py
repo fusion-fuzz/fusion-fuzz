@@ -310,6 +310,12 @@ class FusionFuzzLoop:
             host = parent_a
             for strategy in chain[:-1]:
                 host = strategy.fuse(host, parent_b)
+                if host is None:
+                    # a technique that declines returns None; the next
+                    # one in the chain would read `.content` off it and
+                    # the whole pair was logged as a fusion *error*.
+                    record_degradation("strategy declined mid-chain", type(strategy).__name__)
+                    return [], [], (parent_a, parent_b)
 
             final_strategy = chain[-1]
             bidirectional = hasattr(final_strategy, 'fuse_bidirectional')
@@ -531,6 +537,9 @@ class FusionFuzzLoop:
             host = host_seed
             for strategy in chain:
                 host = strategy.fuse(host, donor_seed)
+                if host is None:
+                    record_degradation("strategy declined mid-chain", type(strategy).__name__)
+                    return None, chain
         except Exception as e:
             logger.warning(f"Fusion error: {e}")
             record_degradation("fusion raised",
