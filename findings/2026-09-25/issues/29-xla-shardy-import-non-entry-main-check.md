@@ -5,7 +5,7 @@
 ## What happens
 
 ```
-F0000 module_attributes_importer.cc:351] Check failed: parameter_shapes.size() == main.getNumArguments() (4 vs. 1)
+F0000 module_attributes_importer.cc:351] Check failed: parameter_shapes.size() == main.getNumArguments() (2 vs. 1)
 ```
 
 `ShardyXLA` imports the HLO module to MLIR and then looks up the function called `main`
