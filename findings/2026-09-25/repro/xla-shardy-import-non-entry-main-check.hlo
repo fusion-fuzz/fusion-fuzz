@@ -1,0 +1,12 @@
+HloModule module
+%recovery_2 (p: f32[2,16]) -> f32[4,16] {
+  %p = f32[2,16]{1,0} parameter(0), sharding={devices=[2,1]<=[2]}
+  ROOT %ag = f32[4,16]{1,0} all-gather(%p), dimensions={0}
+}
+%main (p: f32[4,8]) -> f32[4,8] {
+  %p = f32[4,8]{1,0} parameter(0)
+}
+ENTRY %fusion {
+  %param0 = s4[200]{0:E(4)} parameter(0)
+  %param1 = s4[400]{0:E(4)} parameter(1)
+}
