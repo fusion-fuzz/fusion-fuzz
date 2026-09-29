@@ -50,3 +50,54 @@ it compile. Sharding annotations are irrelevant.
 Either do not fuse instructions that participate in control dependencies, or transfer the
 dependencies to the fusion, as the other fusion passes do. A CHECK on a well-formed module
 is neither.
+
+## Variant: sibling fusion path (`hlo_instructions.cc:3068`)
+
+The same defect is reached through `MultiOutputFusion::FuseSiblings` →
+`HloFusionInstruction::MergeFusionInstructionIntoMultiOutput`, where the CHECK is
+
+```
+F0000 hlo_instructions.cc:3068] Check failed: instruction_to_merge->parent()->RemoveInstruction(instruction_to_merge) is OK
+  (INTERNAL: RET_CHECK failure (xla/hlo/ir/hlo_computation.cc:806) ignore_safety_check || IsSafelyRemovable(instruction)
+   cannot remove instruction: %b.1 = f32[32] fusion(%m), kind=kLoop, calls=%x ...)
+```
+
+Two `call`s of a computation whose two loop fusions are ordered by a control dependency
+(the shape of XLA's command-buffer tests), sharing one operand, get inlined; the two
+`negate` fusions of `%m` are then siblings and the pass merges one that still carries the
+control edge. 23 lines:
+
+```
+x {
+  a = f32[32] parameter(0)
+  ROOT b = f32[32] negate(a)
+}
+y {
+  a = f32[32] parameter(0)
+  ROOT b = f32[32] add(a, a)
+}
+command_buffer {
+  p = f32[32] parameter(0)
+  q = f32[32] parameter(1)
+  b = f32[32] fusion(p), kind=kLoop, calls=x
+  c = f32[32] fusion(q), kind=kLoop, calls=y, control-predecessors={b}
+  ROOT t = (f32[32], f32[32]) tuple(b, c)
+}
+ENTRY main {
+  m = f32[32] parameter(0)
+  n = f32[32] parameter(1)
+  n2 = f32[32] parameter(2)
+  call = (f32[32], f32[32]) call(m, n), to_apply=command_buffer
+  call2 = (f32[32], f32[32]) call(m, n2), to_apply=command_buffer
+  ROOT r = ((f32[32], f32[32]), (f32[32], f32[32])) tuple(call, call2)
+}
+```
+
+```bash
+hlo-opt --platform=gpu --stage=hlo \
+  --xla_gpu_target_config_filename=xla/backends/gpu/target_config/specs/h100_sxm.txtpb \
+  --o=/dev/null mof_siblings.hlo
+```
+
+A single `call` compiles; the crash needs the two calls sharing `%m` (V100 and H100 specs
+checked).
