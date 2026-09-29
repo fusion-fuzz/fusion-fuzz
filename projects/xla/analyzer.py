@@ -176,6 +176,24 @@ def _first_xla_frame(output):
     return None
 
 
+_INT_LIMITS = {"s8": ("127", "-128"), "s16": ("32767", "-32768"),
+               "s32": ("2147483647", "-2147483648"),
+               "s64": ("9223372036854775807", "-9223372036854775808"),
+               "u8": ("255",), "u16": ("65535",), "u32": ("4294967295",),
+               "u64": ("18446744073709551615",)}
+_RESULT_LITERAL_RE = re.compile(r"(?:expected|actual):\s+([su](?:8|16|32|64))\[[^\]]*\]\s*\1\[[^\]]*\]\s*\{(.*?)\n\}", re.S)
+
+
+def _int_overflow_mismatch(out):
+    """True when the compared result is an integer array and either side
+    holds the type's limit values — a float->int conversion overflowed."""
+    for ty, body in _RESULT_LITERAL_RE.findall(out):
+        toks = set(re.findall(r"-?\d+", body))
+        if toks & set(_INT_LIMITS.get(ty, ())):
+            return True
+    return False
+
+
 def classify(output, tool="run_hlo_module", return_code=None):
     """Decide what `output` (stdout+stderr of one run) is.
 
@@ -262,6 +280,13 @@ def classify(output, tool="run_hlo_module", return_code=None):
     #    enough (a reference run that hit UNIMPLEMENTED also fails).
     statuses = _STATUS_RE.findall(out)
     if _MISMATCH_RE.search(out) and not _RNG_RE.search(out):
+        if _int_overflow_mismatch(out):
+            # a float->integer result that hit the integer's limits: the
+            # conversion of an out-of-range float is unspecified in HLO
+            # (the CPU backend saturates, the evaluator wraps or zeros),
+            # so the two runners are allowed to differ. Seen with
+            # --use_large_float_range=true on bf16 x bf16 -> s32 dots.
+            return {"kind": "rejected", "signature": None, "is_bug": False, "is_valid": True}
         mm = re.search(r"first mismatch at array index ([^\n:]*)", out)
         where = ("index " + mm.group(1).strip()) if mm else "result"
         return hit("mismatch", f"Mismatch: CPU vs interpreter ({where})", valid=True)
