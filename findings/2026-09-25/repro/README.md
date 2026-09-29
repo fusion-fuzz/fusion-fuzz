@@ -7,7 +7,7 @@ matching file under `../issues/`.
 assertion needs no source at all, only two `--cuda-gpu-arch` values and a `ptxas`
 invocation that fails.
 
-The nine `xla-*.hlo` files added on 2026-09-29 (issues 18–26) were verified that day
+The `xla-*.hlo` files added on 2026-09-29 (issues 18–28) were verified that day
 against the same openxla/xla `a8f4eee` build; the others were verified on 2026-09-26.
 
 Verified against: openxla/xla `a8f4eee`, triton-lang/triton `d1fc86b`,

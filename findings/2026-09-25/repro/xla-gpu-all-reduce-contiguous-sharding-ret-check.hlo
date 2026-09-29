@@ -1,0 +1,13 @@
+HloModule m, replica_count=4
+add {
+  a = f32[] parameter(0)
+  b = f32[] parameter(1)
+  ROOT s = f32[] add(a, b)
+}
+ENTRY e {
+  p0 = f32[128] parameter(0), sharding={maximal device=0}
+  p1 = f32[128] parameter(1), sharding={maximal device=1}
+  ar0 = f32[128] all-reduce(p0), replica_groups={}, to_apply=add, sharding={maximal device=0}
+  ar1 = f32[128] all-reduce(p1), replica_groups={}, to_apply=add, sharding={maximal device=1}
+  ROOT t = (f32[128], f32[128]) tuple(ar0, ar1), sharding={{maximal device=0}, {maximal device=1}}
+}
