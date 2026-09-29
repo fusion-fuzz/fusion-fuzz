@@ -1,0 +1,6 @@
+HloModule m
+
+ENTRY %e {
+  %tok = token[] after-all()
+  ROOT %t = (token[], token[]) tuple(%tok, %tok)
+}
