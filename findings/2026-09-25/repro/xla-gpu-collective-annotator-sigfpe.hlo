@@ -1,0 +1,9 @@
+sum {
+  a = f32[] parameter(0)
+  b = f32[] parameter(1)
+  ROOT s = f32[] add(a, b)
+}
+ENTRY main {
+  p = f32[8] parameter(0)
+  ROOT ar = f32[8] all-reduce(p), replica_groups={{0,1}}, to_apply=sum
+}
