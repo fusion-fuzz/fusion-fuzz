@@ -89,6 +89,9 @@ class CUDADriver(BaseDriver):
         "-fcuda-short-ptr -fgpu-rdc",
     ]
     NVCC_MODES = [
+        # `--cuda` stops after cudafe++ (EDG's C++ frontend plus the
+        # host/device split): the frontend alone, no cicc and no ptxas.
+        ("--cuda -o /dev/null", 20),
         ("--ptx -o /dev/null", 30),
         ("--cubin -o /dev/null", 20),
         ("-c -o /dev/null", 25),
@@ -99,7 +102,7 @@ class CUDADriver(BaseDriver):
         "--expt-relaxed-constexpr", "--expt-extended-lambda", "--extended-lambda",
         "--use_fast_math", "-Xptxas -O0", "-Xptxas -O3", "-Xptxas -v", "-lineinfo",
         "--fmad=false", "--ftz=true", "--prec-div=false", "--prec-sqrt=false",
-        "-G", "-rdc=true", "-Xcicc -O0", "--restrict", "-std=c++17", "-Wno-deprecated-gpu-targets",
+        "-G", "-rdc=true", "-Xcicc -O0", "--restrict", "-Wno-deprecated-gpu-targets",
         "--device-debug", "-maxrregcount=32", "--extra-device-vectorization",
         # ptxas and cicc knobs, device-link optimisation, threading
         "-Xptxas -O1", "-Xptxas -O2", "-Xptxas --allow-expensive-optimizations=true",
@@ -124,6 +127,17 @@ class CUDADriver(BaseDriver):
         self.cuda_path = info.get("cuda_path") or "/usr/local/cuda"
         self.include_dirs = [d for d in info.get("include_dirs", []) if os.path.isdir(d)]
         self.mem_limit_mb = int(config.get("execution", {}).get("mem_limit_mb", 0) or 0)
+        # execution.compiler: "mixed" (clang CLANG_SHARE of the time, nvcc
+        # otherwise), "nvcc" or "clang". The environment variable wins so a
+        # one-off run can switch without editing config.yaml. nvcc-only is
+        # for fuzzing NVIDIA's own toolchain (cudafe++/cicc/ptxas) without
+        # clang's frontend contributing LLVM bugs to the findings.
+        self.compiler = (os.environ.get("FFL_CUDA_COMPILER")
+                         or config.get("execution", {}).get("compiler", "mixed")).lower()
+        if self.compiler == "nvcc" and not self.nvcc:
+            raise RuntimeError("execution.compiler is nvcc but no nvcc was found")
+        if self.compiler == "clang" and not self.clang:
+            raise RuntimeError("execution.compiler is clang but no clang++ was found")
 
     # ── command construction ──────────────────────────────────────────
 
@@ -160,9 +174,14 @@ class CUDADriver(BaseDriver):
             flags.remove("-fcuda-is-device")
         return f"{base} {' '.join(flags)} {seed_file}"
 
+    #: CUDA 13 dropped every architecture below sm_75 ("Unsupported gpu
+    #: architecture"); clang still accepts them, nvcc must not draw them.
+    NVCC_MIN_CC = 75
+
     def _nvcc_command(self, seed_file, dryrun):
-        real_archs = self.ARCHS + self.NVCC_EXTRA_ARCHS
-        real_weights = self.ARCH_WEIGHTS + self.NVCC_EXTRA_WEIGHTS
+        keep = [i for i, a in enumerate(self.ARCHS) if int(a[3:5]) >= self.NVCC_MIN_CC]
+        real_archs = [self.ARCHS[i] for i in keep] + self.NVCC_EXTRA_ARCHS
+        real_weights = [self.ARCH_WEIGHTS[i] for i in keep] + self.NVCC_EXTRA_WEIGHTS
         if dryrun:
             arch = random.choices(real_archs, weights=real_weights, k=1)[0]
             return (f"{self.nvcc} -arch={arch} -w {self._includes()} "
@@ -199,9 +218,14 @@ class CUDADriver(BaseDriver):
         return f"{base} {' '.join(flags)} {seed_file}"
 
     def _build_command(self, seed_file, dryrun=False):
-        use_clang = bool(self.clang) and (not self.nvcc or random.random() < self.CLANG_SHARE)
-        if dryrun:
-            use_clang = bool(self.clang)
+        if self.compiler == "nvcc":
+            use_clang = False
+        elif self.compiler == "clang":
+            use_clang = True
+        else:
+            use_clang = bool(self.clang) and (not self.nvcc or random.random() < self.CLANG_SHARE)
+            if dryrun:
+                use_clang = bool(self.clang)
         if use_clang:
             return f"{self._ulimit()}{self._clang_command(seed_file, dryrun)}", "clang"
         return f"{self._ulimit()}{self._nvcc_command(seed_file, dryrun)}", "nvcc"

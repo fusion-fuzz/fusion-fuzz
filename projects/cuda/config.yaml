@@ -4,7 +4,12 @@ execution:
   # projects/cuda/driver.py builds the real command per seed (clang CUDA
   # frontend or nvcc, compile-only, random architecture/flags); this is
   # only BaseDriver's fallback.
-  command: "clang++ -x cuda --cuda-device-only -fsyntax-only {seed_path}"
+  command: "nvcc -arch=sm_80 -w --ptx -o /dev/null {seed_path}"
+  # Which compiler the driver draws: "mixed" (clang 60% / nvcc 40%),
+  # "nvcc" (NVIDIA's cudafe++ / cicc / ptxas only — clang's CUDA frontend
+  # shares LLVM with the clang adapter and its bugs belong there), or
+  # "clang". FFL_CUDA_COMPILER in the environment overrides it.
+  compiler: nvcc
   # nvcc runs cudafe++, cicc (an LLVM-based device compiler) and ptxas in
   # sequence and a template-heavy seed (thrust/cub) can take tens of
   # seconds legitimately; clang's device-side -O3 on the same code is
