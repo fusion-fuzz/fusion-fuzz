@@ -197,7 +197,11 @@ def _entry(mod):
     return None
 
 
-_BUF_DECL_RE = re.compile(r"\b(\w+)\s*(?::\s*T\.Buffer\(\s*\(?([\d,\s]+?)\)?\s*,|=\s*T\.(?:match_buffer|alloc_buffer|sblock_alloc_buffer)\(\s*(?:\w+\s*,\s*)?[\[(]([\d,\s]+?)[\])])")
+# `A: T.Buffer((2, 3), "f32")` / `A: T.Buffer(4, "f32")`: the tuple form
+# must be read up to its closing paren — a non-greedy class stopped at the
+# first comma and turned (2, 3) into [2], so every rank-2 access was
+# skipped as a rank mismatch and an OOB store corrupted the heap.
+_BUF_DECL_RE = re.compile(r"\b(\w+)\s*(?::\s*T\.Buffer\(\s*(?:\(([\d,\s]+)\)|(\d+))\s*,|=\s*T\.(?:match_buffer|alloc_buffer|sblock_alloc_buffer)\(\s*(?:\w+\s*,\s*)?[\[(]([\d,\s]+?)[\])])")
 _CONST_ACCESS_RE = re.compile(r"\b(\w+)\[([\d,\s]+)\]")
 
 
@@ -263,7 +267,7 @@ def _constant_oob(script):
     and is rejected before it is executed. Returns a message or None."""
     shapes = {}
     for m in _BUF_DECL_RE.finditer(script):
-        dims = m.group(2) or m.group(3)
+        dims = m.group(2) or m.group(3) or m.group(4)
         try:
             shapes[m.group(1)] = [int(d) for d in dims.replace(" ", "").split(",") if d]
         except ValueError:
