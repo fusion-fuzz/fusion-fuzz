@@ -1,5 +1,0 @@
-ENTRY main {
-  param = s32[8] parameter(0)
-  size = s32[] constant(3)
-  param_dynamic = s32[<=8] set-dimension-size(param, size), dimensions={0}
-}

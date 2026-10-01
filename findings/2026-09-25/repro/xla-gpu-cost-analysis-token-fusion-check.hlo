@@ -1,8 +1,0 @@
-fused_computation {
-  token0 = token[] after-all()
-  constant = u32[3]{0} constant({1,2,3})
-  ROOT  outfeed = token[] outfeed(constant, token0), outfeed_shape=u32[3]{0}
-}
-ENTRY main {
-  ROOT result = token[] fusion(), kind=kLoop, calls=fused_computation
-}

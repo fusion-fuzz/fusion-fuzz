@@ -1,9 +1,0 @@
-ENTRY %entry {
-  %p1 = f32[128]{0} parameter(0)
-  %p2 = f32[512]{0} parameter(1)
-  %cp1s = (f32[512]{0}, f32[512]{0}, u32[], u32[]) collective-permute-start(%p2), source_target_pairs={{1,0},{0,3},{3,2}}, frontend_attributes={_scheduling_group_id="0", keep_original_sequence_order_in_group="true"}
-  %cp1d = f32[512]{0} collective-permute-done(%cp1s), frontend_attributes={_scheduling_group_id="0", keep_original_sequence_order_in_group="true"}
-  %cp2s = (f32[128]{0}, f32[128]{0}, u32[], u32[]) collective-permute-start(%p1), source_target_pairs={{1,0},{0,3},{3,2}}, frontend_attributes={_scheduling_group_id="0"}
-  %cp2d = f32[128]{0} collective-permute-done(%cp2s), frontend_attributes={_scheduling_group_id="0"}
-  ROOT %t = (f32[512]{0}, f32[128]{0}) tuple(%cp1d, %cp2d)
-}
