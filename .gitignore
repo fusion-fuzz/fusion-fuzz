@@ -60,6 +60,7 @@ projects/go/seeds/
 # Lean Project
 projects/lean/lean4/
 projects/lean/seeds/
+projects/lean/toolchain.json
 
 # Haskell Project
 projects/haskell/ghc-src/

@@ -68,6 +68,7 @@ LANGUAGE_ALIASES: Dict[str, str] = {
     "ruby": "ruby", "rb": "ruby",
     "r": "r", "rscript": "r",
     "julia": "julia", "jl": "julia",
+    "lean": "lean", "lean4": "lean",
     "javascript": "javascript", "js": "javascript",
     # TypeScript is JavaScript plus type annotations: the comment and
     # string tokens are identical, and a type annotation never changes
@@ -143,6 +144,22 @@ LIVE_VAR_CONFIGS: Dict[str, LiveVarConfig] = {
     # R has no block scope: an assignment inside an `if`/`for`/`while`
     # body at top level creates a global, and only a `function(...)`
     # body is a new scope. Flat, reset at each function definition.
+    # Lean: a file is a flat sequence of commands and every declaration
+    # stays in the environment for the rest of it, so the state at a
+    # command boundary is everything declared so far — cumulative, never
+    # reset. Locals (`let`, `have`, `intro`) are counted too, which
+    # weights a point after a long proof or `do` block a little higher.
+    "lean": LiveVarConfig(
+        mode="flat",
+        declare=[r'^(?:@\[[^\]]*\]\s*)?(?:(?:private|protected|public|noncomputable|partial|'
+                 r'unsafe|nonrec)\s+)*(?:def|theorem|abbrev|instance|structure|class|inductive|'
+                 r'axiom|opaque)\s+([^\s(:{\[⦃]+)',
+                 r'^variable\s*[({\[]\s*([A-Za-z_][\w\']*)',
+                 r'\blet\s+(?:mut\s+)?([A-Za-z_][\w\']*)',
+                 r'\bhave\s+([A-Za-z_][\w\']*)\s*:',
+                 r'\bintro\s+([A-Za-z_][\w\']*)',
+                 r'^\s*([A-Za-z_][\w\']*)\s*←'],
+    ),
     "r": LiveVarConfig(
         mode="flat",
         declare=[r'^\s*([A-Za-z._][\w._]*)\s*(?:<<?-|=(?!=))',
@@ -291,6 +308,9 @@ _LEXICON = {
                 "quotes": ['"""', '"', "'", "`"]},
     "swift":   {"line": ["//"], "block": [("/*", "*/")], "quotes": ['"']},
     "haskell": {"line": ["--"], "block": [("{-", "-}")], "quotes": ['"']},
+    # Lean's block comments nest; the outermost pair wins here (the
+    # segment rule itself uses core/lean_text.py's nesting-aware scan).
+    "lean":    {"line": ["--"], "block": [("/-", "-/")], "quotes": ['"']},
     # Fortran uses doubled-quote escaping ('' / "") rather than backslash
     # escaping; the generic backslash-aware scanner below is a reasonable
     # approximation (worst case: it closes a string one quote earlier than
@@ -1016,6 +1036,13 @@ def _compute_segment_boundaries(content: str, language: str) -> List[int]:
     lines = content.splitlines()
     if not lines:
         return []
+    if LANGUAGE_ALIASES.get(str(language).lower(), language) == "lean":
+        # A Lean file is cut between commands only, and a command boundary
+        # is a fact about the command grammar (doc comments, attributes and
+        # `... in` prefixes bind to the next command; `mutual` blocks do
+        # not split), not about delimiter depth.
+        from . import lean_text
+        return lean_text.segment_boundaries(content)
     mask = _lexical_mask(content, language)
     offsets, off = [], 0
     for ln in lines:

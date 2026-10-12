@@ -134,14 +134,13 @@ engines.
 | ![Ruby](https://img.shields.io/badge/Ruby-experimental-orange?logo=ruby&logoColor=white) | Ruby | **Experimental** | ✅ | ✅ | ✅ |
 | ![R](https://img.shields.io/badge/R-experimental-orange?logo=r&logoColor=white) | R | **Experimental** | ✅ | ✅ | ✅ |
 | ![Julia](https://img.shields.io/badge/Julia-experimental-orange?logo=julia&logoColor=white) | Julia | **Experimental** | ✅ | ✅ | ✅ |
+| ![Lean](https://img.shields.io/badge/Lean_4-experimental-orange) | Lean 4 (compiler built from source with assertions, optional ASan/UBSan) | **Experimental** | ✅ | ✅ | ✅ |
 
 **Supported** means the adapter has been run at length, its valid-fusion rate
 measured, and real bugs reported from it. **Experimental** means all three
 fusion strategies are wired and the adapter runs end to end, but it has had far
 less fuzzing time, so its valid-fusion rate and its oracle's false-positive
 behaviour are not yet well characterised.
-
-**Bugs found by Fusion Fuzz are tracked at https://fusion-fuzz.github.io (updated periodically).**
 
 Try fusion-fuzz: 
 

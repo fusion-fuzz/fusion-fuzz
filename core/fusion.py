@@ -35,7 +35,7 @@ class FusionStrategy(abc.ABC):
         "swift": "//", "mlir": "//", "rust": "//", "haskell": "--",
         "naga": "//", "wgsl": "//", "ruby": "#", "typescript": "//", "r": "#",
         "mojo": "#", "tvm": "#",
-        "julia": "#", "xla": "//",
+        "julia": "#", "xla": "//", "lean": "--",
     }
 
     def _tag(self, kind: str) -> str:
@@ -16280,6 +16280,657 @@ class TVMDeclarationFusionStrategy(TVMFusionStrategy):
                             self._fuse_decl(parent_b, parent_a, "ba")) if c]
 
 
+# ---------------------------------------------------------------------------
+# Lean 4
+# ---------------------------------------------------------------------------
+#
+# A Lean file is a header (`module`/`import`) and a flat sequence of
+# commands; core/lean_text.py reads one (commands, scopes, declarations,
+# `by`/`do` blocks). All three techniques put both parents in one file
+# under one merged header, and all of them first rename every donor
+# declaration whose name the host already declares: the orchestrator
+# chains techniques with the same donor, so without that a chained child
+# declares the donor's names twice and fails on "already declared" before
+# anything interesting runs.
+#
+#   dataflow     the donor follows the host, and some of the donor's uses
+#                of its own names (a declaration, or a binder of the
+#                declaration it sits in) are pointed at a host declaration
+#                instead — preferably one with the same declared type, so
+#                the edge type-checks and a host value really flows into
+#                the donor's computation.
+#   state        the four-segment interleave at three granularities: the
+#                file's command sequence (closing and reopening the
+#                namespaces/sections open at each cut), a tactic proof
+#                (the donor's tactics run on the host's goal — the proof
+#                state is Lean's program state — each segment under `try`
+#                so a tactic that does not apply is a no-op, and the
+#                kernel re-checks whatever proof comes out), and a `do`
+#                block of two `IO Unit` programs.
+#   declaration  a host declaration is made to depend on a donor one:
+#                `extends` a donor structure, a constructor taking a donor
+#                type, a new inductive/structure over both with derived
+#                instances, a host and a donor definition in one `mutual`
+#                block, or a host theorem registered with an attribute
+#                (`simp`, `grind`) the donor's proofs then use.
+
+from core import lean_text as _lean
+
+
+class LeanFusionStrategy(FusionStrategy):
+    """Dataflow fusion for Lean 4 (projects/lean)."""
+
+    LANGUAGE = "lean"
+    _TYPED_SHARE = 0.6
+    _KINDED_SHARE = 0.85
+    _PROBE_SHARE = 0.5
+
+    def __init__(self, project_root="projects/lean", lightweight: bool = False):
+        self.project_root = project_root
+        self.mutation = True
+        self.mut = BaseMutator()
+        self.lightweight = lightweight
+
+    # ── shared helpers ──────────────────────────────────────────────
+
+    def _strip_comments(self, code: str) -> str:
+        return _lean.mask(code)
+
+    def _split(self, seed: Seed):
+        header, body = _lean.split_header(seed.content)
+        if self.mutation:
+            body = self.mut.mutate(body)
+        return header, body
+
+    @staticmethod
+    def _closed(body: str) -> str:
+        """`body` with the namespaces/sections it leaves open closed, so
+        that whatever follows it is at the root again."""
+        stack = _lean.open_scopes_at_end(body)
+        return body.rstrip("\n") + ("\n" + "\n".join(_lean.close_scopes(stack)) if stack else "")
+
+    def _meta(self, extra: dict) -> dict:
+        return {"type": "lean", "extension": ".lean", **extra}
+
+    # ── dataflow ────────────────────────────────────────────────────
+
+    @staticmethod
+    def _norm(t: str) -> str:
+        return " ".join(t.replace("(", " ( ").replace(")", " ) ").split())
+
+    def _host_pool(self, code_a: str):
+        out = []
+        for d in _lean.declarations(code_a):
+            if d.kind == "example" or not d.fqname:
+                continue
+            out.append(d)
+        return out
+
+    def _donor_targets(self, code_b: str):
+        """[(name, kind_class, signature, (lo, hi) offsets or None)]: names
+        the donor uses that it declares itself — its declarations (renamed
+        file-wide) and the explicit binders of each declaration (renamed
+        inside that declaration only)."""
+        lines = code_b.split("\n")
+        offs = [0]
+        for ln in lines:
+            offs.append(offs[-1] + len(ln) + 1)
+        cmds = _lean.split_commands(code_b)
+        masked_lines = _lean.mask(code_b).split("\n")
+        targets = []
+        for d in _lean.declarations(code_b, cmds):
+            sig = self._norm(d.binders + " : " + d.type) if d.type else None
+            targets.append((d.name.split(".")[-1], _lean.kind_class(d.kind), sig, None, d))
+        # Binders are renamed inside their own command only: those of every
+        # declaration, and of every `example` (most of the test suite is
+        # examples, which declare no name a host could stand in for).
+        for cmd in cmds:
+            if cmd.keyword not in _lean.DECL_KEYWORDS:
+                continue
+            head = "\n".join(masked_lines[cmd.head_line:cmd.end])
+            cut = re.search(r":=|\bwhere\b|\n\|", head)
+            binders = head[:cut.start()] if cut else head
+            lo, hi = offs[cmd.start], offs[min(cmd.end, len(lines))]
+            for grp, typ in _lean._BINDER_RE.findall(binders):
+                for nm in grp.split():
+                    if re.match(r"^[A-Za-z_][\w']*$", nm) and nm not in _lean.KEYWORDS:
+                        targets.append((nm, "term", self._norm(" : " + typ), (lo, hi), None))
+        return targets
+
+    def _use_sites(self, code: str, name: str, span, decl_heads):
+        m = _lean.mask(code)
+        pat = _lean.ident_pattern(name)
+        out = []
+        for x in pat.finditer(m):
+            if span and not (span[0] <= x.start() < span[1]):
+                continue
+            if x.start() in decl_heads:
+                continue
+            # a binder occurrence `(name :` / `fun name =>` is a definition
+            tail = m[x.end():x.end() + 4]
+            head = m[max(0, x.start() - 4):x.start()]
+            if re.match(r"\s*:(?!=)", tail) and re.search(r"[({\[⦃]\s*$|\s$", head) and \
+                    re.search(r"[({\[⦃]", m[max(0, x.start() - 40):x.start()]):
+                continue
+            out.append(x.start())
+        return out
+
+    def _decl_heads(self, code: str):
+        m = _lean.mask(code)
+        heads = set()
+        for x in _lean._NAME_AFTER_KW_RE.finditer(m):
+            heads.add(x.start("name"))
+            # `def Ns.name`: the last component is what a rename matches
+            nm = x.group("name")
+            if "." in nm:
+                heads.add(x.start("name") + nm.rfind(".") + 1)
+        return heads
+
+    def rename_across(self, code_a: str, code_b: str, names_a=None, names_b=None):
+        pool = self._host_pool(code_a)
+        if not pool:
+            return code_a, code_b
+        targets = self._donor_targets(code_b)
+        heads = self._decl_heads(code_b)
+        usable = []
+        for t in targets:
+            sites = self._use_sites(code_b, t[0], t[3], heads)
+            if sites:
+                usable.append((t, sites))
+        if not usable:
+            return code_a, code_b
+        r = random.random()
+        choice = None
+        tier = "any"
+        if r < self._TYPED_SHARE:
+            by_sig = collections.defaultdict(list)
+            for d in pool:
+                if d.type:
+                    by_sig[self._norm((d.binders + " : " if d.binders else " : ") + d.type)].append(d)
+                    if not d.binders:
+                        by_sig[self._norm(" : " + d.type)].append(d)
+            typed = [(t, s, by_sig[t[2]]) for t, s in usable if t[2] and by_sig.get(t[2])]
+            # A host function `f (x : T) : T` (or `f : T → T`) can take
+            # any donor value of type T: the use `y` becomes `(f y)`, and
+            # the donor computes on what the host function made of its
+            # value.
+            endo = collections.defaultdict(list)
+            for d in pool:
+                if d.kind not in ("def", "abbrev") or re.search(r"[{\[⦃]", d.binders):
+                    continue
+                bs = _lean._BINDER_RE.findall(d.binders)
+                if len(bs) == 1 and len(bs[0][0].split()) == 1 and \
+                        self._norm(bs[0][1]) == self._norm(d.type):
+                    endo[self._norm(" : " + d.type)].append(d)
+                elif not d.binders and "→" in d.type:
+                    parts = [self._norm(x) for x in d.type.split("→")]
+                    if len(parts) == 2 and parts[0] == parts[1]:
+                        endo[self._norm(" : " + parts[0])].append(d)
+            wraps = [(t, s, endo[t[2]]) for t, s in usable if t[2] and endo.get(t[2])]
+            if wraps and (not typed or random.random() < 0.5):
+                (name, _k, _sig, _span, _d), sites, cands = random.choice(wraps)
+                f = random.choice(cands)
+                n = min(pick_occurrence_count(), len(sites))
+                chosen = sorted(random.sample(sites, n), reverse=True)
+                out = code_b
+                for pos in chosen:
+                    out = out[:pos] + f"({f.fqname} {name})" + out[pos + len(name):]
+                if out != code_b:
+                    self._last_edge = (name, f.fqname, "through")
+                    return code_a, self._tag_renamed_lines(code_b, out)
+            if typed:
+                t, s, cands = random.choice(typed)
+                choice = (t, s, random.choice(cands))
+                tier = "typed"
+        if choice is None and r < self._KINDED_SHARE:
+            kinded = []
+            for t, s in usable:
+                same = [d for d in pool if _lean.kind_class(d.kind) == t[1]]
+                if same:
+                    kinded.append((t, s, same))
+            if kinded:
+                t, s, cands = random.choice(kinded)
+                choice = (t, s, random.choice(cands))
+                tier = "kinded"
+        if choice is None:
+            t, s = random.choice(usable)
+            choice = (t, s, random.choice(pool))
+        (name, _k, _sig, _span, _d), sites, target = choice
+        if target.fqname.split(".")[-1] == name and target.fqname == name:
+            return code_a, code_b
+        n = min(pick_occurrence_count(), len(sites))
+        chosen = set(random.sample(sites, n))
+        renamed = _lean.replace_ident(code_b, name, target.fqname, positions=chosen)
+        if renamed == code_b:
+            return code_a, code_b
+        self._last_edge = (name, target.fqname, tier)
+        return code_a, self._tag_renamed_lines(code_b, renamed)
+
+    def _resists_tagging(self, line: str) -> bool:
+        # A `--` tag after an unterminated string or block comment would
+        # land inside it; masking the line alone tells us.
+        s = line.rstrip()
+        return s.endswith("\\") or s.count('"') % 2 == 1 or "/-" in s and "-/" not in s
+
+    def _probes(self, code: str, names):
+        """Commands that push a fused name through more of the system than
+        its definition did: the delaborator (`#print`), the kernel's axiom
+        traversal (`#print axioms`), the compiler and the interpreter
+        (`#eval`), and definitional unfolding checked by the kernel
+        (`example ... := rfl`)."""
+        if not names or random.random() >= self._PROBE_SHARE:
+            return ""
+        decls = {d.fqname: d for d in _lean.declarations(code)}
+        out = []
+        for nm in random.sample(sorted(names), min(2, len(names))):
+            d = decls.get(nm)
+            opts = [f"#print {nm}", f"#print axioms {nm}", f"#check @{nm}"]
+            if d is not None and d.kind in ("def", "abbrev") and not d.binders and \
+                    d.type and not re.search(r"\bProp\b|\bType\b|→|∀", d.type):
+                opts += [f"#eval {nm}", f"example : {nm} = {nm} := rfl",
+                         f"#reduce {nm}"]
+            out.append(random.choice(opts))
+        tag = self._tag("dataflow")
+        return "\n".join(f"{c}  {tag}" for c in out)
+
+    def fuse(self, parent_a: Seed, parent_b: Seed) -> Seed:
+        ha, body_a = self._split(parent_a)
+        hb, body_b = self._split(parent_b)
+        body_b, _ = _lean.rename_collisions(body_b, body_a)
+        body_a = self._closed(body_a)
+        body_b = self._closed(body_b)
+        self._last_edge = None
+        direction = "ab"
+        before = body_b
+        body_a, body_b = self.rename_across(body_a, body_b)
+        renamed = body_b != before
+        if not renamed and not self._host_pool(body_a) and self._host_pool(body_b):
+            # The host declares nothing a donor use could be pointed at
+            # (a file of `example`s): ask the reverse question, with the
+            # donor's declarations first so they are in scope.
+            before = body_a
+            body_b, body_a = self.rename_across(body_b, body_a)
+            renamed = body_a != before
+            if renamed:
+                body_a, body_b = body_b, body_a
+                direction = "ba"
+        probes = self._probes(body_a, {self._last_edge[1]} if renamed and self._last_edge else
+                              {d.fqname for d in self._host_pool(body_a)[:5]})
+        content = _lean.assemble(_lean.merge_headers(ha, hb), body_a, body_b, probes)
+        tier = self._last_edge[2] if renamed and self._last_edge else "none"
+        return Seed(content=content, metadata=self._meta({
+            "parents": [parent_a.id, parent_b.id],
+            "mode": f"df_{tier}_{direction}",
+            "description": f"Fused {parent_a.id} + {parent_b.id}",
+        }))
+
+
+class LeanStateFusionStrategy(LeanFusionStrategy):
+    """State fusion for Lean 4: command-level, tactic-level or `do`-level
+    four-segment interleave (see the section comment)."""
+
+    _TACTIC_SHARE = 0.45
+    _DO_SHARE = 0.5
+
+    # ── command level ───────────────────────────────────────────────
+
+    def _cut(self, body: str):
+        """(prefix_lines, suffix_lines) of `body` at a state point, with the
+        scopes open there closed at the end of the prefix and reopened at
+        the start of the suffix."""
+        from .state_analysis import pick_state_point, split_at_point
+        point = pick_state_point(body, "lean", self.project_root,
+                                 lightweight=getattr(self, "lightweight", False))
+        res = split_at_point(body, point, "lean")
+        if res is None:
+            lines = body.split("\n")
+            return lines, [], point
+        prefix, suffix, split = res
+        cmds = _lean.split_commands(body)
+        k = next((i for i, c in enumerate(cmds) if c.start >= split), len(cmds))
+        stack = _lean.scope_stack_before(cmds, k, body.split("\n"))
+        if stack and suffix:
+            prefix = list(prefix) + _lean.close_scopes(stack)
+            suffix = _lean.reopen_scopes(stack) + list(suffix)
+        return list(prefix), list(suffix), point
+
+    def _tagged(self, seg):
+        seg = list(seg)
+        idx = next((i for i, ln in enumerate(seg) if ln.strip() and not self._resists_tagging(ln)
+                    and not ln.lstrip().startswith(("/-", "--"))), None)
+        if idx is not None:
+            seg[idx] = f"{seg[idx]}  {self._tag('state')}"
+        return seg
+
+    def _command_level(self, hbody, dbody):
+        hp, hs, hpt = self._cut(hbody)
+        dp, ds, _ = self._cut(dbody)
+        fused = "\n".join(hp + [""] + self._tagged(dp) + [""] + hs + [""] + self._tagged(ds))
+        return fused, f"cmd_{hpt.category if hpt else 'end'}"
+
+    # ── block level ─────────────────────────────────────────────────
+
+    def _decl_of_line(self, cmds, line):
+        for c in cmds:
+            if c.start <= line < c.end:
+                return c
+        return None
+
+    def _pick_block(self, body, kind, min_stmts):
+        cmds = _lean.split_commands(body)
+        out = []
+        for b in _lean.blocks(body):
+            if b.kind != kind or len(b.stmt_lines) < min_stmts:
+                continue
+            c = self._decl_of_line(cmds, b.opener_line)
+            if c is None or c.keyword not in _lean.DECL_KEYWORDS:
+                continue
+            if kind == "do":
+                head = "\n".join(body.split("\n")[c.start:b.opener_line + 1])
+                if ":=" not in head or not re.search(r"\bIO\s+(?:P?Unit|Unit)\b", head):
+                    continue
+            out.append((b, c))
+        return out
+
+    def _live(self, body_lines, cmd, block, cut_line):
+        d_binders = ""
+        for d in _lean.declarations("\n".join(body_lines[cmd.start:cmd.end])):
+            d_binders = d.binders
+            break
+        names = _lean.binder_names(d_binders)
+        names += _lean.hypotheses(body_lines[block.start:cut_line])
+        return list(dict.fromkeys(names))
+
+    def _block_level(self, hbody, dbody, kind):
+        hcands = self._pick_block(hbody, kind, 1)
+        dcands = self._pick_block(dbody, kind, 1)
+        if not hcands or not dcands:
+            return None
+        hb, hc = random.choice(hcands)
+        db, dc = random.choice(dcands)
+        hl = hbody.split("\n")
+        dl = dbody.split("\n")
+        # Host cut: before one of its statements, or at the end of the
+        # block, weighted by how many hypotheses/locals are live there.
+        cuts = hb.stmt_lines[1:] + [hb.end]
+        weights = [1 + len(self._live(hl, hc, hb, c)) for c in cuts]
+        hcut = random.choices(cuts, weights=weights, k=1)[0]
+        dcuts = db.stmt_lines[1:] + [db.end]
+        dcut = random.choice(dcuts)
+        dpre = dl[db.start:dcut]
+        dsuf = dl[dcut:db.end]
+        # Bridge: some of the donor's local names become host ones live at
+        # the cut, so a donor tactic `simp at h` / `exact h` acts on a host
+        # hypothesis instead of failing on an unknown name.
+        host_live = self._live(hl, hc, hb, hcut)
+        donor_live = self._live(dl, dc, db, db.end)
+        mapping = {}
+        if host_live:
+            for n in donor_live:
+                if random.random() < 0.5:
+                    mapping[n] = random.choice(host_live)
+        def bridge(seg):
+            text = "\n".join(seg)
+            for old, new in mapping.items():
+                if old != new:
+                    text = _lean.replace_ident(text, old, new)
+            return text.split("\n") if text else []
+        dpre, dsuf = bridge(dpre), bridge(dsuf)
+        tag = self._tag("state")
+        ind = " " * hb.indent
+
+        def wrap(seg):
+            if not any(s.strip() for s in seg):
+                return []
+            body = _lean.reindent(seg, db.indent, hb.indent + (2 if kind == "by" else 0))
+            if kind == "by":
+                return [f"{ind}try  {tag}"] + body
+            return self._tagged(body)
+
+        new_lines = (hl[:hcut] + wrap(dpre) + hl[hcut:hb.end] + wrap(dsuf) + hl[hb.end:])
+        fused_host = "\n".join(new_lines)
+        return fused_host, f"{kind}_{len(host_live)}live"
+
+    # ── fuse ────────────────────────────────────────────────────────
+
+    def _build_state_fused(self, host: Seed, donor: Seed, direction: str) -> Seed:
+        hh, hbody = self._split(host)
+        dh, dbody = self._split(donor)
+        dbody, _ = _lean.rename_collisions(dbody, hbody)
+        mode = None
+        fused = None
+        # The granularity is drawn among those this pair supports: most
+        # pairs have no `do` program on both sides, and drawing the share
+        # blind would almost never reach it.
+        for kind, share in (("do", self._DO_SHARE), ("by", self._TACTIC_SHARE)):
+            if random.random() >= share:
+                continue
+            res = self._block_level(hbody, dbody, kind)
+            if res:
+                # the donor's whole program goes first: its tactics and
+                # statements name its own lemmas and definitions
+                fused = self._closed(dbody) + "\n\n" + res[0]
+                mode = res[1]
+                break
+        if fused is None:
+            fused, mode = self._command_level(hbody, dbody)
+        content = _lean.assemble(_lean.merge_headers(hh, dh), fused)
+        return Seed(content=content, metadata=self._meta({
+            "parents": [host.id, donor.id],
+            "mode": f"state_{mode}_{direction}",
+            "description": f"State-fused {host.id} <- {donor.id} ({direction})",
+        }))
+
+    def fuse(self, parent_a: Seed, parent_b: Seed) -> Seed:
+        return self._build_state_fused(parent_a, parent_b, "ab")
+
+    def fuse_bidirectional(self, parent_a: Seed, parent_b: Seed) -> List[Seed]:
+        return [self._build_state_fused(parent_a, parent_b, "ab"),
+                self._build_state_fused(parent_b, parent_a, "ba")]
+
+
+class LeanDeclarationFusionStrategy(LeanFusionStrategy):
+    """Declaration fusion for Lean 4 (see the section comment). Every mode
+    makes a *host* declaration's elaboration depend on a *donor*
+    declaration, which is what puts the two programs' declarations through
+    the same checks: structure elaboration with inherited fields,
+    inductive positivity and recursor/`noConfusion`/`sizeOf` generation,
+    the deriving handlers, mutual-recursion elaboration and termination
+    checking, and simp/grind lemma registration."""
+
+    DERIVINGS = ["Repr", "BEq", "Hashable", "DecidableEq", "Ord", "Inhabited",
+                 "Nonempty", "ReflBEq", "LawfulBEq"]
+    ATTRIBUTES = ["simp", "grind =", "grind", "grind →", "grind ←", "grind _=_",
+                  "local simp", "simp ←", "simp ↓"]
+    DEF_ATTRIBUTES = ["simp", "grind", "grind =", "irreducible", "reducible", "semireducible",
+                      "inline", "noinline", "specialize", "macro_inline", "instance",
+                      "local simp", "match_pattern", "always_inline", "implicit_reducible"]
+
+    def _type_ref(self, d):
+        """A closed type expression for type declaration `d`, or None:
+        explicit `(α : Type ...)`/`(α : Sort ...)` parameters are
+        instantiated with `Nat`, anything else is not attempted."""
+        if d.params_free:
+            return d.fqname
+        params = _lean._BINDER_RE.findall(d.binders)
+        if re.search(r"[{\[⦃]", d.binders):
+            return None
+        args = []
+        for grp, typ in params:
+            if not re.match(r"^\s*(?:Type|Sort)\b", typ):
+                return None
+            args += ["Nat"] * len(grp.split())
+        return f"({d.fqname} {' '.join(args)})" if args else d.fqname
+
+    def _types(self, body):
+        return [(d, self._type_ref(d)) for d in _lean.declarations(body)
+                if d.kind in ("structure", "inductive", "class") and self._type_ref(d)]
+
+    def is_viable_pair(self, parent_a: Seed, parent_b: Seed) -> bool:
+        a = _lean.split_header(parent_a.content)[1]
+        b = _lean.split_header(parent_b.content)[1]
+        da, db = _lean.declarations(a), _lean.declarations(b)
+        return bool(da) and bool(db)
+
+    # each mode returns (content_body, mode) or None
+
+    def _mode_extends(self, hbody, dbody):
+        hs = [d for d in _lean.declarations(hbody) if d.kind in ("structure", "class")]
+        ds = [d for d in _lean.declarations(dbody) if d.kind in ("structure", "class")]
+        if not hs or not ds:
+            return None
+        h = random.choice(hs)
+        d = random.choice(ds)
+        ref = d.fqname if d.params_free else None
+        if ref is None:
+            hparams = _lean.binder_names(h.binders)
+            if d.explicit_arity == 1 and hparams:
+                ref = f"{d.fqname} {hparams[0]}"
+            else:
+                return None
+        cmds = _lean.split_commands(hbody)
+        cmd = cmds[h.command_index]
+        lines = hbody.split("\n")
+        tag = self._tag("declaration")
+        for i in range(cmd.head_line, cmd.end):
+            ln = lines[i]
+            m = re.search(r"\bextends\b", ln)
+            if m:
+                lines[i] = ln[:m.end()] + f" {ref}," + ln[m.end():] + f"  {tag}"
+                break
+            m = re.search(r"\s(where|:=)\s*$|\swhere\s", ln)
+            if m:
+                lines[i] = ln[:m.start()] + f" extends {ref}" + ln[m.start():] + f"  {tag}"
+                break
+        else:
+            lines[cmd.head_line] = lines[cmd.head_line].rstrip() + f" extends {ref}  {tag}"
+        return self._closed(dbody) + "\n\n" + "\n".join(lines), "extends"
+
+    def _mode_ctor(self, hbody, dbody):
+        hs = [d for d in _lean.declarations(hbody) if d.kind == "inductive" and
+              (not d.type or re.match(r"^(?:Type|Prop|Sort)\b[\w\s]*$", d.type))]
+        ds = self._types(dbody)
+        if not hs or not ds:
+            return None
+        h = random.choice(hs)
+        d, dref = random.choice(ds)
+        hself = h.fqname.split(".")[-1]
+        hargs = _lean.binder_names(h.binders)
+        hty = f"({hself} {' '.join(hargs)})" if hargs else hself
+        arg = random.choice([dref, f"List {dref}", f"Option {dref}", f"{dref} → {hty}",
+                             f"Array {hty}", f"{hty} → {dref}", f"{dref} × {hty}"])
+        cmds = _lean.split_commands(hbody)
+        cmd = cmds[h.command_index]
+        lines = hbody.split("\n")
+        # after the last constructor line (before `deriving`)
+        last = None
+        m = _lean.mask(hbody).split("\n")
+        for i in range(cmd.head_line, cmd.end):
+            if re.match(r"^\s*\|", m[i]):
+                last = i
+        if last is None:
+            return None
+        j = last + 1
+        while j < cmd.end and m[j].strip() and not re.match(r"^\s*(?:\||deriving\b)", m[j]) \
+                and (len(m[j]) - len(m[j].lstrip())) > (len(m[last]) - len(m[last].lstrip())):
+            j += 1
+        indent = re.match(r"^\s*", lines[last]).group(0)
+        cname = f"fflCtor{random.randint(0, 9999)}"
+        lines.insert(j, f"{indent}| {cname} (x : {arg})  {self._tag('declaration')}")
+        return self._closed(dbody) + "\n\n" + "\n".join(lines), "ctor"
+
+    def _mode_mix(self, hbody, dbody):
+        hs, ds = self._types(hbody), self._types(dbody)
+        if not hs or not ds:
+            return None
+        (_h, href), (_d, dref) = random.choice(hs), random.choice(ds)
+        k = random.randint(0, 99999)
+        der = random.sample(self.DERIVINGS, random.randint(1, 3))
+        tag = self._tag("declaration")
+        if random.random() < 0.5:
+            decl = (f"inductive FflMix{k} where  {tag}\n"
+                    f"  | host : {href} → FflMix{k}\n"
+                    f"  | donor : {dref} → FflMix{k}\n"
+                    f"  | both : {href} → {dref} → List FflMix{k} → FflMix{k}\n"
+                    f"  deriving {', '.join(der)}")
+        else:
+            decl = (f"structure FflPair{k} where  {tag}\n"
+                    f"  host : {href}\n"
+                    f"  donor : {dref}\n"
+                    f"  deriving {', '.join(der)}")
+        return self._closed(dbody) + "\n\n" + self._closed(hbody) + "\n\n" + decl, "mix"
+
+    def _mode_mutual(self, hbody, dbody):
+        hd = [d for d in _lean.declarations(hbody) if d.kind == "def" and d.depth == 0]
+        dd = [d for d in _lean.declarations(dbody) if d.kind == "def" and d.depth == 0]
+        if not hd or not dd:
+            return None
+        h, d = random.choice(hd), random.choice(dd)
+        hcmds, dcmds = _lean.split_commands(hbody), _lean.split_commands(dbody)
+        hc, dc = hcmds[h.command_index], dcmds[d.command_index]
+        hl, dl = hbody.split("\n"), dbody.split("\n")
+        dpre = "\n".join(dl[:dc.start])
+        dpost = "\n".join(dl[dc.end:])
+        tag = self._tag("declaration")
+        block = ([f"mutual  {tag}"] + hl[hc.start:hc.end] + [""] + dl[dc.start:dc.end] + ["end"])
+        new_host = "\n".join(hl[:hc.start] + block + hl[hc.end:])
+        return "\n\n".join(p for p in (dpre, new_host, dpost) if p.strip()), "mutual"
+
+    def _mode_attr(self, hbody, dbody):
+        cands = [d for d in _lean.declarations(hbody) if d.kind in ("theorem", "lemma", "def", "abbrev")]
+        if not cands:
+            return None
+        t = random.choice(cands)
+        # On a definition, `simp`/`grind` register its equation lemmas
+        # (generated on demand — structural and well-founded recursion
+        # each have their own generator); the transparency and compiler
+        # attributes change how the donor's `rfl`/`decide`/`simp` and the
+        # code generator see it.
+        attr = random.choice(self.ATTRIBUTES if t.kind in ("theorem", "lemma") else self.DEF_ATTRIBUTES)
+        line = f"attribute [{attr}] {t.fqname}  {self._tag('declaration')}"
+        return self._closed(hbody) + "\n\n" + line + "\n\n" + dbody, "attr"
+
+    def _build_declaration_fused(self, host: Seed, donor: Seed, direction: str) -> Seed:
+        hh, hbody = self._split(host)
+        dh, dbody = self._split(donor)
+        dbody, _ = _lean.rename_collisions(dbody, hbody)
+        modes = [self._mode_extends, self._mode_ctor, self._mode_mix,
+                 self._mode_mutual, self._mode_attr]
+        random.shuffle(modes)
+        res = None
+        for m in modes:
+            res = m(hbody, dbody)
+            if res:
+                break
+        if res is None:
+            # Nothing of the donor's fits the host (a host of `example`s
+            # declares nothing to extend or register): the dependency can
+            # still run the other way between the same two programs.
+            hbody2, _ = _lean.rename_collisions(hbody, dbody)
+            for m in modes:
+                res = m(dbody, hbody2)
+                if res:
+                    direction = f"{direction}r"
+                    break
+        if res is None:
+            body, mode = self._closed(hbody) + "\n\n" + dbody, "none"
+        else:
+            body, mode = res
+        content = _lean.assemble(_lean.merge_headers(hh, dh), body)
+        return Seed(content=content, metadata=self._meta({
+            "parents": [host.id, donor.id],
+            "mode": f"decl_{mode}_{direction}",
+            "description": f"Declaration-fused {host.id} <- {donor.id} ({direction})",
+        }))
+
+    def fuse(self, parent_a: Seed, parent_b: Seed) -> Seed:
+        return self._build_declaration_fused(parent_a, parent_b, "ab")
+
+    def fuse_bidirectional(self, parent_a: Seed, parent_b: Seed) -> List[Seed]:
+        return [self._build_declaration_fused(parent_a, parent_b, "ab"),
+                self._build_declaration_fused(parent_b, parent_a, "ba")]
+
+
 class _CUDALangMixin:
     """`.cu` in, `.cu` out: CUDA sources are C++ already, so the C-to-C++
     spelling rewrite is a no-op and the child never becomes a .c file."""
@@ -16382,6 +17033,8 @@ STRATEGY_REGISTRY = {
                              TVMDeclarationFusionStrategy, TVMStateFusionStrategy),
     "mojo":     _StrategySet("projects/mojo",     MojoFusionStrategy,
                              MojoDeclarationFusionStrategy, MojoStateFusionStrategy),
+    "lean":     _StrategySet("projects/lean",     LeanFusionStrategy,
+                             LeanDeclarationFusionStrategy, LeanStateFusionStrategy),
     "xla":      _StrategySet("projects/xla",      XLAFusionStrategy,
                              XLADeclarationFusionStrategy, XLAStateFusionStrategy),
 }

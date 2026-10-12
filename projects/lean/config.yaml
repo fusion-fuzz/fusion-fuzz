@@ -1,0 +1,70 @@
+project_name: "lean"
+
+execution:
+  # projects/lean/driver.py builds the real command per seed (toolchain,
+  # tool — elaborate / --run / native-vs-interpreter — and the -D option
+  # draws); this is only BaseDriver's fallback.
+  command: "lean {seed_path}"
+  # `import Lean` alone is ~1 s on the assertion build and a sanitized run
+  # is 2-3x that; a grind- or simp-heavy test takes tens of seconds. Long
+  # enough that a timeout is a hang, not a slow test.
+  timeout: 90
+  # 6-core host: one `lean` is one busy core plus short-lived task threads.
+  concurrency: 5
+  worker_model: processes
+  # Address-space cap per run (`ulimit -v`, not applied to the ASan build);
+  # below ~16 GB lean cannot reserve its task threads' stacks. The heap
+  # itself is capped by the driver's `--memory`.
+  # a runaway `decide`/`#reduce` must fail locally, not take the box down.
+  mem_limit_mb: 24576
+
+analysis:
+  # Lean exits 1 on any error message; that is an ordinary rejection.
+  error_return_codes: [1]
+  # A seed that fails on its own produces children failing on the same
+  # command. The `elab_fail` pile is the exception: its rejection is the
+  # test, and the error-recovery paths it reaches are worth fuzzing.
+  drop_seeds_failing_alone: true
+  drop_seeds_failing_alone_except: '^-- ffl: expect-fail'
+  # The coarse net; projects/lean/analyzer.py decides (a program's own
+  # `panic!` or `#[][0]!` prints "PANIC at" too, and is not a Lean bug).
+  crash_patterns:
+    - "LEAN ASSERTION VIOLATION"
+    - "PANIC at"
+    - "INTERNAL PANIC"
+    - "(kernel)"
+    - "internal error"
+    - "Internal error"
+    - "compiler IR check failed"
+    - "(interpreter)"
+    - "invalid LCNF"
+    - "AddressSanitizer"
+    - "runtime error:"
+    - "Segmentation fault"
+    - "unknown free variable"
+  syntax_patterns:
+    - "error:"
+    - "unknown identifier"
+    - "unknown constant"
+    - "type mismatch"
+    - "failed to synthesize"
+    - "unexpected token"
+    - "unsolved goals"
+
+paths:
+  seed_source: "projects/lean/seeds"
+  seed_corpus: "projects/lean/corpus.db"
+  seed_exclude_patterns:
+    - pattern: '\b(?:IO\.Process|IO\.FS\.(?:createDir|removeFile|removeDirAll|rename|Handle\.mk)|IO\.FS\.writeFile|System\.FilePath\.walkDir)'
+      reason: "touches the file system or spawns processes; the run has no sandbox beyond its temp directory"
+    - pattern: '\b(?:Std\.Internal\.UV|Std\.Net|Std\.Http|IO\.Async|Std\.Internal\.IO\.Async)\b'
+      reason: "sockets/event loop: needs a network and real time"
+    - pattern: '\bIO\.sleep\s+(?:[1-9]\d{3,})'
+      reason: "sleeps for a large part of the timeout and learns nothing"
+    - pattern: '--\s*(?:test|bench)[_-]?(?:only|skip)|#guard_panic'
+      reason: "harness-specific directives"
+
+llm:
+  provider: "openai"
+  model: "gpt-4o-mini"
+  timeout: 30
