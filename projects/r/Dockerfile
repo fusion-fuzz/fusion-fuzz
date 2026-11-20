@@ -24,6 +24,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libreadline-dev \
     libpcre2-dev \
     liblzma-dev \
+    libzstd-dev \
     libbz2-dev \
     zlib1g-dev \
     libcurl4-openssl-dev \

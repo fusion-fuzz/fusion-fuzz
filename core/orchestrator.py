@@ -12,6 +12,7 @@ import sys
 import datetime
 import stat
 import gc
+import math
 from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor, wait, FIRST_COMPLETED
 from typing import List, Tuple, Optional
 from .driver import get_driver, DockerDriver, cleanup_stale_processes
@@ -65,6 +66,10 @@ def _extract_display_code(content: str, ext: str) -> tuple[str, str]:
 # out and the (child, result) pairs coming back.
 _WORKER_LOOP = None
 
+# Where crash bundles go (and are deduplicated against). FFL_BUGS_DIR lets
+# two runs of the same project (e.g. an A/B experiment) keep separate sets.
+_BUGS_ROOT = os.environ.get("FFL_BUGS_DIR") or os.path.join("output", "bugs")
+
 
 def _pool_init(seed_base: int, cwd: str):
     # Die with the parent. A worker whose parent is SIGKILLed (a run
@@ -90,9 +95,12 @@ def _pool_init(seed_base: int, cwd: str):
         pass
 
 
-def _pool_iteration(a_idx: int, b_idx: int):
+def _pool_iteration(a_idx, b_idx):
     loop = _WORKER_LOOP
-    a, b = loop.corpus[a_idx], loop.corpus[b_idx]
+    # A seed added to the corpus after the pool forked (coverage feedback)
+    # is not in this worker's copy, so the parent sends the Seed itself.
+    a = loop.corpus[a_idx] if isinstance(a_idx, int) else a_idx
+    b = loop.corpus[b_idx] if isinstance(b_idx, int) else b_idx
     children, _chain, _parents = loop._fuse_pair_chain(a, b)
     pairs = []
     if not children:
@@ -100,6 +108,7 @@ def _pool_iteration(a_idx: int, b_idx: int):
     for child in children:
         try:
             result = loop.driver.execute(child)
+            result.coverage = loop.driver.take_coverage()
             pairs.append((child, result))
         except Exception as e:
             logger.error(f"Execution driver error: {e}")
@@ -177,7 +186,7 @@ class FusionFuzzLoop:
         Scans the output directory for existing crash reports and loads their signatures
         to prevent duplicate reporting across runs.
         """
-        bugs_dir = os.path.join("output", "bugs", self.project_name)
+        bugs_dir = os.path.join(_BUGS_ROOT, self.project_name)
         if not os.path.exists(bugs_dir):
             return
 
@@ -241,6 +250,24 @@ class FusionFuzzLoop:
 
     def select_parents(self):
         """Select two parents from the corpus, preferring unfused pairs."""
+        fb = getattr(self, "_fb_seeds", None)
+        if fb is not None:
+            # Coverage feedback: a feedback seed is only ever paired with an
+            # original seed (never two feedback seeds), and only in a
+            # fraction of iterations, so fused programs cannot snowball in
+            # size and the original corpus keeps being explored.
+            if fb and random.random() < self.cov_policy["fb_pick"]:
+                b = random.choice(fb)
+                if self.cov_policy["adaptive"]:     # binary tournament on seed score
+                    b2 = random.choice(fb)
+                    if self._fb_score(b2) > self._fb_score(b):
+                        b = b2
+                a = random.choice(self._orig_seeds)
+                if random.random() < 0.5:
+                    a, b = b, a
+                self.coverage.record(a.id, b.id)
+                return a, b
+            return self.coverage.select_parents(self._orig_seeds)
         return self.coverage.select_parents(self.corpus)
 
     def _pick_strategy_chain(self, pool: List) -> List:
@@ -376,6 +403,7 @@ class FusionFuzzLoop:
         for child in children:
             try:
                 result = self.driver.execute(child)
+                result.coverage = self.driver.take_coverage()
                 pairs.append((child, result))
             except Exception as e:
                 logger.error(f"Execution driver error: {e}")
@@ -747,9 +775,9 @@ class FusionFuzzLoop:
         # would create a separate folder for every instance of the same bug.
         folder_name = safe_sig
         if signature.startswith("ASAN:memory-leak"):
-            crash_dir = os.path.join(self.original_cwd, "output", "bugs", self.project_name, "leaks", folder_name)
+            crash_dir = os.path.join(self.original_cwd, _BUGS_ROOT, self.project_name, "leaks", folder_name)
         else:
-            crash_dir = os.path.join(self.original_cwd, "output", "bugs", self.project_name, folder_name)
+            crash_dir = os.path.join(self.original_cwd, _BUGS_ROOT, self.project_name, folder_name)
 
         # Distinct signatures can sanitise to the same folder name — every
         # character outside [A-Za-z0-9_.-] becomes "_", so lfortran's
@@ -1206,6 +1234,23 @@ class FusionFuzzLoop:
                 self._save_crash_bundle(child, result, fallback_sig)
                 new_crash = True
 
+        cov = getattr(self, "cov", None)
+        if cov is not None:
+            new_blocks = cov.update(getattr(result, "coverage", None))
+            c = cov.counters
+            c["execs"] = c.get("execs", 0) + 1
+            if result.crashed:
+                c["crashes"] = c.get("crashes", 0) + 1
+            elif not self._is_syntax_error(result):
+                c["valid"] = c.get("valid", 0) + 1
+            c["unique_crashes"] = len(self.unique_crashes)
+            if self.cov_feedback:
+                self._observe_novelty(child, new_blocks)
+            if (self.cov_feedback and new_blocks > 0 and not result.crashed
+                    and not self._is_syntax_error(result)):
+                self._admit_feedback_seed(child, result, new_blocks)
+            c["corpus"] = len(self.corpus)
+
         if self.is_interesting(result):
             self.corpus.append(child)
 
@@ -1443,6 +1488,7 @@ class FusionFuzzLoop:
                 initializer=_pool_init,
                 initargs=(random.randrange(1 << 30), self.original_cwd))
             seed_index = {seed.id: i for i, seed in enumerate(self.corpus)}
+            ref = lambda s: seed_index.get(s.id, s)       # index if the workers have it
         else:
             executor = ThreadPoolExecutor(max_workers=max_workers)
 
@@ -1466,7 +1512,7 @@ class FusionFuzzLoop:
                         a, b = self.select_parents()
                         if not a or not b:
                             break
-                        f = executor.submit(_pool_iteration, seed_index[a.id], seed_index[b.id])
+                        f = executor.submit(_pool_iteration, ref(a), ref(b))
                     else:
                         f = executor.submit(self.process_iteration)
                     active_futures.add(f)
@@ -1609,6 +1655,138 @@ class FusionFuzzLoop:
             logger.info("Final workspace cleaned up.")
         except Exception as e:
             pass
+
+    COV_POLICY_DEFAULTS = dict(
+        min_new=20,        # novelty threshold (fixed with adaptive=0; until the window warms up otherwise)
+        size_factor=1.5,   # a feedback seed must be at most this times its larger parent
+        max_gen=2,         # ... and be at most this many fusions away from the originals
+        max_ratio=0.5,     # feedback seeds kept: at most this fraction of the originals
+        fb_pick=0.3,       # fraction of iterations pairing a feedback seed with an original
+        # adaptive admission (v3); adaptive=0 restores the fixed-threshold v2 policy
+        adaptive=1,
+        quantile=0.9,      # threshold tracks this quantile of discoveries' new-block counts
+        thr_rate=0.05,     # ... adapting by this much (log scale) per discovery
+        floor=3,           # never below this many new blocks
+        pick_decay=10,     # score halves after this many picks that found nothing new
+    )
+
+    def attach_coverage(self, manager, feedback, policy=None):
+        """Collect breakpoint coverage for every execution (core/bpcov).
+
+        With feedback, a valid child that reaches new blocks may become a
+        seed (see _admit_feedback_seed for the admission policy). Without
+        it coverage is only measured, so the two can be compared at equal
+        instrumentation cost."""
+        self.cov = manager
+        self.cov_feedback = bool(feedback)
+        self.cov_policy = dict(self.COV_POLICY_DEFAULTS, **(policy or {}))
+        self.driver.coverage = manager
+        if self.cov_feedback:
+            self._orig_seeds = list(self.corpus)
+            self._fb_seeds = []
+            self._seed_meta = {s.id: (len(s.content or ""), 0, (s.metadata or {}).get("type"))
+                               for s in self.corpus}
+            self._fb_by_id = {}
+            self._novelty_thr = float(self.cov_policy["min_new"])
+        manager.counters["corpus"] = len(self.corpus)
+        manager.start_stats()
+
+    def _fb_score(self, s):
+        """Usefulness of a feedback seed: how exceptional it was when admitted
+        (its new blocks relative to the threshold of the time) plus the
+        relative novelty its children have found since, discounted by how
+        often it has been picked. A seed whose children stop finding
+        anything decays, so a long run keeps replacing stale seeds instead
+        of freezing on the ones admitted while discovery was still easy."""
+        m = s.metadata
+        return (m.get("fb_prior", 0.0) + m.get("fb_credit", 0.0)) / (
+            1.0 + m.get("fb_picks", 0) / self.cov_policy["pick_decay"])
+
+    def _observe_novelty(self, child, new_blocks):
+        """Per execution with coverage feedback on: credit feedback parents
+        and track the distribution of discoveries for the threshold."""
+        pol = self.cov_policy
+        if not pol["adaptive"]:
+            return
+        for pid in (child.metadata or {}).get("root_parents") or []:
+            p = self._fb_by_id.get(pid)
+            if p is not None:
+                p.metadata["fb_picks"] = p.metadata.get("fb_picks", 0) + 1
+                if new_blocks:
+                    p.metadata["fb_credit"] = p.metadata.get("fb_credit", 0.0) + new_blocks / self._novelty_thr
+        if new_blocks <= 0:
+            return
+        # Online quantile estimate (stochastic approximation, in log space so
+        # it adapts as fast from 3000 blocks to 30 as from 30 to 3): at
+        # equilibrium a fraction 1 - quantile of discoveries clear it. A
+        # windowed percentile lagged behind decaying discovery for as long
+        # as the window took to turn over (on cpython: never, in 8 minutes).
+        q, eta = pol["quantile"], pol["thr_rate"]
+        step = eta * (q if new_blocks >= self._novelty_thr else -(1.0 - q))
+        self._novelty_thr = max(float(pol["floor"]), self._novelty_thr * math.exp(step))
+        self.cov.counters["novelty_thr"] = round(self._novelty_thr, 1)
+
+    def _admit_feedback_seed(self, child, result, new_blocks):
+        """Coverage-feedback admission. The naive policy (every valid child
+        with any new block) flooded the corpus with ever larger fused
+        programs: 22% of php's executions were admitted and throughput fell
+        to a third. So a child must clear a novelty threshold, stay close to
+        its parents' size and generation, and compete for a bounded number
+        of slots.
+
+        v2 used a fixed threshold and evicted by absolute new-block count;
+        on a 10 h gcc run the pool filled in two hours and then all but
+        froze (39 replacements), since a late child can rarely match the
+        counts of seeds admitted while discovery was easy. v3 (adaptive=1)
+        tracks a quantile of the discoveries as they happen
+        (_observe_novelty) and scores seeds relative to it (_fb_score), so
+        admission continues at a steady rate for as long as the run lasts."""
+        pol, c = self.cov_policy, self.cov.counters
+        def rej(why):
+            c[why] = c.get(why, 0) + 1
+        parents = (child.metadata or {}).get("root_parents") or []
+        pmeta = [self._seed_meta[p] for p in parents if p in self._seed_meta]
+        size = len(child.content or "")
+        gen = 1 + max((m[1] for m in pmeta), default=0)
+        thr = self._novelty_thr if pol["adaptive"] else pol["min_new"]
+        if new_blocks < thr:
+            return rej("rej_novelty")
+        if gen > pol["max_gen"]:
+            return rej("rej_generation")
+        if pmeta and size > pol["size_factor"] * max(m[0] for m in pmeta):
+            return rej("rej_size")
+        prior = new_blocks / thr
+        cap = max(1, int(pol["max_ratio"] * len(self._orig_seeds)))
+        if len(self._fb_seeds) >= cap:
+            if pol["adaptive"]:
+                worst = min(self._fb_seeds, key=self._fb_score)
+                if self._fb_score(worst) >= prior:
+                    return rej("rej_budget")
+            else:
+                worst = min(self._fb_seeds, key=lambda s: s.metadata.get("new_blocks", 0))
+                if worst.metadata.get("new_blocks", 0) >= new_blocks:
+                    return rej("rej_budget")
+            self._fb_seeds.remove(worst)
+            self.corpus.remove(worst)
+            self._fb_by_id.pop(worst.id, None)
+            c["evicted"] = c.get("evicted", 0) + 1
+        md = dict(child.metadata or {})
+        lang = md.get("type") or next((m[2] for m in pmeta if m[2]), None) or self.project_name
+        md.update(type=lang, feedback=True, new_blocks=new_blocks, generation=gen,
+                  fb_prior=prior, fb_credit=0.0, fb_picks=0)
+        child.metadata = md
+        # Fusion strategies read pre-analysis metadata; derive it from this
+        # execution instead of running the program again.
+        try:
+            from core.dryrun import get_collector
+            child.metadata.update(get_collector(lang).collect(child, result, fallback_language=self.project_name))
+        except Exception as e:
+            logger.debug(f"feedback seed metadata collection failed: {e}")
+        self.corpus.append(child)
+        self._fb_seeds.append(child)
+        self._fb_by_id[child.id] = child
+        self._seed_meta[child.id] = (size, gen, lang)
+        c["added_seeds"] = c.get("added_seeds", 0) + 1
 
     def is_interesting(self, result):
         if result.crashed: return False

@@ -159,6 +159,27 @@ if __name__ == "__main__":
                              'Example: --signature "core dumped"')
     parser.add_argument("--setup-cov", action="store_true", default=False,
                         help="Build project with gcov (no sanitizers) for coverage measurement")
+    parser.add_argument("--cov-module", action="append", default=[], metavar="EXE",
+                        help="Collect breakpoint block coverage (core/bpcov) of this executable "
+                             "or shared library (also one loaded later with dlopen) in every "
+                             "execution; repeat for several (e.g. a compiler driver's cc1). "
+                             "No recompilation needed.")
+    parser.add_argument("--cov-mode", choices=["preload", "ptrace"], default="preload",
+                        help="How coverage is collected: LD_PRELOAD runtime (default) or ptrace "
+                             "(static executables, e.g. Go's toolchain)")
+    parser.add_argument("--cov-feedback", action="store_true", default=False,
+                        help="With --cov-module: add valid fused programs that reach new blocks "
+                             "to the corpus (without it, coverage is only measured)")
+    parser.add_argument("--cov-dir", default=None,
+                        help="Work dir for coverage tables (default .fused/bpcov-<project>-<pid>)")
+    parser.add_argument("--cov-stats", default=None,
+                        help="CSV file for per-minute coverage/corpus/crash counters")
+    parser.add_argument("--cov-policy", default="",
+                        help="Feedback admission/scheduling overrides, e.g. "
+                             "'quantile=0.9,size_factor=1.5,max_gen=2,max_ratio=0.5,fb_pick=0.3'; "
+                             "'adaptive=0' restores the fixed-threshold policy (min_new=20)")
+    parser.add_argument("--cov-rebuild", type=int, default=300,
+                        help="Seconds between probe-table rebuilds (default 300)")
     parser.add_argument("--gcov", action="store_true", default=False,
                         help="After fuzzing, collect and print gcov line coverage information")
     parser.add_argument("--dataflow-fusion", action="store_true", default=False,
@@ -763,6 +784,19 @@ if __name__ == "__main__":
         children_per_pair=args.children_per_pair,
     )
     
+    if args.cov_module:
+        from core.bpcov import CoverageManager
+        cov_dir = args.cov_dir or os.path.join(".fused", f"bpcov-{args.project}-{os.getpid()}")
+        cov = CoverageManager(args.cov_module, mode=args.cov_mode, work_dir=cov_dir,
+                              rebuild_secs=args.cov_rebuild, stats_path=args.cov_stats)
+        _pol = {}
+        for kv in filter(None, (x.strip() for x in args.cov_policy.split(","))):
+            k, v = kv.split("=", 1)
+            _pol[k.strip()] = float(v) if "." in v else int(v)
+        fuzzer.attach_coverage(cov, feedback=args.cov_feedback, policy=_pol)
+        logger.info(f"bpcov: {cov.mode} coverage of {len(cov.modules)} module(s), "
+                    f"{cov.probes_left()} blocks; feedback {'ON' if args.cov_feedback else 'off (measure only)'}")
+
     # === FUSION-ONLY MODE (--save-to): generate and save, never execute ===
     if args.save_to:
         fuzzer.generate_only(args.save_to, max_programs=args.iterations,

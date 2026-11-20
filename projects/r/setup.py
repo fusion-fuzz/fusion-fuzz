@@ -44,7 +44,7 @@ import shutil
 import subprocess
 
 R_REPO = "https://github.com/r-devel/r-svn"
-R_BRANCH = os.environ.get("FFL_R_BRANCH", "master")
+R_BRANCH = os.environ.get("FFL_R_BRANCH", "main")
 
 _MAX_SEED_BYTES = 24 * 1024
 

@@ -160,3 +160,50 @@ Try fusion-fuzz:
 
 
 You should be able to see bugs found by fusion-fuzz in ./output/bugs/<project-name>.
+
+### Coverage feedback (optional)
+
+fusion-fuzz can measure block coverage of the target and feed fused programs that reach new code back into the corpus. It needs no recompilation: `core/bpcov` writes a breakpoint (`int3`) over every not-yet-covered basic block of the given binaries in each execution's private memory, records a block the first time it is hit, and rebuilds its probe tables periodically so covered blocks cost nothing afterwards (steady-state overhead about 1.0-1.3x on the supported targets).
+
+```bash
+python3 main.py --project gcc --pre-analysis --dataflow-fusion --state-fusion --declaration-fusion \
+    --cov-module projects/gcc/gcc-install/libexec/gcc/x86_64-pc-linux-gnu/17.0.0/cc1 \
+    --cov-module projects/gcc/gcc-install/libexec/gcc/x86_64-pc-linux-gnu/17.0.0/cc1plus \
+    --cov-feedback --cov-stats output/gcc-cov.csv
+```
+
+| Flag | Meaning |
+|---|---|
+| `--cov-module PATH` | Executable or shared library to instrument (repeatable). A library loaded later with `dlopen` (e.g. TVM's `libtvm_compiler.so` on `import tvm`) is covered too. |
+| `--cov-mode preload\|ptrace` | `preload` (default): LD_PRELOAD runtime, for dynamically linked binaries. `ptrace`: a tracer that follows fork/exec, for static binaries (Go toolchain, TypeScript's Go `tsc`). |
+| `--cov-feedback` | Add valid fused programs that reach new blocks to the corpus. Without it coverage is only measured, so the two runs can be compared at equal cost. |
+| `--cov-policy k=v,...` | Admission policy overrides (see below). |
+| `--cov-stats FILE` | Per-minute CSV: covered blocks, executions, valid runs, crashes, corpus size, admitted/evicted/rejected seeds, current novelty threshold. |
+| `--cov-dir DIR` | Work directory for probe tables and pre-armed images (default `.fused/bpcov-<project>-<pid>`). |
+| `--cov-rebuild SECONDS` | Interval between probe-table rebuilds (default 300). |
+
+Block extraction is cached per binary; set `FFL_BPCOV_CACHE=<dir>` to share the cache between runs.
+
+Admission policy (`--cov-policy`, defaults shown): a fused program becomes a seed only if its new-block count clears a novelty threshold that tracks the `quantile=0.9` of recent discoveries (never below `floor=3`), it is at most `size_factor=1.5` times its larger parent and `max_gen=2` fusions away from the original corpus. Feedback seeds are capped at `max_ratio=0.5` of the original corpus; when full, a new seed replaces the one with the lowest score (novelty relative to the threshold when it was admitted, plus the new blocks its children found, decaying with every pick that found nothing), so admission continues throughout a long run. A fraction `fb_pick=0.3` of iterations pair a feedback seed (picked by score) with an original seed. `adaptive=0` switches to a fixed threshold of `min_new=20` blocks.
+
+Modules used per project:
+
+| Project | `--cov-module` |
+|---|---|
+| php | `projects/php/php-src/sapi/cli/php` |
+| gcc | `projects/gcc/gcc-install/libexec/gcc/x86_64-pc-linux-gnu/17.0.0/{cc1,cc1plus}` |
+| clang | `projects/clang/llvm-clang-install/bin/clang-24` |
+| flang | `projects/flang/llvm-flang-build/bin/flang-24` |
+| mlir | `projects/mlir/llvm-mlir-install/bin/mlir-opt` |
+| swift | `/usr/bin/swift-frontend` |
+| go (`--cov-mode ptrace`) | `projects/go/go-src/bin/go`, `projects/go/go-src/pkg/tool/linux_amd64/{compile,link}` |
+| cpython | `projects/cpython/cpython/build/python` |
+| ruby | `projects/ruby/install/bin/ruby` |
+| r | `projects/r/install/lib/R/bin/exec/R` |
+| typescript (`--cov-mode ptrace`) | `projects/typescript/tsc-bin` |
+| julia | `projects/julia/julia-src/usr/lib/{libjulia-internal.so.1.15.0,libjulia-codegen.so.1.15.0,julia/sys.so}` |
+| mojo | `projects/mojo/venv/lib/python3.10/site-packages/modular/bin/mojo` |
+| tvm | `projects/tvm/tvm/build/lib/{libtvm_compiler.so,libtvm_runtime.so}` |
+| xla | `projects/xla/bin/{run_hlo_module,hlo-opt}` |
+
+Known limitation: LeakSanitizer's exit-time check runs with every signal blocked, so an ASan target must run with `detect_leaks=0` under coverage (the fuzzing drivers already set it).

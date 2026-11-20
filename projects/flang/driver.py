@@ -288,10 +288,34 @@ class FlangDriver(BaseDriver):
         except (OSError, ValueError):
             return {}
         binary = info.get("binary")
-        if binary and not (os.path.isfile(binary) and os.access(binary, os.X_OK)):
+        usable = lambda b: os.path.isfile(b) and os.access(b, os.X_OK)
+        if binary and not usable(binary) and "/projects/flang/" in binary:
+            # Recorded under another mount of the repository (the build
+            # ran at /work/fusion-fuzz, the fuzzing containers mount it at
+            # /home/fuzz/WorkSpace/fusion-fuzz): re-root it here.
+            moved = os.path.join(self.ffl_root, "projects", "flang",
+                                 binary.split("/projects/flang/", 1)[1])
+            if usable(moved):
+                info["binary"] = binary = moved
+        if binary and not usable(binary):
             # Stale record (build tree wiped) — fall back to PATH rather
             # than failing every execution with "no such file".
+            logger.warning("flang build %s not found — falling back to `%s` on PATH",
+                           binary, self.FLANG_BIN)
             info.pop("binary", None)
+        elif binary and not info.get("sanitizers"):
+            # The record can predate the build it describes; the build
+            # tree's CMake cache says what the binary was compiled with
+            # (an ASan binary must not get the `ulimit -v` cap, see
+            # _env_prefix).
+            cache = os.path.join(os.path.dirname(os.path.dirname(binary)), "CMakeCache.txt")
+            try:
+                for line in open(cache, errors="replace"):
+                    if line.startswith("LLVM_USE_SANITIZER:"):
+                        info["sanitizers"] = line.split("=", 1)[1].strip().replace(";", ",").lower()
+                        break
+            except OSError:
+                pass
         return info
 
     def _env_prefix(self):

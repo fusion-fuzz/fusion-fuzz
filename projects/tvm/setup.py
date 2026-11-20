@@ -42,6 +42,12 @@ import subprocess
 import sys
 
 TVM_REPO = "https://github.com/apache/tvm.git"
+# Pinned to the last commit before upstream split TIRx out (#20742 moves
+# tvm.script, tvm.ir, tvm.tirx and tvm.error into a tvm_tirx package; later
+# commits drop the 3rdparty/tvm-ffi submodule): runner.py, the seed
+# extractor and the build below are written against this layout.
+# FFL_TVM_REF=main follows upstream instead.
+TVM_REF = os.environ.get("FFL_TVM_REF", "aa34ac394fafbca18f846d865c5304fa04c5025c")
 
 
 def _run(cmd, cwd=None):
@@ -83,10 +89,24 @@ def setup(project_root):
     if not os.path.isdir(os.path.join(src, "src")):
         print("Cloning apache/tvm (shallow)...", flush=True)
         shutil.rmtree(src, ignore_errors=True)
-        _run(f"git clone --depth=1 {TVM_REPO} {src}")
+        if TVM_REF == "main":
+            _run(f"git clone --depth=1 {TVM_REPO} {src}")
+        else:
+            _run(f"git init -q {src} && git -C {src} remote add origin {TVM_REPO} && "
+                 f"git -C {src} fetch -q --depth=1 origin {TVM_REF} && git -C {src} checkout -q FETCH_HEAD")
     if not os.path.isdir(os.path.join(src, "3rdparty", "tvm-ffi", "3rdparty", "dlpack", "include")):
         _run("git submodule update --init --depth 1 3rdparty/tvm-ffi", cwd=src)
         _run("git submodule update --init --depth 1", cwd=os.path.join(src, "3rdparty", "tvm-ffi"))
+
+    # tvm_ffi's Python package needs its compiled `core` extension, which
+    # TVM's CMake build does not produce: install the submodule's package
+    # (scikit-build-core, builds the extension and bundles libtvm_ffi.so).
+    # Before configuring: tirx/CMakeLists.txt locates tvm_ffi's CMake
+    # package through `python -m tvm_ffi.config --cmakedir`.
+    try:
+        import tvm_ffi.core  # noqa: F401
+    except Exception:
+        _run(f"{sys.executable} -m pip install --user -q {os.path.join(src, '3rdparty', 'tvm-ffi')}")
 
     build = os.path.join(src, "build")
     lib = os.path.join(build, "lib", "libtvm_compiler.so")
@@ -130,13 +150,6 @@ def setup(project_root):
         _run(f"cmake --build {build} --parallel {_jobs()}")
     if not os.path.exists(lib):
         raise RuntimeError("TVM build failed: build/lib/libtvm_compiler.so not found")
-    # tvm_ffi's Python package needs its compiled `core` extension, which
-    # TVM's CMake build does not produce: install the submodule's package
-    # (scikit-build-core, builds the extension and bundles libtvm_ffi.so).
-    try:
-        import tvm_ffi.core  # noqa: F401
-    except Exception:
-        _run(f"{sys.executable} -m pip install --user -q {os.path.join(src, '3rdparty', 'tvm-ffi')}")
 
     seeds = os.path.join(project_root, "seeds", "tests")
     if not os.path.isdir(seeds) or not os.listdir(seeds):

@@ -1,4 +1,5 @@
 import subprocess
+import threading
 import os
 import signal
 import shutil
@@ -44,6 +45,9 @@ class BaseDriver:
         _core_dir = os.path.dirname(os.path.abspath(__file__))
         self.ffl_root = os.path.dirname(_core_dir)
         self.fused_base = os.path.join(self.ffl_root, ".fused")
+        # Optional breakpoint coverage (core/bpcov): set by the orchestrator.
+        self.coverage = None
+        self._cov_tls = threading.local()
 
     def prepare_environment(self):
         pass
@@ -55,6 +59,26 @@ class BaseDriver:
         can be killed on timeout, preventing orphaned processes from leaking memory.
         Returns (return_code, stdout, stderr).
         """
+        cov_out = None
+        if self.coverage is not None:
+            fd, cov_out = tempfile.mkstemp(prefix="bpcov_", suffix=".out", dir=cwd or None)
+            os.close(fd)
+            cmd = self.coverage.wrap(cmd, cov_out)
+        try:
+            return self._run_command_raw(cmd, cwd)
+        finally:
+            if cov_out is not None:
+                self._cov_tls.records = self.coverage.read(cov_out)
+
+    def take_coverage(self):
+        """Blocks hit by this thread's last _run_command (None without coverage)."""
+        if self.coverage is None:
+            return None
+        recs = getattr(self._cov_tls, "records", None)
+        self._cov_tls.records = None
+        return recs or []
+
+    def _run_command_raw(self, cmd, cwd=None):
         try:
             proc = subprocess.Popen(
                 cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
