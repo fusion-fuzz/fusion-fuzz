@@ -6,9 +6,12 @@ import sys
 import multiprocessing
 
 
-# Tracks the tip of main by default — set LFORTRAN_REF to a tag/commit/branch
-# (e.g. LFORTRAN_REF=v0.63.0) to pin to something reproducible instead.
-DEFAULT_REF = "main"
+# Pinned to the v0.69.0 release; set LFORTRAN_REF to a tag/commit/branch
+# (e.g. LFORTRAN_REF=main) to track something else. Main after v0.69.0
+# does not build here: it requires LLD on Linux and no longer compiles
+# against LLVM 14 (Triple::getMacOSXVersion is guarded for LLVM >= 15, but
+# 14 already has only the VersionTuple overload).
+DEFAULT_REF = "v0.69.0"
 
 INSTALL_PREFIX = "/opt/lfortran"
 LFORTRAN_BIN = os.path.join(INSTALL_PREFIX, "bin", "lfortran")
@@ -92,7 +95,12 @@ def _sanitizer_cmake_opts():
     # print and continue costs nothing here, because the oracle matches on
     # the "UndefinedBehaviorSanitizer" text in the output (see
     # config.yaml's crash_patterns) rather than on the exit status.
-    flags = f"-fsanitize={value} -fno-omit-frame-pointer"
+    #
+    # -O1 (the optimisation level ASan recommends): at -O0 the Debug+ASan
+    # binary has outgrown the 2 GB a non-PIE x86-64 image can address
+    # ("relocation truncated to fit" linking LLVM's static libraries).
+    # CMAKE_BUILD_TYPE stays Debug, so the LFORTRAN_ASSERTs stay in.
+    flags = f"-O1 -fsanitize={value} -fno-omit-frame-pointer"
     cc, cxx = _sanitizer_toolchain()
     if not (cc and cxx):
         print("  (no compiler here can build sanitized code: "
@@ -227,7 +235,7 @@ def _clone_and_build(project_root, ref):
         _run(["git", "fetch", "origin"], cwd=src_dir)
 
     _run(["git", "checkout", ref], cwd=src_dir)
-    if ref == DEFAULT_REF:
+    if ref == "main":
         # Track the tip of main on every fresh build, not whatever commit
         # happened to be checked out when the clone was first made.
         _run(["git", "reset", "--hard", f"origin/{ref}"], cwd=src_dir)

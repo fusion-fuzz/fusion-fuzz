@@ -2,7 +2,9 @@
 # setup.py), so this image only needs a C++ toolchain, CMake/Ninja and the
 # Python bits FFL itself uses — no multi-hour LLVM build like the clang
 # adapter's image implies.
-FROM ubuntu:22.04
+# 24.04 for clang 18: Triton main uses C++20 features (lambdas capturing
+# structured bindings) that 22.04's clang 14 rejects.
+FROM ubuntu:24.04
 
 LABEL maintainer="yuancheng@comp.nus.edu.sg"
 
@@ -26,6 +28,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     python3 \
     python3-pip \
     python3-dev \
+    python3-yaml \
+    python3-requests \
     sqlite3 \
     tmux \
     vim \
@@ -36,9 +40,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
 
-RUN pip3 install --no-cache-dir pyyaml requests
-
-RUN useradd -m fuzz && \
+RUN (userdel -r ubuntu 2>/dev/null || true) && useradd -m fuzz && \
     echo "fuzz:fuzz" | chpasswd && \
     usermod -aG sudo fuzz
 

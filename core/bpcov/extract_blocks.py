@@ -39,12 +39,27 @@ EXCL = 0x80                                           # flag: inside an excluded
 # usually labelled with the plain libc name it replaces (`memset`, not
 # `__interceptor_memset`); exclude every address any sanitizer symbol names.
 excl_addrs = set()
+info_addrs = set()
 for flags in ([], ["-D"]):
     r = subprocess.run(["nm", "--defined-only"] + flags + [binary], capture_output=True, text=True)
     for line in r.stdout.splitlines():
         parts = line.split()
         if len(parts) == 3 and parts[1] in "TtWwiI" and excluded_name(parts[2]):
             excl_addrs.add(int(parts[0], 16))
+        if len(parts) == 3 and parts[1] in "Tt" and parts[2].endswith("_info"):
+            info_addrs.add(int(parts[0], 16))
+# GHC-compiled code (tables next to code) interleaves info tables and other
+# data with the code in .text, and probing block leaders found by linear
+# disassembly corrupts GHC at -O1 and above (heap corruption, then a jump into
+# the heap; root cause not pinned down, the code bytes themselves stay intact).
+# Probing only the closures' entry points (`*_info`, data always lies before
+# them) is safe: one block per closure entry.
+if len(info_addrs) > 1000:
+    with open(out, "w") as f:
+        for a in sorted(info_addrs):
+            f.write("%x\n" % a)
+    print(f"{binary}: GHC code, {len(info_addrs)} closure entry points", file=sys.stderr)
+    sys.exit(0)
 
 addrs, cls, targets = array("Q"), bytearray(), array("Q")
 excluded = False

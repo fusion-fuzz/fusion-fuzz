@@ -513,7 +513,7 @@ if __name__ == "__main__":
         "cpython": "python", "gcc": "c", "clang": "c", "cuda": "cpp",
         "go": "go", "rust": "rust", "php": "php",
         "swift": "swift", "lean": "lean", "mlir": "mlir",
-        "naga": "wgsl", "tint": "wgsl", "wgslc": "wgsl", "sql": "sql",
+        "naga": "wgsl", "tint": "wgsl", "wgslc": "wgsl",
         "flang": "fortran", "lfortran": "fortran", "ruby": "ruby",
         "typescript": "typescript", "r": "r", "julia": "julia",
         "xla": "hlo", "mojo": "mojo", "tvm": "python",

@@ -382,6 +382,18 @@ void *dlopen(const char *file, int mode) {
     return h;
 }
 
+/* A dynamically linked ASan runtime (gcc's libasan, or a program a compiler
+   under test builds with -fsanitize=address and runs, as mojo run does)
+   refuses to start unless it comes first in the library list, and we are
+   preloaded ahead of it. Its flag defaults come from this weak hook, which
+   we interpose; it is read before that check, unlike anything our
+   constructor could set (libasan initialises before us), and options the
+   command sets in ASAN_OPTIONS still take precedence. An executable's own
+   definition (ruby has one) still wins: it comes first in symbol lookup. */
+const char *__asan_default_options(void) {
+    return "verify_asan_link_order=0";
+}
+
 static void open_out(const char *outp) {
     int ofd = open(outp, O_RDWR | O_CREAT, 0644);
     if (ofd < 0) return;
@@ -416,16 +428,6 @@ __attribute__((constructor(101))) static void bpcov_init(void) {
         n_cfg = 1;
     }
     if (!n_cfg) return;
-    /* LD_PRELOAD reaches every descendant, including programs a compiler
-       under test builds with -fsanitize=address and then runs (mojo run):
-       a dynamically linked ASan runtime refuses to start unless it comes
-       first in the library list. Children inherit this. */
-    const char *ao = getenv("ASAN_OPTIONS");
-    if (!ao || !strstr(ao, "verify_asan_link_order")) {
-        char buf[4096];
-        snprintf(buf, sizeof buf, "%s%sverify_asan_link_order=0", ao ? ao : "", ao && *ao ? ":" : "");
-        setenv("ASAN_OPTIONS", buf, 1);
-    }
     if (outp) open_out(outp);
     scan();
 }
